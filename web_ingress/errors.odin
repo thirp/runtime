@@ -1,0 +1,40 @@
+package web_ingress
+
+IngressError :: enum {
+	None,
+	InvalidConfiguration,
+	InvalidPublicHost,
+	DuplicateRoute,
+	UnknownRoute,
+	TlsHandshakeFailed,
+	ClientHelloTooLarge,
+	ClientHelloTimeout,
+	MalformedClientHello,
+	MissingSni,
+	UnsupportedAlpn,
+	BrokerUnavailable,
+	BrokerUnauthorized,
+	ServiceUnavailable,
+	RateLimited,
+	QuotaExceeded,
+	DialTimeout,
+	ConnectionIdle,
+	BufferLimit,
+	Draining,
+	Internal,
+}
+
+PublicHostError :: enum {
+	None,
+	Empty,
+	TooLong,
+	InvalidCharacter,
+	EmptyLabel,
+	LabelTooLong,
+	LeadingHyphen,
+	TrailingHyphen,
+	IpLiteral,
+	Wildcard,
+	InvalidSyntax,
+	OutOfMemory,
+}

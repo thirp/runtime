@@ -1,0 +1,50 @@
+{
+  "spdxVersion": "SPDX-2.3",
+  "dataLicense": "CC0-1.0",
+  "SPDXID": "SPDXRef-DOCUMENT",
+  "name": "thirp-runtime-__VERSION__",
+  "documentNamespace": "https://spdx.org/spdxdocs/thirp-runtime-__VERSION__-__COMMIT__",
+  "creationInfo": {
+    "created": "__DATE__",
+    "creators": [
+      "Tool: thirp-runtime-release",
+      "Person: Charles Benedict, Jr."
+    ]
+  },
+  "packages": [
+    {
+      "name": "thirp-runtime",
+      "SPDXID": "SPDXRef-Package-thirp-runtime",
+      "versionInfo": "__VERSION__",
+      "downloadLocation": "NOASSERTION",
+      "filesAnalyzed": false,
+      "licenseConcluded": "Apache-2.0",
+      "licenseDeclared": "Apache-2.0",
+      "copyrightText": "Copyright 2026 Charles Benedict, Jr.",
+      "supplier": "Person: Charles Benedict, Jr."
+    },
+    {
+      "name": "OpenSSL",
+      "SPDXID": "SPDXRef-Package-openssl",
+      "versionInfo": "3",
+      "downloadLocation": "https://www.openssl.org/",
+      "filesAnalyzed": false,
+      "licenseConcluded": "Apache-2.0",
+      "licenseDeclared": "Apache-2.0",
+      "copyrightText": "NOASSERTION",
+      "comment": "System libssl/libcrypto. Not vendored. See docs/DEPENDENCIES.md."
+    }
+  ],
+  "relationships": [
+    {
+      "spdxElementId": "SPDXRef-DOCUMENT",
+      "relationshipType": "DESCRIBES",
+      "relatedSpdxElement": "SPDXRef-Package-thirp-runtime"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-thirp-runtime",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-openssl"
+    }
+  ]
+}

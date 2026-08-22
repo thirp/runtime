@@ -1,0 +1,3 @@
+# Raw Ingress Principal bearer secret. Install as /etc/thirp/web-ingress.token mode 0600.
+# Must match the web-ingress-a line in broker.tokens. Replace before any real deployment.
+change-me-web-ingress-a

@@ -1,0 +1,8 @@
+Thirp Runtime
+Copyright 2026 Charles Benedict, Jr.
+
+Licensed under the Apache License, Version 2.0.
+See the LICENSE file in the project root.
+
+This product links system OpenSSL 3 (libssl and libcrypto), licensed
+under Apache-2.0. OpenSSL is not vendored. See docs/DEPENDENCIES.md.

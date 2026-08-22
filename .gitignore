@@ -1,0 +1,27 @@
+# Odin / build artifacts
+*.exe
+*.bin
+*.out
+*.o
+*.a
+*.obj
+*.ll
+*.bc
+*.so
+*.dylib
+*.dll
+thirp-broker
+thirp-agent
+thirp-connect
+thirp-echo
+thirp-echo-http
+thirp-c-smoke
+thirp-web-ingress
+dist/
+
+# Editor / OS
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/

@@ -1,0 +1,4 @@
+# Placeholder secrets. Replace before any real deployment. Mode 0600.
+change-me-agent-site-17=agent-site-17:acme;capabilities=register;label=site-17-agent
+change-me-reporting-client=reporting-client:acme;capabilities=connect;label=reporting-client
+change-me-web-ingress-a=web-ingress-a:acme;capabilities=connect;label=web-ingress-a

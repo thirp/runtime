@@ -1,0 +1,3 @@
+# Local-demo credentials. Not for a public host. Mode 0600.
+demo-agent-token=demo-agent:demo;capabilities=register;label=demo-agent
+demo-ingress-token=demo-ingress:demo;capabilities=connect;label=demo-ingress

@@ -1,0 +1,22 @@
+[Unit]
+Description=Thirp Runtime named-service agent
+Documentation=file:///usr/share/doc/thirp/docs/OPERATIONS.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=thirp
+Group=thirp
+ExecStart=/usr/local/bin/thirp-agent --config /etc/thirp/agent.conf
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=8256
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadOnlyPaths=/etc/thirp
+
+[Install]
+WantedBy=multi-user.target

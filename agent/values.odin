@@ -1,0 +1,14 @@
+package agent
+
+import "core:time"
+
+DEFAULT_IMPLEMENTATION :: "thirp-agent"
+HEARTBEAT_INTERVAL :: 15 * time.Second
+LOCAL_READ_BUF :: 16 * 1024
+
+RECONNECT_BASE :: 250 * time.Millisecond
+RECONNECT_MAX :: 15 * time.Second
+
+JOIN_CODE_ALPHABET :: "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+JOIN_CODE_LEN :: 8
+JOIN_CODE_RETRY_CAP :: 8

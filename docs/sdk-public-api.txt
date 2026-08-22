@@ -1,0 +1,35 @@
+# Supported SDK consumer API
+
+This inventory is the supported Agent/Caller and C ABI surface. Odin cannot hide procedures inside a package; helpers not listed here are unsupported internals. Removing a listed name, changing a listed C signature, or adding a `THIRP_API` symbol without updating this file and CHANGELOG.md is a compatibility change.
+
+[package agent]
+types: Agent AgentConfig LocalTarget EphemeralConfig Hosting AgentError
+procs: agent_init agent_run agent_stop agent_destroy agent_is_connected register_service unregister_service host_ephemeral hosting_destroy
+
+[package caller]
+types: Caller CallerConfig Conn CallerError ConnError
+procs: caller_init caller_destroy dial dial_join_code conn_read conn_write conn_half_close conn_close conn_destroy
+
+[package protocol]
+types: ServiceId ServiceIdError
+procs: make_service_id check_service_id
+consts: MAX_SERVICE_ID_LEN PROTOCOL_MAJOR PROTOCOL_MINOR
+
+[package transport]
+procs: parse_endpoint loopback_endpoint listener_listen listener_endpoint listener_accept listener_close listener_set_recv_timeout connection_read connection_write connection_destroy
+
+[c]
+thirp_agent_create
+thirp_register_service
+thirp_unregister_service
+thirp_host_ephemeral
+thirp_agent_stop
+thirp_agent_destroy
+thirp_caller_create
+thirp_dial
+thirp_dial_join_code
+thirp_caller_destroy
+thirp_conn_read
+thirp_conn_write
+thirp_conn_close
+thirp_conn_destroy
