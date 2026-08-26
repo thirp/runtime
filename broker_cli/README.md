@@ -224,6 +224,7 @@ Plaintext:
 
 ## See also
 
+- [BUILDING.md](../docs/BUILDING.md) - building, testing, and packaging
 - [agent_cli/README.md](../agent_cli/README.md) — register a local target
 - [caller_cli/README.md](../caller_cli/README.md) — local listen that dials a service
 - [OPERATIONS.md](../docs/OPERATIONS.md) — deploy, systemd, backup

@@ -112,6 +112,7 @@ Plaintext:
 
 ## See also
 
+- [BUILDING.md](../docs/BUILDING.md) - building, testing, and packaging
 - [caller_cli/README.md](../caller_cli/README.md) — local port that dials the registered service
 - [broker_cli/README.md](../broker_cli/README.md) — broker
 - [OPERATIONS.md](../docs/OPERATIONS.md) — deploy, systemd, backup

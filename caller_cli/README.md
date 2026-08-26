@@ -106,6 +106,7 @@ Plaintext:
 
 ## See also
 
+- [BUILDING.md](../docs/BUILDING.md) - building, testing, and packaging
 - [agent_cli/README.md](../agent_cli/README.md) — register the service
 - [broker_cli/README.md](../broker_cli/README.md) — broker
 - [OPERATIONS.md](../docs/OPERATIONS.md) — deploy, systemd, backup

@@ -145,6 +145,7 @@ The fixture response includes `X-Echo-Method`, `X-Echo-Target`, and `X-Echo-Host
 
 ## See also
 
+- [BUILDING.md](../docs/BUILDING.md) - building, testing, and packaging
 - [OPERATIONS.md](../docs/OPERATIONS.md) — deploy, systemd, Agent stop/restore, grant revoke
 - [SECURITY.md](../docs/SECURITY.md) — threat model
 - [broker_cli/README.md](../broker_cli/README.md) — Broker policy and grants

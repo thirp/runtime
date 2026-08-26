@@ -1,240 +1,176 @@
 # Thirp Runtime
 
-Publish a private service. Connect to a private service. Do not expose the network around it.
+**Reach one named private service without opening the network around it.**
 
-Formerly authored as rendez. Protocol 1.0 is unchanged.
+Thirp Runtime is an open-source data plane for connecting an authorized caller
+to a service in a private environment. An Agent beside the private service
+connects outbound to a Broker. A Caller asks for the service by logical name and
+receives a bidirectional byte stream.
 
-A private application registers a named service with a public broker over an outbound connection. An authorized caller asks the broker for that service and receives a bidirectional byte stream. The broker is a switchboard, not an application server.
+Thirp exposes the service—not the host, subnet, or customer network. It is not a
+VPN, a general-purpose port forwarder, or an application hosting platform. The
+Broker routes opaque streams by service identity; it does not interpret or
+retain application payloads.
 
-This is not a VPN, port-forwarder, or “expose localhost” product. Routing is by logical service identity.
-
-**Language:** Odin (Linux first; architecture stays portable)
-
-## Status
-
-- Parent spec: through Phase 10 (Linux C ABI `libthirp.so`). Phase 11 (Windows/macOS CLIs) is planned, not in this tree. Phase 12 (QUIC) is deferred.
-- Production-readiness amendment: through PR-8. PR-9 (24-hour soak) and PR-10 (release candidate) are not implemented.
-- Web Ingress: through WI-6. See [web_ingress_cli/README.md](web_ingress_cli/README.md).
-
-Project version `0.16.0`. Protocol 1.0.
-
-## Build and test
-
-Requires [Odin](https://odin-lang.org/) `dev-2026-07` or later and OpenSSL 3 (`libssl`/`libcrypto`; `openssl-devel` on Fedora). See [docs/DEPENDENCIES.md](docs/DEPENDENCIES.md).
-
-```bash
-odin test . -all-packages
+```mermaid
+flowchart LR
+    C["Caller CLI or SDK"] <-->|"CONNECT ServiceId"| B["Broker"]
+    B <-->|"outbound session"| A["Agent"]
+    A <-->|"private TCP"| S["Named service"]
 ```
 
-`odin test . -all-packages` runs protocol, broker, transport, auth, logging, agent, caller, config, version, c_abi, and web_ingress. Races that pass in isolation and fail on a 24-thread full suite are listed in [docs/RACES.md](docs/RACES.md).
+## Runtime and Cloud
 
-`scripts/release.sh` writes `dist/thirp-runtime-0.16.0/` (Linux artifacts, SBOM, checksums, SDK and broker tarballs). Set `THIRP_GPG_KEY` to detach-sign `SHA256SUMS`.
+Thirp Runtime and Thirp Cloud use the same data plane, but they solve different
+operational problems.
 
-```bash
-odin build broker_cli -out:thirp-broker
-odin build agent_cli -out:thirp-agent
-odin build caller_cli -out:thirp-connect
-odin build echo_cli -out:thirp-echo
-odin build echo_http_cli -out:thirp-echo-http
-odin build web_ingress_cli -out:thirp-web-ingress
-odin build c_abi -build-mode:shared -out:libthirp.so
-cc -o thirp-c-smoke c_abi/smoke.c -I c_abi -L. -lthirp -Wl,-rpath,$PWD
+| | Thirp Runtime | Thirp Cloud |
+|---|---|---|
+| What it is | Apache-2.0 Broker, Agent, Caller, CLI tools, Web Ingress, and embeddable SDK | Managed control plane and hosted Broker operation built on Thirp Runtime |
+| Access control | Standalone Broker: static credentials and file-backed, deny-by-default policy | Managed identity, customer approval, timed grants, revocation, audit, and usage |
+| Operating model | Self-hosted | Thirp-hosted |
+| Availability | Public Linux release artifacts and source; independently useful | Selective hosted pilot; not part of this repository |
+
+The customer-side process used with Thirp Cloud is the same open-source
+`thirp-agent` provided by Runtime. Runtime does not require Thirp Cloud.
+
+Learn about the managed pilot at [thirp.net](https://thirp.net/).
+
+## Project status
+
+- Source version: **0.16.0**
+- Wire protocol: **1.0**, frozen and documented in
+  [docs/PROTOCOL.md](docs/PROTOCOL.md)
+- Current target: **Linux**, using OpenSSL 3
+- SDKs: Odin source packages and Linux `libthirp.so` C ABI
+- Release artifacts: Linux operator binaries, `libthirp.so`, SDK and Broker
+  tarballs, source, SBOM, checksums, and provenance
+- Not yet available: Windows/macOS CLIs and QUIC transport
+
+The self-hosted Runtime implements TLS, role separation, deny-by-default
+production policy, bounded resources, reconnect, health/metrics, and graceful
+drain. Publishing Linux artifacts does not imply final production qualification:
+the 24-hour soak remains incomplete. Web Ingress has additional edge-facing
+limitations described in the [security model](docs/SECURITY.md).
+
+## What is included
+
+| Component | Purpose |
+|---|---|
+| [`thirp-broker`](broker_cli/README.md) | Authenticates peers, authorizes named-service operations, and relays streams |
+| [`thirp-agent`](agent_cli/README.md) | Connects outbound, registers one or more services, and relays to private TCP targets |
+| [`thirp-connect`](caller_cli/README.md) | Exposes an authorized service on a loopback port for existing tools |
+| [`thirp-web-ingress`](web_ingress_cli/README.md) | Makes an explicitly routed HTTP/HTTPS service reachable by an unmodified browser |
+| [Odin and C SDKs](docs/SDK.md) | Embed Agent or Caller behavior directly in an application |
+
+`thirp-echo` and `thirp-echo-http` are local test fixtures, not installed
+products.
+
+## Try it locally
+
+The supported local walkthrough uses TLS and exercises the complete path:
+
+```text
+curl → thirp-connect → thirp-broker ← thirp-agent → private HTTP service
 ```
 
-## TLS echo
+It downloads three Linux binaries—or builds them from source—creates a loopback
+certificate, starts each component, and sends an HTTP request through the relay.
 
-Generate a local certificate (SAN must include `IP:127.0.0.1` so hostname verification succeeds):
+**Start here: [Local TLS quickstart](docs/QUICKSTART.md).**
 
-```bash
-openssl req -x509 -newkey rsa:2048 -sha256 -days 365 -nodes \
-  -keyout broker.key -out broker.crt \
-  -subj "/CN=127.0.0.1" \
-  -addext "subjectAltName=IP:127.0.0.1,DNS:localhost"
-```
+Download published artifacts from
+[GitHub Releases](https://github.com/thirp/runtime/releases/latest). To compile
+individual components or produce the complete Linux artifact set, see
+[Building, testing, and packaging](docs/BUILDING.md).
 
-Terminal 1:
+## How authorization works
 
-```bash
-./thirp-broker --listen 127.0.0.1:9000 \
-  --tls-cert broker.crt --tls-key broker.key \
-  --token host-dev-token=host-a \
-  --token caller-dev-token=client-a \
-  --metrics-listen 127.0.0.1:9090
-```
+A successful connection requires three separate facts:
 
-Terminal 2:
+1. An authenticated Agent owns the requested `ServiceId`.
+2. An authenticated Caller has permission to connect to that exact service or
+   an explicitly granted namespace.
+3. The Agent can reach the configured local target.
 
-```bash
-./thirp-echo --listen 127.0.0.1:7000
-```
+Knowing a service name is not permission. Agent credentials can register but
+cannot connect; Caller credentials can connect but cannot register. Production
+policy is deny-by-default.
 
-Terminal 3:
+Runtime policy is intentionally local and file-backed. A replaceable Broker
+authenticator and authorizer allow a managed control plane—such as Thirp
+Cloud—to supply dynamic identity, approval, grant, and revocation decisions
+without changing protocol 1.0.
 
-```bash
-./thirp-agent --broker 127.0.0.1:9000 --tls-ca broker.crt \
-    --token host-dev-token \
-    --service demo/echo \
-    --target 127.0.0.1:7000
-```
+See the [production walkthrough](docs/OPERATIONS.md#production-walkthrough) for
+separate least-privilege credentials and exact service grants.
 
-Terminal 4:
+## Operating characteristics
 
-```bash
-./thirp-connect --broker 127.0.0.1:9000 --tls-ca broker.crt \
-    --token caller-dev-token \
-    --service demo/echo \
-    --listen 127.0.0.1:8000
-```
+- Agent and Caller sessions reconnect after transient Broker loss.
+- Service registrations return when an Agent reconnects.
+- In-flight streams do **not** survive a disconnect or Broker restart.
+- Revocation, grant expiry, and authorization-lease expiry terminate affected
+  live streams when supplied by the active authorizer.
+- The Broker relays opaque bytes and records control/connection metadata, not
+  application payloads.
+- A self-hosted deployment uses one Broker process; high availability and
+  cross-Broker handoff are not implemented in this repository.
 
-Terminal 5:
+For configuration, TLS, resource limits, metrics, systemd, containers, upgrades,
+and failure triage, use the [operations guide](docs/OPERATIONS.md). Compatibility
+and restart behavior are defined in [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md).
 
-```bash
-nc 127.0.0.1 8000
-hello
-hello
-```
+## Embed Runtime
 
-A second `nc 127.0.0.1 8000` can run at the same time; each local TCP is a separate stream on the same agent session.
+Applications can host and dial services without spawning the command-line
+tools:
 
-Production policy uses separate least-privilege credentials in files (mode `0600`), not a shared all-powerful token. Copy [examples/production/](examples/production/), replace the `change-me-` secrets and `/etc/thirp` paths, then:
+- Odin applications import `thirp:agent` and `thirp:caller`.
+- C applications link the Linux shared library `libthirp.so` through
+  `thirp.h`.
+- Hosted Broker implementations can consume the Broker Odin collection and
+  provide their own authenticator and authorizer.
+- Ephemeral hosting can generate a short join code for use cases such as
+  peer-hosted games. A join code identifies a service; it is not a credential.
 
-```bash
-./thirp-broker --config /etc/thirp/broker.conf
-./thirp-agent --config /etc/thirp/agent.conf
-./thirp-connect --broker broker.example:8443 --tls-ca /etc/thirp/broker.crt \
-    --token-file /etc/thirp/caller.token \
-    --service acme/site-17/reporting-api \
-    --listen 127.0.0.1:8000
-```
-
-The example agent registers `reporting-api` and `inventory`. The example caller grant is `reporting-api` only. Flags override file values. Walkthrough: [docs/OPERATIONS.md](docs/OPERATIONS.md).
-
-## Web Ingress (browser HTTPS)
-
-An unmodified browser reaches a published HTTP origin through `thirp-web-ingress`. The browser machine needs no Thirp Runtime software. Run from the repository root. Separate Agent and Ingress credentials, production Broker policy, TLS on browser-to-ingress, ingress-to-Broker, and Agent-to-Broker. The local origin is plaintext loopback.
-
-Terminal 1:
-
-```bash
-./thirp-broker --config examples/web-ingress/broker.conf
-```
-
-Terminal 2:
-
-```bash
-./thirp-echo-http --listen 127.0.0.1:7080
-```
-
-Terminal 3:
-
-```bash
-./thirp-agent --config examples/web-ingress/agent.conf
-```
-
-Terminal 4:
-
-```bash
-./thirp-web-ingress --config examples/web-ingress/web-ingress.conf
-```
-
-Terminal 5:
-
-```bash
-curl --cacert examples/web-ingress/web-ingress.crt \
-  --resolve portfolio.demo.test:9443:127.0.0.1 \
-  https://portfolio.demo.test:9443/invite/demo
-```
-
-The fixture response includes `X-Echo-Method`, `X-Echo-Target`, `X-Echo-Host`, and the request body. Those example tokens and certificates are for loopback only. Production template: [examples/production/web-ingress.conf](examples/production/web-ingress.conf). CLI: [web_ingress_cli/README.md](web_ingress_cli/README.md).
-
-Scrape broker metrics:
-
-```bash
-curl -s http://127.0.0.1:9090/metrics
-```
-
-SIGTERM (or SIGINT) stops accepts, rejects new REGISTER/CONNECT with `BROKER_DRAINING`, waits `--shutdown-grace` (default 10s) for live streams, then RESET remaining streams and exits. `--heartbeat-interval` and `--session-timeout` default to 15s and 45s.
-
-Without `--tls-ca`, clients verify the broker against the system CA bundle. `--tls-server-name` defaults to the host in `--broker`. `--insecure` together with TLS flags is rejected.
-
-## Plaintext echo (development)
-
-Pass `--insecure` on the broker, agent, and connect CLIs instead of certificate flags. Do not use this on a public network.
-
-```bash
-./thirp-broker --insecure --listen 127.0.0.1:9000 \
-    --token host-dev-token=host-a \
-    --token caller-dev-token=client-a
-```
-
-Default broker caps (override with flags): 256 KiB per-stream outbound buffer, 8 MiB per-connection buffer, 256 MiB global buffered bytes, 256 streams per agent session, 64 KiB max frame, 4096 physical connections, 256 connections per source IP. Failed authentications default to 20/minute per IP; register/unregister 60/minute per principal; CONNECT 600/minute per principal and per IP (`0` disables a limiter). A stream that exceeds its buffer is RESET; other streams on the same agent stay up. `/metrics` reports labeled `thirp_connection_failure_total`, `thirp_authorization_failures_total`, `thirp_resets_total{reason=...}`, `thirp_limit_exceeds_total{limit=...}`, and `thirp_rate_limit_exceeds_total{limit=...}` so policy denial, missing service, local-target failure, overflow RESET, idle timeout, rate limits, and drain are distinguishable.
-
-The agent stays connected and sends PING while idle. If the broker connection drops, the agent reconnects with exponential backoff and jitter (250ms … 15s) and re-registers. `thirp-connect` does the same for its broker session; lost local sockets still close. Live streams do not survive disconnect. Disconnect or session idle timeout on the broker removes the registration and resets live streams. `--stream-idle-timeout SECONDS` (default `0`, off) RESET idle relay streams with `TIMEOUT`; a production value such as `300` is recommended.
-
-## Embed
-
-Games and other programs link `agent` and `caller` instead of spawning the CLIs. Odin applications import the packages directly (`-collection:thirp=<root>`). C programs link `libthirp.so`. Guide, collection mapping, TLS, token files, and C compile/link: [docs/SDK.md](docs/SDK.md).
-
-```odin
-import thirp_agent "thirp:agent"
-import thirp_caller "thirp:caller"
-
-agent_init(&agent, config)
-register_service(&agent, service_id, LocalTarget{address = target})
-// or: hosting, err := host_ephemeral(&agent, .{namespace = "game", local_address = target})
-
-caller_init(&caller, caller_config)
-conn, err := dial(&caller, service_id)
-n, err := conn_write(conn, data)
-n, err := conn_read(conn, buf)
-```
-
-`host_ephemeral` generates an 8-character join code (alphabet without `0 O 1 I`) and registers `namespace/code`. Callers use `dial_join_code`. The join code is not a credential; AUTH is still required.
-
-```c
-thirp_agent_create(&agent_config, &agent);
-thirp_register_service(agent, "demo/echo", "127.0.0.1:7000");
-/* or: thirp_host_ephemeral(agent, "game", "127.0.0.1:7000", &hosting); */
-
-thirp_caller_create(&caller_config, &caller);
-thirp_dial(caller, "demo/echo", &conn);
-thirp_conn_write(conn, data, n, &put);
-thirp_conn_read(conn, buf, n, &got);
-```
-
-`thirp_conn_read` / `thirp_conn_write` may block. `thirp_unregister_service` drops one name on a live agent without destroying the session.
-
-C-linkable smoke test against an insecure broker and echo (after the build commands above):
-
-```bash
-./thirp-broker --insecure --listen 127.0.0.1:9000 \
-    --token host-dev-token=host-a \
-    --token caller-dev-token=client-a
-./thirp-echo --listen 127.0.0.1:7000
-./thirp-c-smoke 127.0.0.1:9000 host-dev-token caller-dev-token demo/echo 127.0.0.1:7000
-```
-
-## Commands
-
-- [thirp-broker](broker_cli/README.md) — self-hosted Broker
-- [thirp-agent](agent_cli/README.md) — outbound Agent
-- [thirp-connect](caller_cli/README.md) — standalone Caller CLI
-- [thirp-web-ingress](web_ingress_cli/README.md) — browser HTTPS Caller adapter
-
-`thirp-echo` and `thirp-echo-http` are fixtures, not separately documented products.
-
-## License
-
-Apache-2.0. See [LICENSE](LICENSE).
+The supported API surface, lifecycle, examples, artifact layouts, and C link
+instructions are in [docs/SDK.md](docs/SDK.md).
 
 ## Documentation
 
-- [docs/PROTOCOL.md](docs/PROTOCOL.md) — normative Version 1 wire format
-- [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) — protocol, C ABI, Odin SDK, and config compatibility
-- [docs/SDK.md](docs/SDK.md) — embed Agent/Caller from Odin collections or the C ABI
-- [docs/CHANGELOG.md](docs/CHANGELOG.md) — user-visible project versions
-- [docs/OPERATIONS.md](docs/OPERATIONS.md) — deploy, TLS, policy, systemd, backup
-- [docs/SECURITY.md](docs/SECURITY.md) — self-hosted threat model
-- [docs/RACES.md](docs/RACES.md) — TLS poll, fd ownership, drain, stream-buffer races
-- [docs/NAMING.md](docs/NAMING.md) — Odin naming convention
-- [docs/TRADEMARKS.md](docs/TRADEMARKS.md) — product-name notice
+| If you want to… | Read |
+|---|---|
+| Run the local TLS relay | [Quickstart](docs/QUICKSTART.md) |
+| Build, test, or package Runtime | [Building](docs/BUILDING.md) |
+| Deploy a self-hosted Broker and Agents | [Operations](docs/OPERATIONS.md) |
+| Embed Agent or Caller behavior | [SDK](docs/SDK.md) |
+| Evaluate security boundaries and residual risk | [Security](docs/SECURITY.md) |
+| Understand wire behavior | [Protocol](docs/PROTOCOL.md) |
+| Check protocol, config, SDK, or C ABI compatibility | [Compatibility](docs/COMPATIBILITY.md) |
+| Review user-visible changes | [Changelog](docs/CHANGELOG.md) |
+| Configure a specific command | [Broker](broker_cli/README.md), [Agent](agent_cli/README.md), [Connect](caller_cli/README.md), or [Web Ingress](web_ingress_cli/README.md) |
+
+Additional project references:
+
+- [Dependencies](docs/DEPENDENCIES.md)
+- [Known concurrency hazards](docs/RACES.md)
+- [Odin naming conventions](docs/NAMING.md)
+- [Trademark notice](docs/TRADEMARKS.md)
+
+## Security
+
+Report vulnerabilities to `security@thirp.net`. Do not open a public issue for
+an unfixed vulnerability. See [docs/SECURITY.md](docs/SECURITY.md) for the
+self-hosted threat model and release-signing key.
+
+## Project history
+
+Version 0.16.0 renamed the project from Rendez to Thirp Runtime. Wire protocol
+1.0 did not change, but command names, source imports, configuration paths,
+metrics, release artifacts, and the C ABI did. See
+[docs/CHANGELOG.md](docs/CHANGELOG.md#0160) for the migration details.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).

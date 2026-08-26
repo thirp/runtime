@@ -18,6 +18,6 @@ This inventory is the source of truth for the release SBOM (`scripts/sbom.spdx.j
 - **Provenance:** distro OpenSSL 3 (Fedora: `openssl` / `openssl-devel`). Linked at build time via Odin `foreign import "system:ssl"` and `"system:crypto"`. Not vendored.
 - **Build:** `pkg-config --libs openssl` should report `-lssl -lcrypto`
 
-`libthirp.so` (Phase 10 C ABI) links the same system `libssl` / `libcrypto` through `transport`. No extra third-party library is added for the shared object.
+`libthirp.so` (C ABI) links the same system `libssl` / `libcrypto` through `transport`. No extra third-party library is added for the shared object.
 
 No other third-party libraries are linked. Protocol, registry, and relay code do not call OpenSSL. The SPDX document lists `thirp-runtime` (Apache-2.0) and `OpenSSL` (Apache-2.0) only.

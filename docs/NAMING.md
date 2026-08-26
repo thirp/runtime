@@ -1,6 +1,6 @@
 # Odin naming conventions
 
-Generic naming rules distilled from a nine_hole cardgame codebase. Prefer clarity of role over cleverness. Names should say what a thing *is* (types) or *does* (procs), not how it is implemented.
+Generic naming rules distilled from a cardgame codebase. Strange, I know. Prefer clarity of role over cleverness. Names should say what a thing *is* (types) or *does* (procs), not how it is implemented.
 
 I had this document created because I like how the naming worked out and would like to repeat these standadards in future projects.
 

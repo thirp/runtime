@@ -14,6 +14,8 @@ Breaking rename from rendez to Thirp Runtime. Protocol 1.0 is unchanged. Mixed 0
 - Release tree `dist/thirp-runtime-<VERSION>/` plus `thirp-runtime-sdk-<VERSION>.tar.gz` and `thirp-runtime-broker-<VERSION>.tar.gz`. Collection root `odin/thirp`. Manifest `"project": "thirp-runtime"`.
 - HELLO `implementation` strings are `thirp-broker`, `thirp-agent`, `thirp-connect`, `thirp-web-ingress`.
 - Signing env `RENDEZ_GPG_KEY` → `THIRP_GPG_KEY`.
+- Source archive `thirp-runtime-<VERSION>.tar.gz` is the public allowlisted tree.
+- GitHub Releases attach every file listed in `SHA256SUMS`, plus `SHA256SUMS` and `SHA256SUMS.asc`.
 
 ## 0.15.0
 
