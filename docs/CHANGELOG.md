@@ -2,6 +2,14 @@
 
 Project version is independent of the wire protocol version. This tree speaks protocol 1.0. See [COMPATIBILITY.md](COMPATIBILITY.md).
 
+## 0.16.1
+
+Agent session survival after stream RESET. Protocol 1.0, the C ABI, and the Agent/Caller SDK surface are unchanged.
+
+- On `RESET`/`CLOSE`, the Agent no longer replies `StreamNotFound`. That echo ping-ponged with the Broker until the Agent session died, so a later CONNECT saw the Service as unregistered.
+- The local pump shuts down the origin socket before destroy so it leaves `recv` instead of writing `HalfClose` onto a stream the Broker already dropped.
+- `thirp-agent --token-file` kept the secret until process exit. Odin `defer` is block-scoped; the previous `defer delete` inside the read `if` freed the token before AUTH.
+
 ## 0.16.0
 
 Breaking rename from rendez to Thirp Runtime. Protocol 1.0 is unchanged. Mixed 0.15.0 / 0.16.0 **wire** remains compatible. Source, C ABI, metrics, config paths, systemd units, and command names are not. No compatibility aliases.

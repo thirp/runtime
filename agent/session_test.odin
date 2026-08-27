@@ -57,6 +57,62 @@ test_agent_register_echo_bytes_match :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_agent_reset_keeps_session_registered :: proc(t: ^testing.T) {
+	fx: TestBroker
+	start_test_broker(t, &fx)
+	defer stop_test_broker(&fx)
+
+	echo: EchoFixture
+	echo_ep := start_echo(t, &echo)
+	defer stop_echo(&echo)
+
+	agent: Agent
+	testing.expect_value(
+		t,
+		agent_init(
+			&agent,
+			AgentConfig{broker = broker_endpoint(t, &fx), token = TEST_TOKEN_HOST, insecure = true},
+		),
+		AgentError.None,
+	)
+	defer agent_destroy(&agent)
+	testing.expect_value(
+		t,
+		register_service(&agent, must_service(t, TEST_SERVICE), LocalTarget{address = echo_ep}),
+		AgentError.None,
+	)
+
+	run: AgentRunArg
+	run.agent = &agent
+	th := thread.create_and_start_with_poly_data(&run, agent_run_proc)
+	defer {
+		agent_stop(&agent)
+		thread.join(th)
+		thread.destroy(th)
+	}
+	wait_agent_connected(t, &agent)
+
+	caller := dial_broker(t, &fx)
+	defer trans.connection_destroy(caller)
+	decoder: proto.FrameDecoder
+	handshake_caller(t, caller, &decoder)
+	defer proto.decoder_destroy(&decoder)
+	sid := caller_connect_ok(t, caller, &decoder, TEST_SERVICE)
+
+	payload, perr := proto.encode_wire_failure(
+		proto.WireFailure{code = proto.wire_error_to_u16(.Unauthorized)},
+	)
+	testing.expect_value(t, perr, proto.ProtocolError.None)
+	must_write(t, caller, .Reset, payload, sid)
+	delete(payload)
+	must_write(t, caller, .Reset, nil, sid)
+
+	testing.expect(t, agent_is_connected(&agent))
+	echo_via_service(t, &fx, TEST_SERVICE, []u8{'a', 'f', 't', 'e', 'r'})
+	testing.expect(t, agent_is_connected(&agent))
+}
+
+@(test)
 test_agent_stop_unblocks_run :: proc(t: ^testing.T) {
 	fx: TestBroker
 	start_test_broker(t, &fx)

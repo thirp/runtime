@@ -19,7 +19,7 @@ extern "C" {
 #endif
 
 /* Project version, not the wire protocol version. See COMPATIBILITY.md. */
-#define THIRP_VERSION_STRING "0.16.0"
+#define THIRP_VERSION_STRING "0.16.1"
 
 #ifndef THIRP_API
 #  if defined(_WIN32)

@@ -20,7 +20,7 @@ Any agent or caller that speaks protocol 1.0 can talk to a protocol 1.0 broker. 
 Do not infer protocol compatibility from the executable version. `--version` always prints both, for example:
 
 ```text
-thirp-broker 0.16.0 (commit <sha>, protocol 1.0)
+thirp-broker 0.16.1 (commit <sha>, protocol 1.0)
 ```
 
 A single-broker restart interrupts active sessions. Drain rejects new `REGISTER` / `CONNECT`, lets existing streams finish within `shutdown_grace`, then exits. Agents reconnect and re-register the desired set. `thirp-connect` reconnects the broker session; lost local sockets still close. See [OPERATIONS.md](OPERATIONS.md).

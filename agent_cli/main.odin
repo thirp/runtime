@@ -239,6 +239,7 @@ run :: proc() -> int {
 	if settings.token_file.set {
 		token_file = settings.token_file.value
 	}
+	file_token: string
 	if len(token_file) > 0 {
 		if auth.file_group_or_world_readable(token_file) {
 			fmt.eprintf("WARNING: token file is group- or world-readable; prefer mode 0600\n")
@@ -248,9 +249,10 @@ run :: proc() -> int {
 			fmt.eprintf("failed to read token file\n")
 			return 1
 		}
+		file_token = secret
 		token = secret
-		defer delete(token)
 	}
+	defer delete(file_token)
 
 	clear(&mappings)
 	for spec in settings.maps {

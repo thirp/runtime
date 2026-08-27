@@ -96,16 +96,16 @@ agent_pump_local :: proc(arg: ^AgentPumpArg) {
 			return
 		}
 		n, err := trans.connection_read(arg.local, buf[:])
+		sync.mutex_lock(&arg.relay.mutex)
+		stream, found = arg.relay.streams[arg.stream_id]
+		closed = !found || stream.closed
+		broker = arg.relay.broker
+		half := found && stream.broker_half_closed
+		sync.mutex_unlock(&arg.relay.mutex)
+		if closed {
+			return
+		}
 		if err != .None {
-			sync.mutex_lock(&arg.relay.mutex)
-			stream, found = arg.relay.streams[arg.stream_id]
-			if !found || stream.closed {
-				sync.mutex_unlock(&arg.relay.mutex)
-				return
-			}
-			half := stream.broker_half_closed
-			broker = arg.relay.broker
-			sync.mutex_unlock(&arg.relay.mutex)
 			_ = agent_write(broker, .HalfClose, nil, arg.stream_id)
 			if half {
 				_ = agent_write(broker, .Close, nil, arg.stream_id)
@@ -361,15 +361,13 @@ agent_relay_loop :: proc(relay: ^AgentRelay, decoder: ^proto.FrameDecoder) {
 		case .HalfClose:
 			agent_handle_half_close(relay, frame)
 		case .Close, .Reset:
+			// RESET/CLOSE is terminal. Do not echo StreamNotFound — the
+			// broker already dropped the stream and a reply ping-pongs
+			// until the session dies. Shutdown the local conn so the
+			// pump leaves recv; destroy from this thread after that.
 			stream, found := agent_take_stream(relay, frame.header.stream_id)
-			if !found {
-				_ = agent_write_failure(
-					relay.broker,
-					.Reset,
-					.StreamNotFound,
-					frame.header.stream_id,
-				)
-			} else if stream.local != nil {
+			if found && stream.local != nil {
+				trans.connection_shutdown_both(stream.local)
 				trans.connection_destroy(stream.local)
 			}
 		case .RegisterOk, .RegisterFailed:

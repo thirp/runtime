@@ -6,7 +6,7 @@ import "core:fmt"
 // Override at release: odin build ... -define:THIRP_COMMIT="<sha>"
 // Quote the SHA so a hex that starts with a digit stays a string; version_line
 // strips the surrounding quotes Odin then keeps in the constant.
-PROJECT_VERSION :: #config(THIRP_VERSION, "0.16.0")
+PROJECT_VERSION :: #config(THIRP_VERSION, "0.16.1")
 PROJECT_COMMIT :: #config(THIRP_COMMIT, "unknown")
 PROTOCOL_LABEL :: "1.0"
 
