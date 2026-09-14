@@ -26,6 +26,8 @@ RelayStream :: struct {
 	policy_version:            i64,
 	bytes_caller_to_agent:     u64,
 	bytes_agent_to_caller:     u64,
+	caller_implementation:     string,
+	agent_implementation:      string,
 }
 
 GrantExpiry :: struct {
@@ -84,6 +86,12 @@ relay_free_authz_strings :: proc(server: ^Server, stream: RelayStream) {
 	if len(stream.environment_id) > 0 {
 		delete(stream.environment_id, server.allocator)
 	}
+	if len(stream.caller_implementation) > 0 {
+		delete(stream.caller_implementation, server.allocator)
+	}
+	if len(stream.agent_implementation) > 0 {
+		delete(stream.agent_implementation, server.allocator)
+	}
 }
 
 relay_clone_string :: proc(s: string, allocator := context.allocator) -> (string, bool) {
@@ -130,6 +138,33 @@ relay_stream_count :: proc(server: ^Server) -> int {
 	return len(server.streams)
 }
 
+relay_open_partial :: proc(
+	grant_id, cred_id, prin_id, org_id, env_id, caller_impl, agent_impl: string,
+) -> RelayStream {
+	return RelayStream {
+		access_grant_id       = grant_id,
+		credential_id         = cred_id,
+		principal_id          = prin_id,
+		organization_id       = org_id,
+		environment_id        = env_id,
+		caller_implementation = caller_impl,
+		agent_implementation  = agent_impl,
+	}
+}
+
+relay_peek_agent_conn :: proc(server: ^Server, session_id: SessionId) -> ^trans.Connection {
+	if server == nil {
+		return nil
+	}
+	sync.mutex_lock(&server.routing_mutex)
+	defer sync.mutex_unlock(&server.routing_mutex)
+	conn, found := server.agent_conns[session_id]
+	if !found {
+		return nil
+	}
+	return conn
+}
+
 relay_open_stream :: proc(
 	server: ^Server,
 	service_id: ServiceId,
@@ -149,9 +184,11 @@ relay_open_stream :: proc(
 	grant_id, gok := relay_clone_string(authz.access_grant_id, server.allocator)
 	cred_src := ""
 	prin_src := ""
+	caller_src := ""
 	if h != nil {
 		cred_src = h.credential_id
 		prin_src = h.principal_id
+		caller_src = h.implementation
 	}
 	cred_id, cok := relay_clone_string(cred_src, server.allocator)
 	prin_id, pok := relay_clone_string(prin_src, server.allocator)
@@ -165,7 +202,13 @@ relay_open_stream :: proc(
 	}
 	org_id, ook := relay_clone_string(org_src, server.allocator)
 	env_id, eok := relay_clone_string(env_src, server.allocator)
-	if !gok || !cok || !pok || !ook || !eok {
+	agent_src := ""
+	if peeked := relay_peek_agent_conn(server, agent_session); peeked != nil {
+		agent_src = server_conn_implementation(server, peeked)
+	}
+	caller_impl, ciok := relay_clone_string(caller_src, server.allocator)
+	agent_impl, aiok := relay_clone_string(agent_src, server.allocator)
+	if !gok || !cok || !pok || !ook || !eok || !ciok || !aiok {
 		delete(cloned, server.allocator)
 		if gok && len(grant_id) > 0 {
 			delete(grant_id, server.allocator)
@@ -182,6 +225,12 @@ relay_open_stream :: proc(
 		if eok && len(env_id) > 0 {
 			delete(env_id, server.allocator)
 		}
+		if ciok && len(caller_impl) > 0 {
+			delete(caller_impl, server.allocator)
+		}
+		if aiok && len(agent_impl) > 0 {
+			delete(agent_impl, server.allocator)
+		}
 		return proto.CONNECTION_STREAM_ID, nil, .OutOfMemory
 	}
 
@@ -191,61 +240,31 @@ relay_open_stream :: proc(
 	found_conn, found := server.agent_conns[agent_session]
 	if !found || found_conn == nil {
 		delete(cloned, server.allocator)
-		relay_free_authz_strings(server, RelayStream {
-			access_grant_id = grant_id,
-			credential_id   = cred_id,
-			principal_id    = prin_id,
-			organization_id = org_id,
-			environment_id  = env_id,
-		})
+		relay_free_authz_strings(server, relay_open_partial(grant_id, cred_id, prin_id, org_id, env_id, caller_impl, agent_impl))
 		return proto.CONNECTION_STREAM_ID, nil, .AgentUnavailable
 	}
 	if server.max_streams_per_session > 0 &&
 	   server.session_stream_count[agent_session] >= server.max_streams_per_session {
 		delete(cloned, server.allocator)
-		relay_free_authz_strings(server, RelayStream {
-			access_grant_id = grant_id,
-			credential_id   = cred_id,
-			principal_id    = prin_id,
-			organization_id = org_id,
-			environment_id  = env_id,
-		})
+		relay_free_authz_strings(server, relay_open_partial(grant_id, cred_id, prin_id, org_id, env_id, caller_impl, agent_impl))
 		return proto.CONNECTION_STREAM_ID, nil, .QuotaExceeded
 	}
 	if !trans.connection_acquire(found_conn) {
 		delete(cloned, server.allocator)
-		relay_free_authz_strings(server, RelayStream {
-			access_grant_id = grant_id,
-			credential_id   = cred_id,
-			principal_id    = prin_id,
-			organization_id = org_id,
-			environment_id  = env_id,
-		})
+		relay_free_authz_strings(server, relay_open_partial(grant_id, cred_id, prin_id, org_id, env_id, caller_impl, agent_impl))
 		return proto.CONNECTION_STREAM_ID, nil, .AgentUnavailable
 	}
 	if !trans.connection_acquire(caller_conn) {
 		trans.connection_release(found_conn)
 		delete(cloned, server.allocator)
-		relay_free_authz_strings(server, RelayStream {
-			access_grant_id = grant_id,
-			credential_id   = cred_id,
-			principal_id    = prin_id,
-			organization_id = org_id,
-			environment_id  = env_id,
-		})
+		relay_free_authz_strings(server, relay_open_partial(grant_id, cred_id, prin_id, org_id, env_id, caller_impl, agent_impl))
 		return proto.CONNECTION_STREAM_ID, nil, .AgentUnavailable
 	}
 	if !trans.connection_acquire(found_conn) {
 		trans.connection_release(found_conn)
 		trans.connection_release(caller_conn)
 		delete(cloned, server.allocator)
-		relay_free_authz_strings(server, RelayStream {
-			access_grant_id = grant_id,
-			credential_id   = cred_id,
-			principal_id    = prin_id,
-			organization_id = org_id,
-			environment_id  = env_id,
-		})
+		relay_free_authz_strings(server, relay_open_partial(grant_id, cred_id, prin_id, org_id, env_id, caller_impl, agent_impl))
 		return proto.CONNECTION_STREAM_ID, nil, .AgentUnavailable
 	}
 
@@ -274,6 +293,8 @@ relay_open_stream :: proc(
 		valid_until               = authz.valid_until,
 		authorization_lease_until = authz.authorization_lease_until,
 		policy_version            = authz.policy_version,
+		caller_implementation     = caller_impl,
+		agent_implementation      = agent_impl,
 	}
 	relay_adjust_session_stream_count_locked(server, agent_session, 1)
 	return stream_id, found_conn, .None

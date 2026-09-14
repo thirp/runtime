@@ -39,10 +39,11 @@ unavailable_authorize_register :: proc(ctx: rawptr, req: RegisterAuthzRequest) -
 }
 
 ObserverLog :: struct {
-	mutex:     sync.Mutex,
-	allocator: mem.Allocator,
-	kinds:     [dynamic]RegistrationEventKind,
-	services:  [dynamic]string,
+	mutex:            sync.Mutex,
+	allocator:        mem.Allocator,
+	kinds:            [dynamic]RegistrationEventKind,
+	services:         [dynamic]string,
+	implementations:  [dynamic]string,
 }
 
 observer_log_init :: proc(log: ^ObserverLog, allocator := context.allocator) {
@@ -50,14 +51,19 @@ observer_log_init :: proc(log: ^ObserverLog, allocator := context.allocator) {
 	log.allocator = allocator
 	log.kinds = make([dynamic]RegistrationEventKind, allocator)
 	log.services = make([dynamic]string, allocator)
+	log.implementations = make([dynamic]string, allocator)
 }
 
 observer_log_destroy :: proc(log: ^ObserverLog) {
 	for s in log.services {
 		delete(s, log.allocator)
 	}
+	for s in log.implementations {
+		delete(s, log.allocator)
+	}
 	delete(log.kinds)
 	delete(log.services)
+	delete(log.implementations)
 }
 
 observe_registration :: proc(ctx: rawptr, ev: RegistrationEvent) {
@@ -71,6 +77,10 @@ observe_registration :: proc(ctx: rawptr, ev: RegistrationEvent) {
 	cloned, err := strings.clone(string(ev.service_id), log.allocator)
 	if err == .None {
 		append(&log.services, cloned)
+	}
+	impl, ierr := strings.clone(ev.peer_implementation, log.allocator)
+	if ierr == .None {
+		append(&log.implementations, impl)
 	}
 }
 
@@ -187,6 +197,8 @@ test_registration_observer_register_and_unregister :: proc(t: ^testing.T) {
 	testing.expect_value(t, log.kinds[0], RegistrationEventKind.Registered)
 	testing.expect_value(t, log.kinds[1], RegistrationEventKind.Unregistered)
 	testing.expect_value(t, log.services[0], TEST_SERVICE)
+	testing.expect_value(t, log.implementations[0], "test-peer")
+	testing.expect_value(t, log.implementations[1], "test-peer")
 	testing.expect_value(t, log.services[1], TEST_SERVICE)
 }
 
@@ -510,6 +522,10 @@ test_connection_observer_authorized_and_opened :: proc(t: ^testing.T) {
 	testing.expect_value(t, clog.grants[0], GRANT_A)
 	testing.expect_value(t, clog.bytes_c2a[0], u64(0))
 	testing.expect_value(t, clog.bytes_a2c[0], u64(0))
+	testing.expect_value(t, clog.callers[0], "test-peer")
+	testing.expect_value(t, clog.callers[1], "test-peer")
+	testing.expect_value(t, clog.agents[0], "")
+	testing.expect_value(t, clog.agents[1], "test-peer")
 }
 
 @(test)
@@ -634,6 +650,8 @@ ConnectionLog :: struct {
 	grants:     [dynamic]string,
 	bytes_c2a:  [dynamic]u64,
 	bytes_a2c:  [dynamic]u64,
+	callers:    [dynamic]string,
+	agents:     [dynamic]string,
 }
 
 connection_log_init :: proc(log: ^ConnectionLog, allocator := context.allocator) {
@@ -643,16 +661,26 @@ connection_log_init :: proc(log: ^ConnectionLog, allocator := context.allocator)
 	log.grants = make([dynamic]string, allocator)
 	log.bytes_c2a = make([dynamic]u64, allocator)
 	log.bytes_a2c = make([dynamic]u64, allocator)
+	log.callers = make([dynamic]string, allocator)
+	log.agents = make([dynamic]string, allocator)
 }
 
 connection_log_destroy :: proc(log: ^ConnectionLog) {
 	for s in log.grants {
 		delete(s, log.allocator)
 	}
+	for s in log.callers {
+		delete(s, log.allocator)
+	}
+	for s in log.agents {
+		delete(s, log.allocator)
+	}
 	delete(log.kinds)
 	delete(log.grants)
 	delete(log.bytes_c2a)
 	delete(log.bytes_a2c)
+	delete(log.callers)
+	delete(log.agents)
 }
 
 observe_connection :: proc(ctx: rawptr, ev: ConnectionEvent) {
@@ -669,4 +697,12 @@ observe_connection :: proc(ctx: rawptr, ev: ConnectionEvent) {
 	}
 	append(&log.bytes_c2a, ev.bytes_caller_to_agent)
 	append(&log.bytes_a2c, ev.bytes_agent_to_caller)
+	caller, cerr := strings.clone(ev.caller_implementation, log.allocator)
+	if cerr == .None {
+		append(&log.callers, caller)
+	}
+	agent, aerr := strings.clone(ev.agent_implementation, log.allocator)
+	if aerr == .None {
+		append(&log.agents, agent)
+	}
 }

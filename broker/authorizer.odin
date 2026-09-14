@@ -51,13 +51,14 @@ RegistrationEventKind :: enum {
 }
 
 RegistrationEvent :: struct {
-	kind:             RegistrationEventKind,
-	service_id:       ServiceId,
-	principal_id:     string,
-	organization_id:  string,
-	environment_id:   string,
-	credential_id:    string,
-	session_id:       SessionId,
+	kind:                  RegistrationEventKind,
+	service_id:            ServiceId,
+	principal_id:          string,
+	organization_id:       string,
+	environment_id:        string,
+	credential_id:         string,
+	session_id:            SessionId,
+	peer_implementation:   string,
 }
 
 RegistrationObserverProc :: proc(ctx: rawptr, ev: RegistrationEvent)
@@ -83,6 +84,8 @@ ConnectionEvent :: struct {
 	termination_reason:     string,
 	bytes_caller_to_agent:  u64,
 	bytes_agent_to_caller:  u64,
+	caller_implementation:  string,
+	agent_implementation:   string,
 }
 
 ConnectionObserverProc :: proc(ctx: rawptr, ev: ConnectionEvent)

@@ -39,6 +39,7 @@ ConnHandler :: struct {
 	principal_kind:     string,
 	auth_policy_version: i64,
 	capabilities:       PrincipalCapabilities,
+	implementation:  string,
 	last_recv:       time.Time,
 	last_ping_sent:  time.Time,
 	caller_counted:  bool,
@@ -183,6 +184,10 @@ conn_cleanup :: proc(h: ^ConnHandler) {
 		delete(h.principal_kind, h.server.allocator)
 		h.principal_kind = ""
 	}
+	if len(h.implementation) > 0 {
+		delete(h.implementation, h.server.allocator)
+		h.implementation = ""
+	}
 	proto.decoder_destroy(&h.decoder)
 	trans.connection_destroy(h.conn, h.server.allocator)
 	h.conn = nil
@@ -319,11 +324,12 @@ conn_handle_hello :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 		_ = conn_send_failure(h, .Error, protocol_error_to_wire(err))
 		return true
 	}
-	delete(msg.implementation, h.server.allocator)
 	if msg.major != proto.PROTOCOL_MAJOR {
+		delete(msg.implementation, h.server.allocator)
 		_ = conn_send_failure(h, .Error, .UnsupportedVersion)
 		return true
 	}
+	h.implementation = msg.implementation
 	h.role = msg.role
 	ack := proto.HelloAck {
 		major            = proto.PROTOCOL_MAJOR,
@@ -603,13 +609,14 @@ conn_handle_register :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 	server_emit_registration(
 		h.server,
 		RegistrationEvent {
-			kind            = .Registered,
-			service_id      = msg.service_id,
-			principal_id    = h.principal_id,
-			organization_id = h.organization,
-			environment_id  = h.environment_id,
-			credential_id   = h.credential_id,
-			session_id      = h.session_id,
+			kind                 = .Registered,
+			service_id           = msg.service_id,
+			principal_id         = h.principal_id,
+			organization_id      = h.organization,
+			environment_id       = h.environment_id,
+			credential_id        = h.credential_id,
+			session_id           = h.session_id,
+			peer_implementation  = h.implementation,
 		},
 	)
 	if !conn_write_payload(h, .RegisterOk, ok_payload) {
@@ -696,13 +703,14 @@ conn_handle_unregister :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 	server_emit_registration(
 		h.server,
 		RegistrationEvent {
-			kind            = .Unregistered,
-			service_id      = msg.service_id,
-			principal_id    = h.principal_id,
-			organization_id = h.organization,
-			environment_id  = h.environment_id,
-			credential_id   = h.credential_id,
-			session_id      = h.session_id,
+			kind                = .Unregistered,
+			service_id          = msg.service_id,
+			principal_id        = h.principal_id,
+			organization_id     = h.organization,
+			environment_id      = h.environment_id,
+			credential_id       = h.credential_id,
+			session_id          = h.session_id,
+			peer_implementation = h.implementation,
 		},
 	)
 	if !conn_write_payload(h, .UnregisterOk, ok_payload) {
@@ -1368,15 +1376,16 @@ conn_emit_connect_decision :: proc(
 	server_emit_connection(
 		h.server,
 		ConnectionEvent {
-			kind            = kind,
-			stream_id       = proto.CONNECTION_STREAM_ID,
-			service_id      = service_id,
-			grant_id        = d.access_grant_id,
-			credential_id   = h.credential_id,
-			principal_id    = h.principal_id,
-			organization_id = org,
-			environment_id  = env,
-			session_id      = h.session_id,
+			kind                   = kind,
+			stream_id              = proto.CONNECTION_STREAM_ID,
+			service_id             = service_id,
+			grant_id               = d.access_grant_id,
+			credential_id          = h.credential_id,
+			principal_id           = h.principal_id,
+			organization_id        = org,
+			environment_id         = env,
+			session_id             = h.session_id,
+			caller_implementation  = h.implementation,
 		},
 	)
 }
@@ -1399,13 +1408,14 @@ conn_emit_session_unregistered :: proc(h: ^ConnHandler) {
 		server_emit_registration(
 			h.server,
 			RegistrationEvent {
-				kind            = .Unregistered,
-				service_id      = sid,
-				principal_id    = h.principal_id,
-				organization_id = h.organization,
-				environment_id  = h.environment_id,
-				credential_id   = h.credential_id,
-				session_id      = h.session_id,
+				kind                = .Unregistered,
+				service_id          = sid,
+				principal_id        = h.principal_id,
+				organization_id     = h.organization,
+				environment_id      = h.environment_id,
+				credential_id       = h.credential_id,
+				session_id          = h.session_id,
+				peer_implementation = h.implementation,
 			},
 		)
 	}

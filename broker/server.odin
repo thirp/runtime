@@ -235,6 +235,20 @@ server_unregister_handler :: proc(server: ^Server, h: ^ConnHandler) {
 	delete_key(&server.handlers, h)
 }
 
+server_conn_implementation :: proc(server: ^Server, conn: ^trans.Connection) -> string {
+	if server == nil || conn == nil {
+		return ""
+	}
+	sync.mutex_lock(&server.handlers_mutex)
+	defer sync.mutex_unlock(&server.handlers_mutex)
+	for h in server.handlers {
+		if h != nil && h.conn == conn {
+			return h.implementation
+		}
+	}
+	return ""
+}
+
 server_emit_registration :: proc(server: ^Server, ev: RegistrationEvent) {
 	if server == nil || server.registration_observer == nil {
 		return
@@ -267,6 +281,8 @@ connection_event_from_stream :: proc(
 		termination_reason    = reason,
 		bytes_caller_to_agent = stream.bytes_caller_to_agent,
 		bytes_agent_to_caller = stream.bytes_agent_to_caller,
+		caller_implementation = stream.caller_implementation,
+		agent_implementation  = stream.agent_implementation,
 	}
 }
 

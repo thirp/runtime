@@ -160,6 +160,8 @@ run :: proc() -> int {
 	logger: log.Logger
 	log.logger_init(&logger, .Info)
 
+	impl := ver.version_line("thirp-connect")
+	defer delete(impl)
 	c: cl.Caller
 	cerr := cl.caller_init(
 		&c,
@@ -169,7 +171,7 @@ run :: proc() -> int {
 			insecure        = insecure,
 			tls_ca          = tls_ca,
 			tls_server_name = tls_server_name,
-			implementation  = cl.DEFAULT_IMPLEMENTATION,
+			implementation  = impl,
 			logger          = &logger,
 		},
 	)

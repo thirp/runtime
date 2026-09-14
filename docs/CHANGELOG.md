@@ -2,6 +2,13 @@
 
 Project version is independent of the wire protocol version. This tree speaks protocol 1.0. See [COMPATIBILITY.md](COMPATIBILITY.md).
 
+## 0.16.2
+
+Keep HELLO `implementation` for observers; Agent/Connect send `version_line`. Protocol 1.0, the C ABI, and the Agent/Caller SDK surface are unchanged.
+
+- HELLO `implementation` is kept on `ConnHandler` and copied onto observer `RegistrationEvent.peer_implementation` / `ConnectionEvent.caller_implementation` and `agent_implementation`. Not a wire change.
+- `thirp-agent` and `thirp-connect` send `version_line` as HELLO `implementation`.
+
 ## 0.16.1
 
 Agent session survival after stream RESET. Protocol 1.0, the C ABI, and the Agent/Caller SDK surface are unchanged.

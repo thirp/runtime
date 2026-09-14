@@ -307,6 +307,8 @@ run :: proc() -> int {
 	logger: log.Logger
 	log.logger_init(&logger, .Info)
 
+	impl := ver.version_line("thirp-agent")
+	defer delete(impl)
 	agent: ag.Agent
 	aerr := ag.agent_init(
 		&agent,
@@ -316,7 +318,7 @@ run :: proc() -> int {
 			insecure        = insecure,
 			tls_ca          = tls_ca,
 			tls_server_name = tls_server_name,
-			implementation  = ag.DEFAULT_IMPLEMENTATION,
+			implementation  = impl,
 			logger          = &logger,
 		},
 	)
