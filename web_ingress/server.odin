@@ -45,7 +45,7 @@ ingress_server_init :: proc(
 	}
 
 	if connect_broker {
-		broker_ep, berr := trans.parse_endpoint(config.broker)
+		broker_ep, berr := trans.resolve_endpoint(config.broker)
 		if berr != .None || broker_ep.port == 0 {
 			ingress_server_clear_tls(server)
 			ingress_server_clear_allocs(server)
@@ -132,7 +132,7 @@ ingress_caller_retry_proc :: proc(server: ^IngressServer) {
 		if server.stop || server.retry_stop || server.caller_ok {
 			return
 		}
-		broker_ep, berr := trans.parse_endpoint(server.config.broker)
+		broker_ep, berr := trans.resolve_endpoint(server.config.broker)
 		if berr != .None {
 			attempt += 1
 			continue

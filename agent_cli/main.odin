@@ -271,10 +271,15 @@ run :: proc() -> int {
 		append(&mappings, ServiceMapping{service = settings.service.value, target = settings.target.value})
 	}
 
-	ep, eerr := trans.parse_endpoint(broker)
+	ep, eerr := trans.resolve_endpoint(broker)
 	if eerr != .None {
 		fmt.eprintf("invalid broker address\n")
 		return 1
+	}
+	if !insecure && len(tls_server_name) == 0 {
+		if host, hok := trans.endpoint_host(broker); hok {
+			tls_server_name = host
+		}
 	}
 
 	ParsedMapping :: struct {
@@ -292,7 +297,7 @@ run :: proc() -> int {
 			invalid = true
 			continue
 		}
-		target_ep, terr := trans.parse_endpoint(m.target)
+		target_ep, terr := trans.resolve_endpoint(m.target)
 		if terr != .None || target_ep.port == 0 {
 			fmt.eprintf("invalid target address: %s\n", m.target)
 			invalid = true

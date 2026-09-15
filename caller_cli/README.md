@@ -24,7 +24,7 @@ thirp-connect [--version] --broker HOST:PORT (--token TOKEN | --token-file PATH)
 | Flag | Required | Meaning |
 |---|---|---|
 | `--version` | no | Print project version and protocol 1.0, then exit 0 |
-| `--broker HOST:PORT` | yes | Broker address |
+| `--broker HOST:PORT` | yes | Broker address. IP or DNS name; DNS is resolved at start |
 | `--token TOKEN` | one of | Bearer token (must match a broker credential). Development convenience |
 | `--token-file PATH` | one of | File whose body is the bearer secret. Prefer mode `0600` |
 | `--service SERVICE_ID` | yes | Service to dial on each local accept |

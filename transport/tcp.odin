@@ -16,6 +16,30 @@ parse_endpoint :: proc(value: string) -> (net.Endpoint, TransportError) {
 	return ep, .None
 }
 
+// Host part of HOST:PORT or [IPv6]:PORT. IP-only parse_endpoint stays for listen.
+endpoint_host :: proc(value: string) -> (string, bool) {
+	host, _, ok := net.split_port(value)
+	if !ok || len(host) == 0 {
+		return "", false
+	}
+	return host, true
+}
+
+// IP or DNS HOST:PORT. Prefers A over AAAA. Listen addresses keep parse_endpoint.
+resolve_endpoint :: proc(value: string) -> (net.Endpoint, TransportError) {
+	ep4, ep6, err := net.resolve(value)
+	if err != nil {
+		return {}, .InvalidEndpoint
+	}
+	if ep4.address != nil {
+		return ep4, .None
+	}
+	if ep6.address != nil {
+		return ep6, .None
+	}
+	return {}, .InvalidEndpoint
+}
+
 loopback_endpoint :: proc(port: int) -> net.Endpoint {
 	return net.Endpoint{address = net.IP4_Loopback, port = port}
 }

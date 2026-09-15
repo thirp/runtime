@@ -24,7 +24,7 @@ thirp-agent [--version] [--config PATH] --broker HOST:PORT (--token TOKEN | --to
 |---|---|---|
 | `--version` | no | Print project version and protocol 1.0, then exit 0 |
 | `--config PATH` | no | Line-oriented `key = value` file. Flags override. May be set once |
-| `--broker HOST:PORT` | yes | Broker address |
+| `--broker HOST:PORT` | yes | Broker address. IP or DNS name; DNS is resolved at start |
 | `--token TOKEN` | one of | Bearer token (must match a broker credential). Development convenience |
 | `--token-file PATH` | one of | File whose body is the bearer secret. Prefer mode `0600` |
 | `--map SERVICE_ID=HOST:PORT` | one mapping | Repeatable service → local target. At least one `--map` or the one-service pair |

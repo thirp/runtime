@@ -109,7 +109,7 @@ run :: proc() -> int {
 	}
 	defer delete(token)
 
-	broker_ep, berr := trans.parse_endpoint(broker)
+	broker_ep, berr := trans.resolve_endpoint(broker)
 	if berr != .None {
 		fmt.eprintf("invalid --broker address\n")
 		return 1

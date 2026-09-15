@@ -65,6 +65,26 @@ test_parse_endpoint_rejects_garbage :: proc(t: ^testing.T) {
 	testing.expect_value(t, err, TransportError.InvalidEndpoint)
 	_, err = parse_endpoint("127.0.0.1:9000")
 	testing.expect_value(t, err, TransportError.None)
+	_, err = parse_endpoint("localhost:9000")
+	testing.expect_value(t, err, TransportError.InvalidEndpoint)
+}
+
+@(test)
+test_resolve_endpoint_accepts_ip_and_localhost :: proc(t: ^testing.T) {
+	ep, err := resolve_endpoint("127.0.0.1:9000")
+	testing.expect_value(t, err, TransportError.None)
+	testing.expect_value(t, ep.port, 9000)
+	testing.expect_value(t, ep.address, net.IP4_Address{127, 0, 0, 1})
+	ep, err = resolve_endpoint("localhost:9000")
+	testing.expect_value(t, err, TransportError.None)
+	testing.expect_value(t, ep.port, 9000)
+	host, hok := endpoint_host("broker.us-east-1.thirp.net:8443")
+	testing.expect(t, hok)
+	testing.expect_value(t, host, "broker.us-east-1.thirp.net")
+	_, err = resolve_endpoint("https://broker.example:8443")
+	testing.expect_value(t, err, TransportError.InvalidEndpoint)
+	_, err = resolve_endpoint("not-an-endpoint")
+	testing.expect_value(t, err, TransportError.InvalidEndpoint)
 }
 
 @(test)

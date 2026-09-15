@@ -143,10 +143,15 @@ run :: proc() -> int {
 		return 1
 	}
 
-	broker_ep, berr := trans.parse_endpoint(broker)
+	broker_ep, berr := trans.resolve_endpoint(broker)
 	if berr != .None {
 		fmt.eprintf("invalid --broker address\n")
 		return 1
+	}
+	if !insecure && len(tls_server_name) == 0 {
+		if host, hok := trans.endpoint_host(broker); hok {
+			tls_server_name = host
+		}
 	}
 	listen_ep, lerr := trans.parse_endpoint(listen)
 	if lerr != .None {

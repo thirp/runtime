@@ -2,6 +2,14 @@
 
 Project version is independent of the wire protocol version. This tree speaks protocol 1.0. See [COMPATIBILITY.md](COMPATIBILITY.md).
 
+## 0.16.3
+
+Broker hostnames and TLS certificate chains. Protocol 1.0, the C ABI, and the Agent/Caller SDK surface are unchanged.
+
+- Agent, Connect, Web Ingress, C ABI, and SDK examples resolve `HOST:PORT` with DNS (`resolve_endpoint`; A preferred over AAAA). Listen addresses stay IP-only `parse_endpoint`.
+- When TLS is on and `--tls-server-name` is empty, SNI is the broker hostname.
+- TLS servers load a full PEM chain (`SSL_CTX_use_certificate_chain_file`) so Let's Encrypt intermediates are sent.
+
 ## 0.16.2
 
 Keep HELLO `implementation` for observers; Agent/Connect send `version_line`. Protocol 1.0, the C ABI, and the Agent/Caller SDK surface are unchanged.

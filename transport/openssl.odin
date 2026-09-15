@@ -53,6 +53,7 @@ foreign openssl {
 	SSL_CTX_free :: proc(ctx: SSL_CTX) ---
 	SSL_CTX_ctrl :: proc(ctx: SSL_CTX, cmd: c.int, larg: c.long, parg: rawptr) -> c.long ---
 	SSL_CTX_use_certificate_file :: proc(ctx: SSL_CTX, file: cstring, type: c.int) -> c.int ---
+	SSL_CTX_use_certificate_chain_file :: proc(ctx: SSL_CTX, file: cstring) -> c.int ---
 	SSL_CTX_use_PrivateKey_file :: proc(ctx: SSL_CTX, file: cstring, type: c.int) -> c.int ---
 	SSL_CTX_check_private_key :: proc(ctx: SSL_CTX) -> c.int ---
 	SSL_CTX_set_verify :: proc(ctx: SSL_CTX, mode: c.int, callback: rawptr) ---

@@ -2,6 +2,7 @@ package transport
 
 import "core:fmt"
 import "core:os"
+import "core:strings"
 import "core:sync"
 import "core:testing"
 import "core:thread"
@@ -138,6 +139,48 @@ test_tls_listen_dial_exchanges_bytes :: proc(t: ^testing.T) {
 	testing.expect_value(t, rerr, TransportError.None)
 	testing.expect_value(t, n, len(msg))
 	testing.expect_value(t, string(buf[:n]), "ping")
+}
+
+@(test)
+test_tls_server_sends_chain_from_multi_pem_file :: proc(t: ^testing.T) {
+	chain, _ := strings.concatenate({TEST_SERVER_CERT, TEST_OTHER_CERT})
+	testing.expect(t, len(chain) > 0)
+	defer delete(chain)
+	cert_path, cert_ok := write_temp_pem("chain", chain)
+	testing.expect(t, cert_ok)
+	defer remove_temp_pem(cert_path)
+	key_path, key_ok := write_temp_pem("key", TEST_SERVER_KEY)
+	testing.expect(t, key_ok)
+	defer remove_temp_pem(key_path)
+	ca_path, ca_ok := write_temp_pem("ca", TEST_SERVER_CERT)
+	testing.expect(t, ca_ok)
+	defer remove_temp_pem(ca_path)
+
+	ctx, ctx_err := tls_server_context_init(cert_path, key_path)
+	testing.expect_value(t, ctx_err, TransportError.None)
+	defer tls_server_context_destroy(ctx)
+
+	ln, lerr := listener_listen(loopback_endpoint(0))
+	testing.expect_value(t, lerr, TransportError.None)
+	defer listener_close(&ln)
+	_ = listener_set_recv_timeout(&ln, 2 * time.Second)
+	ep, eerr := listener_endpoint(ln)
+	testing.expect_value(t, eerr, TransportError.None)
+
+	arg := TlsAcceptArg {
+		ln  = &ln,
+		ctx = ctx,
+	}
+	worker := thread.create_and_start_with_poly_data(&arg, tls_accept_worker)
+	client, derr := connection_dial_tls(ep, TlsClientConfig{ca_path = ca_path, server_name = "127.0.0.1"})
+	testing.expect_value(t, derr, TransportError.None)
+	testing.expect(t, client != nil)
+	defer connection_destroy(client)
+	thread.join(worker)
+	thread.destroy(worker)
+	testing.expect_value(t, arg.err, TransportError.None)
+	testing.expect(t, arg.server != nil)
+	connection_destroy(arg.server)
 }
 
 @(test)

@@ -44,7 +44,7 @@ tls_server_context_init :: proc(
 	key_c := strings.clone_to_cstring(key_path, allocator)
 	defer delete(key_c, allocator)
 
-	if SSL_CTX_use_certificate_file(ctx, cert_c, SSL_FILETYPE_PEM) != 1 {
+	if SSL_CTX_use_certificate_chain_file(ctx, cert_c) != 1 {
 		SSL_CTX_free(ctx)
 		return nil, .Tls
 	}

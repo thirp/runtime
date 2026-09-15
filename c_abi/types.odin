@@ -63,7 +63,7 @@ parse_target :: proc(target: cstring) -> (net.Endpoint, c.int) {
 	if target == nil {
 		return {}, ERR_INVALID_ARGUMENT
 	}
-	ep, err := trans.parse_endpoint(cstr_str(target))
+	ep, err := trans.resolve_endpoint(cstr_str(target))
 	if err != .None {
 		return {}, ERR_INVALID_ARGUMENT
 	}
@@ -81,20 +81,35 @@ service_id_from_cstr :: proc(s: cstring) -> (proto.ServiceId, c.int) {
 	return id, 0
 }
 
+broker_endpoint_and_sni :: proc(broker, tls_server_name: string, insecure: bool) -> (net.Endpoint, string, c.int) {
+	ep, err := trans.resolve_endpoint(broker)
+	if err != .None {
+		return {}, "", ERR_INVALID_ARGUMENT
+	}
+	sni := tls_server_name
+	if !insecure && len(sni) == 0 {
+		if host, hok := trans.endpoint_host(broker); hok {
+			sni = host
+		}
+	}
+	return ep, sni, 0
+}
+
 agent_config_from_c :: proc(cfg: ^ThirpAgentConfig) -> (ag.AgentConfig, c.int) {
 	if cfg == nil {
 		return {}, ERR_INVALID_ARGUMENT
 	}
-	ep, err := trans.parse_endpoint(cstr_str(cfg.broker))
-	if err != .None {
-		return {}, ERR_INVALID_ARGUMENT
+	insecure := cfg.insecure != 0
+	ep, sni, err := broker_endpoint_and_sni(cstr_str(cfg.broker), cstr_str(cfg.tls_server_name), insecure)
+	if err != 0 {
+		return {}, err
 	}
 	return ag.AgentConfig {
 			broker          = ep,
 			token           = cstr_str(cfg.token),
-			insecure        = cfg.insecure != 0,
+			insecure        = insecure,
 			tls_ca          = cstr_str(cfg.tls_ca),
-			tls_server_name = cstr_str(cfg.tls_server_name),
+			tls_server_name = sni,
 			implementation  = cstr_str(cfg.implementation),
 		},
 		0
@@ -104,16 +119,17 @@ caller_config_from_c :: proc(cfg: ^ThirpCallerConfig) -> (cl.CallerConfig, c.int
 	if cfg == nil {
 		return {}, ERR_INVALID_ARGUMENT
 	}
-	ep, err := trans.parse_endpoint(cstr_str(cfg.broker))
-	if err != .None {
-		return {}, ERR_INVALID_ARGUMENT
+	insecure := cfg.insecure != 0
+	ep, sni, err := broker_endpoint_and_sni(cstr_str(cfg.broker), cstr_str(cfg.tls_server_name), insecure)
+	if err != 0 {
+		return {}, err
 	}
 	return cl.CallerConfig {
 			broker          = ep,
 			token           = cstr_str(cfg.token),
-			insecure        = cfg.insecure != 0,
+			insecure        = insecure,
 			tls_ca          = cstr_str(cfg.tls_ca),
-			tls_server_name = cstr_str(cfg.tls_server_name),
+			tls_server_name = sni,
 			implementation  = cstr_str(cfg.implementation),
 		},
 		0
