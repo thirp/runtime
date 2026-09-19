@@ -13,7 +13,7 @@ CERT_CONTEXT :: struct {
 	hCertStore:         HCERTSTORE,
 }
 
-foreign import crypt32 "system:crypt32"
+foreign import crypt32 "system:crypt32.lib"
 
 foreign crypt32 {
 	CertOpenSystemStoreW :: proc(hProv: rawptr, szSubsystemProtocol: win.wstring) -> HCERTSTORE ---
