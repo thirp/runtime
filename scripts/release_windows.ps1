@@ -6,6 +6,13 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Write-Utf8Lf([string]$Path, [string]$Content) {
+	# LF-only so Linux verify_dataplane_release.sh (grep/sha256sum) works on Windows trees.
+	$utf8 = New-Object System.Text.UTF8Encoding $false
+	[System.IO.File]::WriteAllText($Path, ($Content -replace "`r`n", "`n" -replace "`r", "`n"), $utf8)
+}
+
+
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Root = (Resolve-Path (Join-Path $ScriptDir "..")).Path
 Set-Location $Root
@@ -97,7 +104,7 @@ Copy-Item (Join-Path $Root "NOTICE") (Join-Path $Out "NOTICE") -Force
 Copy-Item (Join-Path $Root "docs\CHANGELOG.md") (Join-Path $Out "CHANGELOG.md") -Force
 Copy-Item (Join-Path $Root "docs\DEPENDENCIES.md") (Join-Path $Out "DEPENDENCIES.md") -Force
 
-@"
+$Provenance = @"
 name: thirp-runtime
 version: $Version
 source_commit: $Commit
@@ -109,7 +116,8 @@ artifact_kind: dataplane
 components: thirp-agent thirp-connect libthirp
 build_command: scripts/release_windows.ps1
 built_at: $Date
-"@ | Set-Content -Path (Join-Path $Out "PROVENANCE.txt") -Encoding ascii
+"@
+Write-Utf8Lf (Join-Path $Out "PROVENANCE.txt") $Provenance
 
 $Pfx = $env:THIRP_WINDOWS_PFX
 if ($Pfx) {
@@ -147,7 +155,7 @@ $SumLines = foreach ($name in $SumFiles) {
 	$hash = (Get-FileHash -Algorithm SHA256 (Join-Path $Out $name)).Hash.ToLowerInvariant()
 	"{0}  {1}" -f $hash, $name
 }
-$SumLines | Set-Content -Path (Join-Path $Out "SHA256SUMS") -Encoding ascii
+Write-Utf8Lf (Join-Path $Out "SHA256SUMS") (($SumLines -join "`n") + "`n")
 
 $GpgKey = $env:THIRP_GPG_KEY
 $PublishFp = "3B8559D8754FB3C5B21110C786897A405CF3D8C4"

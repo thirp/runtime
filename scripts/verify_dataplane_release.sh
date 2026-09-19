@@ -53,12 +53,12 @@ done
 
 if [[ -f "${OUT}/PROVENANCE.txt" ]]; then
 	for field in name version source_commit target artifact_kind components build_command; do
-		if ! grep -q "^${field}:" "${OUT}/PROVENANCE.txt"; then
+		if ! tr -d '\r' < "${OUT}/PROVENANCE.txt" | grep -q "^${field}:"; then
 			echo "verify_dataplane_release: PROVENANCE.txt missing ${field}" >&2
 			fail=1
 		fi
 	done
-	if ! grep -q '^artifact_kind: dataplane$' "${OUT}/PROVENANCE.txt"; then
+	if ! tr -d '\r' < "${OUT}/PROVENANCE.txt" | grep -q '^artifact_kind: dataplane$'; then
 		echo "verify_dataplane_release: PROVENANCE.txt artifact_kind must be dataplane" >&2
 		fail=1
 	fi
@@ -66,20 +66,23 @@ fi
 
 if [[ -f "${OUT}/SHA256SUMS" ]]; then
 	for f in "${BINS[@]}" thirp.h LICENSE NOTICE CHANGELOG.md DEPENDENCIES.md PROVENANCE.txt; do
-		if ! awk '{print $2}' "${OUT}/SHA256SUMS" | grep -qx "$f"; then
+		if ! tr -d '\r' < "${OUT}/SHA256SUMS" | awk '{print $2}' | grep -qx "$f"; then
 			echo "verify_dataplane_release: SHA256SUMS missing ${f}" >&2
 			fail=1
 		fi
 	done
-	if grep -qE 'thirp-broker|thirp-web-ingress' "${OUT}/SHA256SUMS"; then
+	if tr -d '\r' < "${OUT}/SHA256SUMS" | grep -qE 'thirp-broker|thirp-web-ingress'; then
 		echo "verify_dataplane_release: SHA256SUMS lists a non-data-plane binary" >&2
 		fail=1
 	fi
 	if command -v sha256sum >/dev/null 2>&1; then
-		if ! (cd "$OUT" && sha256sum -c SHA256SUMS); then
+		sums_check="$(mktemp)"
+		tr -d '\r' < "${OUT}/SHA256SUMS" > "$sums_check"
+		if ! (cd "$OUT" && sha256sum -c "$sums_check"); then
 			echo "verify_dataplane_release: SHA256SUMS check failed" >&2
 			fail=1
 		fi
+		rm -f "$sums_check"
 	fi
 fi
 
