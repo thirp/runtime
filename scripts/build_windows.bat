@@ -26,16 +26,17 @@ if "!COMMIT!"=="" set COMMIT=unknown
 
 echo Building thirp-runtime %VERSION% for Windows (%MODE%)...
 
-where odin >nul 2>&1
+where odin
 if errorlevel 1 (
     echo Error: odin compiler not found. Install from https://odin-lang.org/ >&2
     exit /b 1
 )
 
-where openssl >nul 2>&1
+where openssl
 if errorlevel 1 (
     echo Error: OpenSSL not found. Install OpenSSL 3 for Windows >&2
     echo See: https://wiki.openssl.org/index.php/Binaries >&2
+    echo PATH=%PATH% >&2
     exit /b 1
 )
 

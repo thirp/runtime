@@ -61,10 +61,21 @@ $Archive = Join-Path $Root "dist\thirp-runtime-windows-$Arch-$Version.zip"
 Write-Host "release_windows: building $Version commit $Commit ($Worktree) $Arch"
 Write-Host "release_windows: openssl=$OpenSslVer path=$($OpenSsl.Source)"
 Write-Host "release_windows: odin=$OdinVer path=$($Odin.Source)"
-$BuildBat = Join-Path $Root "scripts\build_windows.bat"
-& cmd.exe /c "`"$BuildBat`" dataplane"
-if ($LASTEXITCODE -ne 0) {
-	throw "release_windows: build_windows.bat dataplane failed ($LASTEXITCODE)"
+# Relative path from $Root — avoid nested-quote breakage on cmd /c "path with spaces"
+$BuildBatRel = "scripts\build_windows.bat"
+if (-not (Test-Path (Join-Path $Root $BuildBatRel))) {
+	throw "release_windows: missing $BuildBatRel"
+}
+$prev = Get-Location
+Set-Location $Root
+try {
+	cmd.exe /c "$BuildBatRel dataplane"
+	$buildExit = $LASTEXITCODE
+} finally {
+	Set-Location $prev
+}
+if ($buildExit -ne 0) {
+	throw "release_windows: build_windows.bat dataplane failed ($buildExit)"
 }
 
 foreach ($name in @("thirp-agent.exe", "thirp-connect.exe", "libthirp.dll")) {
