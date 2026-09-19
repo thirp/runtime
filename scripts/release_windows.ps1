@@ -1,5 +1,9 @@
 # Build a Windows data-plane release tree: thirp-agent.exe, thirp-connect.exe,
 # libthirp.dll, docs, provenance, SHA-256 checksums, optional GPG / Authenticode.
+param(
+	[switch]$SkipBuild
+)
+
 $ErrorActionPreference = "Stop"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -61,21 +65,24 @@ $Archive = Join-Path $Root "dist\thirp-runtime-windows-$Arch-$Version.zip"
 Write-Host "release_windows: building $Version commit $Commit ($Worktree) $Arch"
 Write-Host "release_windows: openssl=$OpenSslVer path=$($OpenSsl.Source)"
 Write-Host "release_windows: odin=$OdinVer path=$($Odin.Source)"
-# Relative path from $Root — avoid nested-quote breakage on cmd /c "path with spaces"
-$BuildBatRel = "scripts\build_windows.bat"
-if (-not (Test-Path (Join-Path $Root $BuildBatRel))) {
-	throw "release_windows: missing $BuildBatRel"
-}
-$prev = Get-Location
-Set-Location $Root
-try {
-	cmd.exe /c "$BuildBatRel dataplane"
-	$buildExit = $LASTEXITCODE
-} finally {
-	Set-Location $prev
-}
-if ($buildExit -ne 0) {
-	throw "release_windows: build_windows.bat dataplane failed ($buildExit)"
+if (-not $SkipBuild) {
+	$BuildBatRel = "scripts\build_windows.bat"
+	if (-not (Test-Path (Join-Path $Root $BuildBatRel))) {
+		throw "release_windows: missing $BuildBatRel"
+	}
+	$prev = Get-Location
+	Set-Location $Root
+	try {
+		cmd.exe /c "call $BuildBatRel dataplane"
+		$buildExit = $LASTEXITCODE
+	} finally {
+		Set-Location $prev
+	}
+	if ($buildExit -ne 0) {
+		throw "release_windows: build_windows.bat dataplane failed ($buildExit)"
+	}
+} else {
+	Write-Host "release_windows: SkipBuild — packaging existing dist tree"
 }
 
 foreach ($name in @("thirp-agent.exe", "thirp-connect.exe", "libthirp.dll")) {
