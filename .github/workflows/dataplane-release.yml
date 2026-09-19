@@ -98,16 +98,22 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install OpenSSL 3
+      - name: Install OpenSSL
         shell: pwsh
         run: |
           choco install openssl --no-progress -y
-          $bin = "C:\Program Files\OpenSSL-Win64\bin"
-          $lib = "C:\Program Files\OpenSSL-Win64\lib"
-          if (-not (Test-Path $bin)) { throw "OpenSSL bin dir missing: $bin" }
+          $candidates = @(
+            "C:\Program Files\OpenSSL-Win64",
+            "C:\Program Files\OpenSSL"
+          )
+          $root = $candidates | Where-Object { Test-Path (Join-Path $_ "bin\openssl.exe") } | Select-Object -First 1
+          if (-not $root) { throw "OpenSSL install root not found under $($candidates -join ', ')" }
+          $bin = Join-Path $root "bin"
+          $lib = Join-Path $root "lib"
           Add-Content -Path $env:GITHUB_PATH -Value $bin
-          Add-Content -Path $env:GITHUB_PATH -Value $lib
-          Add-Content -Path $env:GITHUB_ENV -Value "OPENSSL_ROOT_DIR=C:\Program Files\OpenSSL-Win64"
+          if (Test-Path $lib) { Add-Content -Path $env:GITHUB_PATH -Value $lib }
+          Add-Content -Path $env:GITHUB_ENV -Value "OPENSSL_ROOT_DIR=$root"
+          Write-Host "Using OPENSSL_ROOT_DIR=$root"
       - name: Install Odin
         shell: pwsh
         run: .\scripts\ci_setup_odin.ps1
