@@ -1,4 +1,5 @@
-@echo off
+echo ENTERED_BUILD_WINDOWS
+@echo on
 REM Build Windows binaries for thirp-runtime.
 REM   scripts\build_windows.bat            all CLIs + libthirp.dll (local convenience)
 REM   scripts\build_windows.bat dataplane  agent, caller, libthirp.dll only
