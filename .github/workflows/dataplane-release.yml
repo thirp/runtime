@@ -152,15 +152,9 @@ jobs:
       - name: Build data-plane release tree
         shell: cmd
         run: |
-          echo WORKSPACE=%GITHUB_WORKSPACE%
           cd /d "%GITHUB_WORKSPACE%"
           call "%VCVARS64%"
-          where openssl
-          where odin
-          dir scripts\build_windows.bat
-          echo === invoking bat ===
-          call "%GITHUB_WORKSPACE%\scripts\build_windows.bat" dataplane
-          echo === bat returned ERRORLEVEL=%ERRORLEVEL% ===
+          call scripts\build_windows.bat dataplane
       - name: Package Windows release tree
         shell: pwsh
         run: |

@@ -1,5 +1,4 @@
-echo ENTERED_BUILD_WINDOWS
-@echo on
+@echo off
 REM Build Windows binaries for thirp-runtime.
 REM   scripts\build_windows.bat            all CLIs + libthirp.dll (local convenience)
 REM   scripts\build_windows.bat dataplane  agent, caller, libthirp.dll only
@@ -11,7 +10,7 @@ set ROOT=%CD%
 set MODE=all
 if /i "%~1"=="dataplane" set MODE=dataplane
 if not "%~1"=="" if /i not "%~1"=="dataplane" (
-    echo build_windows: unknown mode: %~1 (use all or dataplane) >&2
+    echo build_windows: unknown mode: %~1 - use all or dataplane >&2
     exit /b 1
 )
 
@@ -27,17 +26,16 @@ if "!COMMIT!"=="" set COMMIT=unknown
 
 echo Building thirp-runtime %VERSION% for Windows (%MODE%)...
 
-where odin
+where odin >nul 2>&1
 if errorlevel 1 (
     echo Error: odin compiler not found. Install from https://odin-lang.org/ >&2
     exit /b 1
 )
 
-where openssl
+where openssl >nul 2>&1
 if errorlevel 1 (
     echo Error: OpenSSL not found. Install OpenSSL 3 for Windows >&2
     echo See: https://wiki.openssl.org/index.php/Binaries >&2
-    echo PATH=%PATH% >&2
     exit /b 1
 )
 
