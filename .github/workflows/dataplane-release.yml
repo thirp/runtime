@@ -154,8 +154,22 @@ jobs:
           }
           # Compile in the SAME cmd session as vcvars so MSVC env applies.
           # Quote the whole /c string so PowerShell does not split on &&
-          $compile = "cd /d `"$pwd`" && call `"$vcvars`" && where openssl && where odin && call scripts\build_windows.bat dataplane"
+          $log = Join-Path $pwd "bat_log.txt"
+          $compile = @"
+cd /d "$pwd"
+call "$vcvars"
+echo === pre-bat ===
+where openssl
+where odin
+dir scripts\build_windows.bat
+echo === running bat ===
+call scripts\build_windows.bat dataplane > "$log" 2>&1
+echo BAT_EXIT=%ERRORLEVEL%
+type "$log"
+exit /b %ERRORLEVEL%
+"@
           $p = Start-Process -FilePath cmd.exe -ArgumentList @('/c', $compile) -Wait -PassThru -NoNewWindow
+          if (Test-Path $log) { Write-Host "---- bat_log.txt ----"; Get-Content $log | ForEach-Object { Write-Host $_ } }
           if ($p.ExitCode -ne 0) { throw "build_windows.bat dataplane failed ($($p.ExitCode))" }
           # Package checksums / provenance / zip (compile already done)
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\release_windows.ps1 -SkipBuild
