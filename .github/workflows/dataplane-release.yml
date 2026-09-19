@@ -138,40 +138,18 @@ jobs:
         shell: pwsh
         run: |
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          if (-not (Test-Path $vswhere)) { throw "vswhere.exe missing — Visual Studio Installer not on runner" }
+          if (-not (Test-Path $vswhere)) { throw "vswhere.exe missing" }
           $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-          if (-not $vsPath) { throw "No VS install with VC Tools x86.x64 found" }
+          if (-not $vsPath) { throw "No VS install with VC Tools found" }
           $vcvars = Join-Path $vsPath "VC\Auxiliary\Build\vcvars64.bat"
-          if (-not (Test-Path $vcvars)) { throw "vcvars64.bat missing at $vcvars" }
           Write-Host "Using vcvars: $vcvars"
           if ($env:OPENSSL_ROOT_DIR) {
             $opensslBin = Join-Path $env:OPENSSL_ROOT_DIR "bin"
-            if (Test-Path $opensslBin) {
-              $env:PATH = "$opensslBin;$env:PATH"
-              # Persist into the nested cmd that runs the bat
-              Add-Content -Path $env:GITHUB_PATH -Value $opensslBin
-            }
+            if (Test-Path $opensslBin) { $env:PATH = "$opensslBin;$env:PATH" }
           }
-          # Compile in the SAME cmd session as vcvars so MSVC env applies.
-          # Quote the whole /c string so PowerShell does not split on &&
-          $log = Join-Path $pwd "bat_log.txt"
-          $compile = @"
-cd /d "$pwd"
-call "$vcvars"
-echo === pre-bat ===
-where openssl
-where odin
-dir scripts\build_windows.bat
-echo === running bat ===
-call scripts\build_windows.bat dataplane > "$log" 2>&1
-echo BAT_EXIT=%ERRORLEVEL%
-type "$log"
-exit /b %ERRORLEVEL%
-"@
-          $p = Start-Process -FilePath cmd.exe -ArgumentList @('/c', $compile) -Wait -PassThru -NoNewWindow
-          if (Test-Path $log) { Write-Host "---- bat_log.txt ----"; Get-Content $log | ForEach-Object { Write-Host $_ } }
-          if ($p.ExitCode -ne 0) { throw "build_windows.bat dataplane failed ($($p.ExitCode))" }
-          # Package checksums / provenance / zip (compile already done)
+          $helper = Join-Path $pwd "scripts\ci_build_windows_dataplane.cmd"
+          $proc = Start-Process -FilePath cmd.exe -ArgumentList @('/c', "`"$helper`" `"$vcvars`"") -Wait -PassThru -NoNewWindow
+          if ($proc.ExitCode -ne 0) { throw "build_windows.bat dataplane failed ($($proc.ExitCode))" }
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\release_windows.ps1 -SkipBuild
           if ($LASTEXITCODE -ne 0) { throw "release_windows.ps1 -SkipBuild failed ($LASTEXITCODE)" }
       - uses: actions/upload-artifact@v4
