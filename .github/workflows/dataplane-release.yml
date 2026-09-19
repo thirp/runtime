@@ -153,11 +153,12 @@ jobs:
             }
           }
           # Compile in the SAME cmd session as vcvars so MSVC env applies.
-          $compile = "call `"$vcvars`" && echo PATH_HAS_OPENSSL= && where openssl && call scripts\build_windows.bat dataplane"
-          cmd.exe /c $compile
-          if ($LASTEXITCODE -ne 0) { throw "build_windows.bat dataplane failed ($LASTEXITCODE)" }
+          # Quote the whole /c string so PowerShell does not split on &&
+          $compile = "cd /d `"$pwd`" && call `"$vcvars`" && where openssl && where odin && call scripts\build_windows.bat dataplane"
+          $p = Start-Process -FilePath cmd.exe -ArgumentList @('/c', $compile) -Wait -PassThru -NoNewWindow
+          if ($p.ExitCode -ne 0) { throw "build_windows.bat dataplane failed ($($p.ExitCode))" }
           # Package checksums / provenance / zip (compile already done)
-          powershell -NoProfile -ExecutionPolicy Bypass -File scripts\release_windows.ps1 -SkipBuild
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\release_windows.ps1 -SkipBuild
           if ($LASTEXITCODE -ne 0) { throw "release_windows.ps1 -SkipBuild failed ($LASTEXITCODE)" }
       - uses: actions/upload-artifact@v4
         with:
