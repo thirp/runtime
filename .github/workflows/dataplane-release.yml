@@ -135,16 +135,23 @@ jobs:
             Add-Content -Path $env:GITHUB_ENV -Value "THIRP_WINDOWS_PFX_PASSWORD=$($env:WINDOWS_CERT_PASSWORD)"
           }
       - name: Build data-plane release tree
-        shell: cmd
+        shell: pwsh
         run: |
-          if exist "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" (
-            call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-          ) else if exist "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" (
-            call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
-          ) else (
-            call "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
-          )
-          powershell -NoProfile -ExecutionPolicy Bypass -File scripts\release_windows.ps1
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { throw "vswhere.exe missing — Visual Studio Installer not on runner" }
+          $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsPath) { throw "No VS install with VC Tools x86.x64 found" }
+          $vcvars = Join-Path $vsPath "VC\Auxiliary\Build\vcvars64.bat"
+          if (-not (Test-Path $vcvars)) { throw "vcvars64.bat missing at $vcvars" }
+          Write-Host "Using vcvars: $vcvars"
+          # Ensure OpenSSL bin is on PATH for nested cmd (GITHUB_PATH already applied to this shell)
+          if ($env:OPENSSL_ROOT_DIR) {
+            $opensslBin = Join-Path $env:OPENSSL_ROOT_DIR "bin"
+            if (Test-Path $opensslBin) { $env:PATH = "$opensslBin;$env:PATH" }
+          }
+          $cmd = "call `"$vcvars`" && powershell -NoProfile -ExecutionPolicy Bypass -File scripts\release_windows.ps1"
+          cmd.exe /c $cmd
+          if ($LASTEXITCODE -ne 0) { throw "release_windows.ps1 failed ($LASTEXITCODE)" }
       - uses: actions/upload-artifact@v4
         with:
           name: thirp-runtime-windows

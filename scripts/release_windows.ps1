@@ -59,6 +59,8 @@ $Out = Join-Path $Root "dist\thirp-runtime-windows-$Version"
 $Archive = Join-Path $Root "dist\thirp-runtime-windows-$Arch-$Version.zip"
 
 Write-Host "release_windows: building $Version commit $Commit ($Worktree) $Arch"
+Write-Host "release_windows: openssl=$OpenSslVer path=$($OpenSsl.Source)"
+Write-Host "release_windows: odin=$OdinVer path=$($Odin.Source)"
 $BuildBat = Join-Path $Root "scripts\build_windows.bat"
 & cmd.exe /c "`"$BuildBat`" dataplane"
 if ($LASTEXITCODE -ne 0) {
