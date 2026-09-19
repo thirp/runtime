@@ -1,9 +1,7 @@
 package transport
 
-import "core:c"
 import "core:net"
 import "core:sync"
-import "core:sys/posix"
 import "core:time"
 
 READ_BUF_SIZE :: 4096
@@ -161,48 +159,14 @@ connection_peek :: proc(conn: ^Connection, dst: []u8) -> (n: int, err: Transport
 	if len(dst) == 0 {
 		return 0, .None
 	}
-	got := posix.recv(
-		posix.FD(connection_socket_fd(conn)),
-		raw_data(dst),
-		c.size_t(len(dst)),
-		{.PEEK},
-	)
-	if got < 0 {
-		#partial switch posix.get_errno() {
-		case .EAGAIN, .ETIMEDOUT:
-			return 0, .Timeout
-		case .ECONNRESET, .ENOTCONN, .EPIPE:
-			conn.closed = true
-			return 0, .Closed
-		}
-		return 0, .Network
-	}
-	if got == 0 {
-		conn.closed = true
-		return 0, .Closed
-	}
-	return int(got), .None
+	return connection_peek_impl(conn, dst)
 }
 
 connection_set_recv_lowat :: proc(conn: ^Connection, n: int) -> TransportError {
 	if conn == nil || conn.closed {
 		return .Closed
 	}
-	val: c.int = 1
-	if n > 1 {
-		val = c.int(n)
-	}
-	rc := posix.setsockopt(
-		posix.FD(connection_socket_fd(conn)),
-		posix.SOL_SOCKET,
-		.RCVLOWAT,
-		&val,
-		posix.socklen_t(size_of(val)),
-	)
-	if rc != .OK {
-		return .Network
-	}
-	return .None
+	return connection_set_recv_lowat_impl(conn, n)
 }
 
 connection_write :: proc(conn: ^Connection, src: []u8) -> TransportError {
@@ -231,6 +195,22 @@ connection_set_recv_timeout :: proc(conn: ^Connection, timeout: time.Duration) -
 	}
 	conn.recv_timeout = timeout
 	opt_err := net.set_option(conn.socket, .Receive_Timeout, timeout)
+	if opt_err != .None {
+		return .Network
+	}
+	return .None
+}
+
+// Send timeout for TLS WANT_WRITE polls and SO_SNDTIMEO on the TCP socket.
+// Zero means block until the peer drains (preferred for DATA backpressure).
+// Must not share the short recv_timeout used by relay heartbeat polling —
+// that incorrectly turns healthy backpressure into write Timeout / RESET.
+connection_set_send_timeout :: proc(conn: ^Connection, timeout: time.Duration) -> TransportError {
+	if conn == nil || conn.closed {
+		return .Closed
+	}
+	conn.send_timeout = timeout
+	opt_err := net.set_option(conn.socket, .Send_Timeout, timeout)
 	if opt_err != .None {
 		return .Network
 	}

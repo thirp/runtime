@@ -10,9 +10,7 @@ import ver "../version"
 import "core:fmt"
 import "core:net"
 import "core:os"
-import posix "core:sys/posix"
 import "core:strings"
-import "core:thread"
 
 ServiceMapping :: struct {
 	service: string,
@@ -340,30 +338,13 @@ run :: proc() -> int {
 		}
 	}
 
-	set: posix.sigset_t
-	posix.sigemptyset(&set)
-	posix.sigaddset(&set, .SIGINT)
-	posix.sigaddset(&set, .SIGTERM)
-	posix.pthread_sigmask(.BLOCK, &set, nil)
-	waiter := AgentSignalWaiter{set = set, agent = &agent}
-	_ = thread.create_and_start_with_poly_data(&waiter, agent_signal_wait)
+	agent_setup_interrupt(&agent)
 
 	for m in parsed {
 		fmt.printf("registered %s -> %s\n", m.service, net.endpoint_to_string(m.target))
 	}
 	_ = ag.agent_run(&agent)
 	return 0
-}
-
-AgentSignalWaiter :: struct {
-	set:   posix.sigset_t,
-	agent: ^ag.Agent,
-}
-
-agent_signal_wait :: proc(w: ^AgentSignalWaiter) {
-	sig: posix.Signal
-	_ = posix.sigwait(&w.set, &sig)
-	ag.agent_stop(w.agent)
 }
 
 print_agent_config_read_error :: proc(err: cfg.ConfigError) {

@@ -4,7 +4,6 @@ import "core:c"
 import "core:net"
 import "core:strings"
 import "core:sync"
-import "core:sys/posix"
 import "core:time"
 
 TLS_HANDSHAKE_TIMEOUT :: 10 * time.Second
@@ -12,10 +11,7 @@ TLS_HANDSHAKE_TIMEOUT :: 10 * time.Second
 openssl_once: sync.Once
 
 openssl_ensure_init :: proc() {
-	sync.once_do(&openssl_once, proc() {
-		_ = OPENSSL_init_ssl(OPENSSL_INIT_LOAD_SSL_STRINGS | OPENSSL_INIT_LOAD_CRYPTO_STRINGS, nil)
-		_ = posix.sigignore(.SIGPIPE)
-	})
+	sync.once_do(&openssl_once, openssl_once_init)
 }
 
 tls_server_context_init :: proc(
@@ -147,7 +143,7 @@ tls_client_context_new :: proc(cfg: TlsClientConfig, allocator := context.alloca
 	}
 	SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nil)
 	if len(cfg.ca_path) == 0 {
-		if SSL_CTX_set_default_verify_paths(ctx) != 1 {
+		if !tls_client_context_load_system_ca(ctx) {
 			SSL_CTX_free(ctx)
 			return nil, .Tls
 		}
@@ -323,33 +319,12 @@ tls_poll_timeout_ms :: proc(timeout: time.Duration) -> c.int {
 	return c.int(ms)
 }
 
+tls_wait_socket :: proc(conn: ^Connection, want_write: bool, timeout: time.Duration) -> TransportError {
+	return tls_wait_socket_impl(conn, want_write, timeout)
+}
+
 tls_poll :: proc(conn: ^Connection, want_write: bool, timeout: time.Duration) -> TransportError {
-	if conn == nil || conn.closed {
-		return .Closed
-	}
-	pfd: posix.pollfd
-	pfd.fd = posix.FD(connection_socket_fd(conn))
-	pfd.events = want_write ? {.OUT} : {.IN}
-	n := posix.poll(&pfd, 1, tls_poll_timeout_ms(timeout))
-	if n == 0 {
-		return .Timeout
-	}
-	if n < 0 {
-		return .Network
-	}
-	if .NVAL in pfd.revents {
-		conn.closed = true
-		return .Closed
-	}
-	ready := want_write ? (.OUT in pfd.revents) : (.IN in pfd.revents)
-	if ready {
-		return .None
-	}
-	if .HUP in pfd.revents || .ERR in pfd.revents {
-		conn.closed = true
-		return .Closed
-	}
-	return .None
+	return tls_wait_socket(conn, want_write, timeout)
 }
 
 tls_map_ssl_error :: proc(conn: ^Connection, rc: c.int, ssl_err: c.int) -> TransportError {
@@ -424,7 +399,7 @@ tls_connection_write :: proc(conn: ^Connection, src: []u8) -> TransportError {
 		if mapped != .WouldBlock {
 			return mapped
 		}
-		poll_err := tls_poll(conn, ssl_err != SSL_ERROR_WANT_READ, conn.recv_timeout)
+		poll_err := tls_poll(conn, ssl_err != SSL_ERROR_WANT_READ, conn.send_timeout)
 		if poll_err != .None {
 			return poll_err
 		}

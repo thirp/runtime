@@ -6,6 +6,8 @@ SSL :: distinct rawptr
 SSL_CTX :: distinct rawptr
 SSL_METHOD :: distinct rawptr
 BIO :: distinct rawptr
+X509_STORE :: distinct rawptr
+X509 :: distinct rawptr
 
 SSL_FILETYPE_PEM :: 1
 TLS1_2_VERSION :: 0x0303
@@ -40,9 +42,16 @@ AlpnSelectCb :: #type proc "c" (
 	arg: rawptr,
 ) -> c.int
 
-foreign import openssl {
-	"system:ssl",
-	"system:crypto",
+when ODIN_OS == .Windows {
+	foreign import openssl {
+		"system:libssl",
+		"system:libcrypto",
+	}
+} else {
+	foreign import openssl {
+		"system:ssl",
+		"system:crypto",
+	}
 }
 
 foreign openssl {
@@ -77,6 +86,10 @@ foreign openssl {
 	SSL_CTX_set_alpn_select_cb :: proc(ctx: SSL_CTX, cb: AlpnSelectCb, arg: rawptr) ---
 	SSL_set_alpn_protos :: proc(ssl: SSL, protos: [^]u8, protos_len: c.uint) -> c.int ---
 	ERR_clear_error :: proc() ---
+	SSL_CTX_get_cert_store :: proc(ctx: SSL_CTX) -> X509_STORE ---
+	X509_STORE_add_cert :: proc(ctx: X509_STORE, x: X509) -> c.int ---
+	d2i_X509 :: proc(a: ^X509, pp: ^^u8, length: c.long) -> X509 ---
+	X509_free :: proc(a: X509) ---
 }
 
 ssl_ctx_set_min_proto_tls12 :: proc(ctx: SSL_CTX) -> bool {

@@ -12,8 +12,6 @@ import "core:net"
 import "core:os"
 import "core:strconv"
 import "core:strings"
-import posix "core:sys/posix"
-import "core:thread"
 import "core:time"
 
 usage :: proc() {
@@ -720,36 +718,11 @@ main :: proc() {
 		fmt.printf("metrics on http://%s/metrics (/healthz /readyz)\n", net.endpoint_to_string(mbound))
 	}
 
-	set: posix.sigset_t
-	posix.sigemptyset(&set)
-	posix.sigaddset(&set, .SIGINT)
-	posix.sigaddset(&set, .SIGTERM)
-	posix.pthread_sigmask(.BLOCK, &set, nil)
-	waiter := SignalWaiter {
-		server = &server,
-		set    = set,
-	}
-	th := thread.create_and_start_with_poly_data(&waiter, signal_wait_proc)
-	_ = th
+	broker_setup_interrupt(&server)
 	broker.server_serve(&server)
 	broker.server_drain(&server, server.shutdown_grace)
 	_ = broker.server_wait_idle(&server, server.shutdown_grace + 2 * time.Second)
 	broker.server_destroy(&server)
-}
-
-SignalWaiter :: struct {
-	server: ^broker.Server,
-	set:    posix.sigset_t,
-}
-
-signal_wait_proc :: proc(w: ^SignalWaiter) {
-	sig: posix.Signal
-	_ = posix.sigwait(&w.set, &sig)
-	w.server.stop = true
-	if w.server.listening {
-		trans.listener_close(&w.server.listener)
-		w.server.listening = false
-	}
 }
 
 print_config_read_error :: proc(err: cfg.ConfigError) {
