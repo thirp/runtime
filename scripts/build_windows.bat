@@ -55,8 +55,8 @@ for %%D in (
     "%OPENSSL_ROOT%\lib64"
     "%OPENSSL_ROOT%\lib\VC\x64\MDd"
 ) do (
-    if "%OPENSSL_LIBPATH%"=="" if exist "%%~D\libssl.lib" set "OPENSSL_LIBPATH=%%~D"
-    if "%OPENSSL_LIBPATH%"=="" if exist "%%~D\libssl-3-x64.lib" set "OPENSSL_LIBPATH=%%~D"
+    if "!OPENSSL_LIBPATH!"=="" if exist "%%~D\libssl.lib" set "OPENSSL_LIBPATH=%%~D"
+    if "!OPENSSL_LIBPATH!"=="" if exist "%%~D\libssl-3-x64.lib" set "OPENSSL_LIBPATH=%%~D"
 )
 if "%OPENSSL_LIBPATH%"=="" (
     echo Error: libssl.lib not found under %OPENSSL_ROOT% >&2

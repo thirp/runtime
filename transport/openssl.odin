@@ -43,9 +43,10 @@ AlpnSelectCb :: #type proc "c" (
 ) -> c.int
 
 when ODIN_OS == .Windows {
+	// MSVC needs the .lib suffix; bare "libssl" becomes libssl.obj and fails LNK1181.
 	foreign import openssl {
-		"system:libssl",
-		"system:libcrypto",
+		"system:libssl.lib",
+		"system:libcrypto.lib",
 	}
 } else {
 	foreign import openssl {
