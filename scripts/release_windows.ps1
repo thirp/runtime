@@ -82,7 +82,7 @@ if (-not $SkipBuild) {
 		throw "release_windows: build_windows.bat dataplane failed ($buildExit)"
 	}
 } else {
-	Write-Host "release_windows: SkipBuild — packaging existing dist tree"
+	Write-Host "release_windows: SkipBuild - packaging existing dist tree"
 }
 
 foreach ($name in @("thirp-agent.exe", "thirp-connect.exe", "libthirp.dll")) {

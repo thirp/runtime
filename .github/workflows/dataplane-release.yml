@@ -158,7 +158,7 @@ jobs:
       - name: Package Windows release tree
         shell: pwsh
         run: |
-          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\release_windows.ps1 -SkipBuild
+          pwsh -NoProfile -File scripts/release_windows.ps1 -SkipBuild
           if ($LASTEXITCODE -ne 0) { throw "release_windows.ps1 -SkipBuild failed ($LASTEXITCODE)" }
       - uses: actions/upload-artifact@v4
         with:
