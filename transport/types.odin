@@ -14,6 +14,7 @@ Connection :: struct {
 	remote:        net.Endpoint,
 	tls:           ^TlsSession,
 	recv_timeout:  time.Duration,
+	send_timeout:  time.Duration, // TLS WANT_WRITE poll; 0 = block (do not use recv_timeout)
 }
 
 Listener :: struct {
