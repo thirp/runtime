@@ -1,0 +1,168 @@
+# Data-plane release binaries for macOS and Windows.
+# GitHub Actions YAML; Origin-compatible if the forge runs GHA workflows.
+# Native compile jobs need macos-latest / windows-latest (or self-hosted
+# equivalents). This repository's Linux cloud agents cannot run those jobs.
+#
+# Secrets Chuck must supply for a signed publish (all optional; unsigned
+# checksums still upload):
+#   THIRP_GPG_PRIVATE_KEY     ASCII-armored private key (fingerprint in docs/SECURITY.md)
+#   THIRP_GPG_PASSPHRASE      if the key is protected
+#   THIRP_MACOS_CODESIGN_IDENTITY   Apple Developer ID Application identity name
+#   THIRP_MACOS_CERT_P12      base64 Developer ID .p12 (import on the Mac runner)
+#   THIRP_MACOS_CERT_PASSWORD password for that .p12
+#   THIRP_MACOS_NOTARY_PROFILE notarytool keychain profile name (after one-time store-credentials)
+#   THIRP_WINDOWS_PFX         path or uploaded PFX (see WINDOWS_CERT_PFX below)
+#   WINDOWS_CERT_PFX          base64 Authenticode PFX
+#   THIRP_WINDOWS_PFX_PASSWORD / WINDOWS_CERT_PASSWORD
+name: dataplane-release
+
+on:
+  push:
+    branches: [master, main]
+    tags: ["v*"]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+
+concurrency:
+  group: dataplane-release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate release scripts and fixtures
+        run: bash scripts/release_dataplane_test.sh
+
+  macos:
+    needs: check
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install OpenSSL 3
+        run: brew install openssl@3
+      - name: Install Odin
+        run: bash scripts/ci_setup_odin.sh
+      - name: Import Apple Developer ID
+        if: ${{ secrets.THIRP_MACOS_CERT_P12 != '' }}
+        env:
+          THIRP_MACOS_CERT_P12: ${{ secrets.THIRP_MACOS_CERT_P12 }}
+          THIRP_MACOS_CERT_PASSWORD: ${{ secrets.THIRP_MACOS_CERT_PASSWORD }}
+        run: |
+          printf '%s' "$THIRP_MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/developer-id.p12"
+          KEYCHAIN="$RUNNER_TEMP/thirp.keychain-db"
+          security create-keychain -p "" "$KEYCHAIN"
+          security set-keychain-settings "$KEYCHAIN"
+          security unlock-keychain -p "" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/developer-id.p12" -k "$KEYCHAIN" \
+            -P "${THIRP_MACOS_CERT_PASSWORD}" -T /usr/bin/codesign -A
+          security list-keychains -d user -s "$KEYCHAIN"
+      - name: Build data-plane release tree
+        env:
+          THIRP_MACOS_CODESIGN_IDENTITY: ${{ secrets.THIRP_MACOS_CODESIGN_IDENTITY }}
+          THIRP_MACOS_NOTARY_PROFILE: ${{ secrets.THIRP_MACOS_NOTARY_PROFILE }}
+          THIRP_GPG_KEY: ${{ secrets.THIRP_GPG_KEY }}
+        run: bash scripts/release_macos.sh
+      - name: Import GPG and re-sign if the private key is present
+        if: ${{ secrets.THIRP_GPG_PRIVATE_KEY != '' }}
+        env:
+          THIRP_GPG_PRIVATE_KEY: ${{ secrets.THIRP_GPG_PRIVATE_KEY }}
+          THIRP_GPG_PASSPHRASE: ${{ secrets.THIRP_GPG_PASSPHRASE }}
+        run: |
+          printf '%s\n' "$THIRP_GPG_PRIVATE_KEY" | gpg --batch --import
+          VERSION="$(tr -d '[:space:]' < VERSION.txt)"
+          export THIRP_GPG_KEY="3B8559D8754FB3C5B21110C786897A405CF3D8C4"
+          # shellcheck source=scripts/release_common.sh
+          source scripts/release_common.sh
+          release_sign_sha256sums "dist/thirp-runtime-macos-${VERSION}/SHA256SUMS"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: thirp-runtime-macos
+          path: |
+            dist/thirp-runtime-macos-*
+          if-no-files-found: error
+
+  windows:
+    needs: check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install OpenSSL 3
+        shell: pwsh
+        run: |
+          choco install openssl --no-progress -y
+          $bin = "C:\Program Files\OpenSSL-Win64\bin"
+          $lib = "C:\Program Files\OpenSSL-Win64\lib"
+          if (-not (Test-Path $bin)) { throw "OpenSSL bin dir missing: $bin" }
+          Add-Content -Path $env:GITHUB_PATH -Value $bin
+          Add-Content -Path $env:GITHUB_PATH -Value $lib
+          Add-Content -Path $env:GITHUB_ENV -Value "OPENSSL_ROOT_DIR=C:\Program Files\OpenSSL-Win64"
+      - name: Install Odin
+        shell: pwsh
+        run: .\scripts\ci_setup_odin.ps1
+      - name: Import Authenticode certificate
+        if: ${{ secrets.WINDOWS_CERT_PFX != '' }}
+        env:
+          WINDOWS_CERT_PFX: ${{ secrets.WINDOWS_CERT_PFX }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        shell: pwsh
+        run: |
+          $bytes = [Convert]::FromBase64String($env:WINDOWS_CERT_PFX)
+          $path = Join-Path $env:RUNNER_TEMP "authenticode.pfx"
+          [IO.File]::WriteAllBytes($path, $bytes)
+          Add-Content -Path $env:GITHUB_ENV -Value "THIRP_WINDOWS_PFX=$path"
+          if ($env:WINDOWS_CERT_PASSWORD) {
+            Add-Content -Path $env:GITHUB_ENV -Value "THIRP_WINDOWS_PFX_PASSWORD=$($env:WINDOWS_CERT_PASSWORD)"
+          }
+      - name: Build data-plane release tree
+        shell: cmd
+        run: |
+          if exist "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" (
+            call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          ) else if exist "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" (
+            call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+          ) else (
+            call "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+          )
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts\release_windows.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: thirp-runtime-windows
+          path: |
+            dist/thirp-runtime-windows-*
+          if-no-files-found: error
+
+  publish:
+    if: github.repository == 'thirp/runtime' && startsWith(github.ref, 'refs/tags/v')
+    needs: [macos, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/ci
+      - name: Attach platform artifacts to the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          mapfile -t files < <(find dist/ci -type f | sort)
+          if [[ "${#files[@]}" -eq 0 ]]; then
+            echo "publish: no artifacts downloaded" >&2
+            exit 1
+          fi
+          if gh release view "$TAG" --repo thirp/runtime >/dev/null 2>&1; then
+            gh release upload "$TAG" "${files[@]}" --repo thirp/runtime --clobber
+          else
+            gh release create "$TAG" "${files[@]}" \
+              --repo thirp/runtime \
+              --title "Thirp Runtime ${TAG#v}" \
+              --notes "Linux operator artifacts are attached by scripts/publish_github.sh --release. This job adds macOS and Windows data-plane Agent/Caller binaries and libthirp. Verify SHA256SUMS; see docs/BUILDING.md and docs/SECURITY.md."
+          fi
