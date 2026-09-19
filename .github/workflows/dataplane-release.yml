@@ -134,7 +134,7 @@ jobs:
           if ($env:WINDOWS_CERT_PASSWORD) {
             Add-Content -Path $env:GITHUB_ENV -Value "THIRP_WINDOWS_PFX_PASSWORD=$($env:WINDOWS_CERT_PASSWORD)"
           }
-      - name: Build data-plane release tree
+      - name: Locate MSVC vcvars
         shell: pwsh
         run: |
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -142,14 +142,23 @@ jobs:
           $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
           if (-not $vsPath) { throw "No VS install with VC Tools found" }
           $vcvars = Join-Path $vsPath "VC\Auxiliary\Build\vcvars64.bat"
+          if (-not (Test-Path $vcvars)) { throw "vcvars64.bat missing at $vcvars" }
           Write-Host "Using vcvars: $vcvars"
+          Add-Content -Path $env:GITHUB_ENV -Value "VCVARS64=$vcvars"
           if ($env:OPENSSL_ROOT_DIR) {
             $opensslBin = Join-Path $env:OPENSSL_ROOT_DIR "bin"
-            if (Test-Path $opensslBin) { $env:PATH = "$opensslBin;$env:PATH" }
+            if (Test-Path $opensslBin) { Add-Content -Path $env:GITHUB_PATH -Value $opensslBin }
           }
-          $helper = Join-Path $pwd "scripts\ci_build_windows_dataplane.cmd"
-          $proc = Start-Process -FilePath cmd.exe -ArgumentList @('/c', "`"$helper`" `"$vcvars`"") -Wait -PassThru -NoNewWindow
-          if ($proc.ExitCode -ne 0) { throw "build_windows.bat dataplane failed ($($proc.ExitCode))" }
+      - name: Build data-plane release tree
+        shell: cmd
+        run: |
+          call "%VCVARS64%"
+          where openssl
+          where odin
+          call scripts\build_windows.bat dataplane
+      - name: Package Windows release tree
+        shell: pwsh
+        run: |
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\release_windows.ps1 -SkipBuild
           if ($LASTEXITCODE -ne 0) { throw "release_windows.ps1 -SkipBuild failed ($LASTEXITCODE)" }
       - uses: actions/upload-artifact@v4
