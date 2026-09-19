@@ -35,7 +35,15 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git init
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --depth 1 origin "${GITHUB_SHA}"
+          git checkout --force FETCH_HEAD
       - name: Validate release scripts and fixtures
         run: bash scripts/release_dataplane_test.sh
 
@@ -43,7 +51,15 @@ jobs:
     needs: check
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git init
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --depth 1 origin "${GITHUB_SHA}"
+          git checkout --force FETCH_HEAD
       - name: Install OpenSSL 3
         run: brew install openssl@3
       - name: Install Odin
@@ -86,7 +102,7 @@ jobs:
           # shellcheck source=scripts/release_common.sh
           source scripts/release_common.sh
           release_sign_sha256sums "dist/thirp-runtime-macos-${VERSION}/SHA256SUMS"
-      - uses: actions/upload-artifact@v4
+      - uses: ./.github/actions/upload-artifact
         with:
           name: thirp-runtime-macos
           path: |
@@ -97,7 +113,15 @@ jobs:
     needs: check
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git init
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --depth 1 origin "${GITHUB_SHA}"
+          git checkout --force FETCH_HEAD
       - name: Install OpenSSL 3
         shell: pwsh
         run: |
@@ -139,7 +163,7 @@ jobs:
             call "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
           )
           powershell -NoProfile -ExecutionPolicy Bypass -File scripts\release_windows.ps1
-      - uses: actions/upload-artifact@v4
+      - uses: ./.github/actions/upload-artifact
         with:
           name: thirp-runtime-windows
           path: |
@@ -153,8 +177,16 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - name: Checkout
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git init
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --depth 1 origin "${GITHUB_SHA}"
+          git checkout --force FETCH_HEAD
+      - uses: ./.github/actions/download-artifact
         with:
           path: dist/ci
       - name: Attach platform artifacts to the GitHub Release
