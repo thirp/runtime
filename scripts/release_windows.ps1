@@ -45,8 +45,8 @@ if ($OdinVer -notmatch 'dev-(\d{4}-\d{2})') {
 	throw "release_windows: could not parse Odin month from: $OdinVer"
 }
 $OdinMonth = $Matches[1]
-if ($OdinMonth -lt "2026-09") {
-	throw "release_windows: Odin $OdinVer is older than minimum dev-2026-09"
+if ($OdinMonth -lt "2026-07") {
+	throw "release_windows: Odin $OdinVer is older than minimum dev-2026-07"
 }
 
 $OpenSsl = Get-Command openssl -ErrorAction SilentlyContinue

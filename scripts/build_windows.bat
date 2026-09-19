@@ -43,18 +43,40 @@ set OUT=%ROOT%\dist\thirp-runtime-windows-%VERSION%
 if exist "%OUT%" rd /s /q "%OUT%"
 mkdir "%OUT%"
 
+REM Locate libssl.lib for MSVC (OpenSSL 3/4 Shining Light layouts).
+set "OPENSSL_ROOT=%OPENSSL_ROOT_DIR%"
+if "%OPENSSL_ROOT%"=="" set "OPENSSL_ROOT=C:\Program Files\OpenSSL"
+set "OPENSSL_LIBPATH="
+for %%D in (
+    "%OPENSSL_ROOT%\lib\VC\x64\MD"
+    "%OPENSSL_ROOT%\lib\VC\x64\MT"
+    "%OPENSSL_ROOT%\lib\VC\x64\MDd"
+    "%OPENSSL_ROOT%\lib"
+    "%OPENSSL_ROOT%\lib64"
+) do (
+    if exist "%%~D\libssl.lib" set "OPENSSL_LIBPATH=%%~D"
+    if exist "%%~D\libssl-3-x64.lib" if "%OPENSSL_LIBPATH%"=="" set "OPENSSL_LIBPATH=%%~D"
+)
+if "%OPENSSL_LIBPATH%"=="" (
+    echo Error: libssl.lib not found under %OPENSSL_ROOT% >&2
+    dir /s /b "%OPENSSL_ROOT%\*ssl*.lib" 2>nul
+    exit /b 1
+)
+echo Using OPENSSL_LIBPATH=%OPENSSL_LIBPATH%
+set "ODIN_LINK=/LIBPATH:"%OPENSSL_LIBPATH%""
+
 echo Building binaries...
 if /i "%MODE%"=="all" (
-    odin build broker_cli -out:"%OUT%\thirp-broker.exe" -define:THIRP_COMMIT="\"%COMMIT%\""
+    odin build broker_cli -out:"%OUT%\thirp-broker.exe" -define:THIRP_COMMIT="\"%COMMIT%\"" -extra-linker-flags:"%ODIN_LINK%"
     if errorlevel 1 exit /b 1
-    odin build web_ingress_cli -out:"%OUT%\thirp-web-ingress.exe" -define:THIRP_COMMIT="\"%COMMIT%\""
+    odin build web_ingress_cli -out:"%OUT%\thirp-web-ingress.exe" -define:THIRP_COMMIT="\"%COMMIT%\"" -extra-linker-flags:"%ODIN_LINK%"
     if errorlevel 1 exit /b 1
 )
-odin build agent_cli -out:"%OUT%\thirp-agent.exe" -define:THIRP_COMMIT="\"%COMMIT%\""
+odin build agent_cli -out:"%OUT%\thirp-agent.exe" -define:THIRP_COMMIT="\"%COMMIT%\"" -extra-linker-flags:"%ODIN_LINK%"
 if errorlevel 1 exit /b 1
-odin build caller_cli -out:"%OUT%\thirp-connect.exe" -define:THIRP_COMMIT="\"%COMMIT%\""
+odin build caller_cli -out:"%OUT%\thirp-connect.exe" -define:THIRP_COMMIT="\"%COMMIT%\"" -extra-linker-flags:"%ODIN_LINK%"
 if errorlevel 1 exit /b 1
-odin build c_abi -build-mode:shared -out:"%OUT%\libthirp.dll"
+odin build c_abi -build-mode:shared -out:"%OUT%\libthirp.dll" -extra-linker-flags:"%ODIN_LINK%"
 if errorlevel 1 exit /b 1
 
 copy "%ROOT%\c_abi\thirp.h" "%OUT%\thirp.h"
