@@ -144,14 +144,21 @@ jobs:
           $vcvars = Join-Path $vsPath "VC\Auxiliary\Build\vcvars64.bat"
           if (-not (Test-Path $vcvars)) { throw "vcvars64.bat missing at $vcvars" }
           Write-Host "Using vcvars: $vcvars"
-          # Ensure OpenSSL bin is on PATH for nested cmd (GITHUB_PATH already applied to this shell)
           if ($env:OPENSSL_ROOT_DIR) {
             $opensslBin = Join-Path $env:OPENSSL_ROOT_DIR "bin"
-            if (Test-Path $opensslBin) { $env:PATH = "$opensslBin;$env:PATH" }
+            if (Test-Path $opensslBin) {
+              $env:PATH = "$opensslBin;$env:PATH"
+              # Persist into the nested cmd that runs the bat
+              Add-Content -Path $env:GITHUB_PATH -Value $opensslBin
+            }
           }
-          $cmd = "call `"$vcvars`" && powershell -NoProfile -ExecutionPolicy Bypass -File scripts\release_windows.ps1"
-          cmd.exe /c $cmd
-          if ($LASTEXITCODE -ne 0) { throw "release_windows.ps1 failed ($LASTEXITCODE)" }
+          # Compile in the SAME cmd session as vcvars so MSVC env applies.
+          $compile = "call `"$vcvars`" && echo PATH_HAS_OPENSSL= && where openssl && call scripts\build_windows.bat dataplane"
+          cmd.exe /c $compile
+          if ($LASTEXITCODE -ne 0) { throw "build_windows.bat dataplane failed ($LASTEXITCODE)" }
+          # Package checksums / provenance / zip (compile already done)
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts\release_windows.ps1 -SkipBuild
+          if ($LASTEXITCODE -ne 0) { throw "release_windows.ps1 -SkipBuild failed ($LASTEXITCODE)" }
       - uses: actions/upload-artifact@v4
         with:
           name: thirp-runtime-windows
