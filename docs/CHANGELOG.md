@@ -4,6 +4,10 @@ Project version is independent of the wire protocol version. This tree speaks pr
 
 ## Unreleased
 
+Docs: release matrix matches published unsigned multi-OS dataplane ([v0.16.3-dataplane-unsigned](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned)) — macOS arm64, Windows AMD64, Linux x86_64; embed SDK tarball still Linux `.so` only; operator/Broker stack remains Linux-primary; macOS Intel and OS-level signing not claimed.
+
+Windows dataplane link: `system:libssl.lib` / `system:libcrypto.lib` and `LIB` search under `OPENSSL_ROOT_DIR` / `C:\Program Files\OpenSSL` (OpenSSL 4). macOS: weak `_odin_entry_point` so Odin 2026-09 Darwin `posix_spawnp` link finds the symbol. CI downloads 2026-09 `.tar.gz` nightlies.
+
 Caller no longer RESET finished or unknown streams. Broker delivers terminal CLOSE/RESET after dropping leftover DATA (fixes CLOSE-delivery / stuck agent fds). Broker rate-limits `STREAM_NOT_FOUND` stream_reset Info logs. Agent no longer RESET finished or unknown streams. Broker outbox cleanup on stream termination. macOS and Windows CLIs, C ABI libraries, and automated data-plane release packaging. Protocol 1.0 unchanged.
 
 - **Caller + Broker**: Post-stop idle RESET storm after PR #4. Two remaining bugs, no protocol change. (1) `conn_handle_stream_frame` called `server_drop_stream_queues` *after* enqueueing the terminal CLOSE/RESET/second HALF_CLOSE, so the peer never got the frame. Agent origin fds stayed open (N=256 → ~258 stuck). (2) Caller still echoed `RESET` / `STREAM_NOT_FOUND` on DATA / HALF_CLOSE / CLOSE / RESET for a stream `conn_close` had already removed — same ping-pong PR #4 stopped on the agent (~383k `stream_not_found`/s, broker RSS 121→2749 MiB / 5 min). Fix: drop leftover DATA first, then enqueue the terminal frame, then `relay_drop_stream`. Caller ignores unknown/finished stream frames. Regression: N=32 Caller `conn_destroy` burst then idle — `resets_total{reason=stream_not_found}` stays flat and echo origin conns return to 0. Broker test: caller CLOSE is readable on the agent after queued DATA.
@@ -21,7 +25,7 @@ Caller no longer RESET finished or unknown streams. Broker delivers terminal CLO
 - Windows Ctrl-C/console close handling via SetConsoleCtrlHandler
 - Portable temp file paths in tests respect TEMP/TMP/TMPDIR environment variables
 - Build scripts: `scripts/build_macos.sh` and `scripts/build_windows.bat` (`dataplane` mode for Agent/Caller/`libthirp` only)
-- Data-plane release packaging: `scripts/release_macos.sh`, `scripts/release_windows.ps1`, checksums, provenance, optional GPG. GitHub Actions workflow `.github/workflows/dataplane-release.yml` builds those trees on `macos-latest` / `windows-latest`. B-010 packaging is no longer a manual-only path. Apple Developer ID (`THIRP_MACOS_CODESIGN_IDENTITY`) and Authenticode (`THIRP_WINDOWS_PFX`) remain Chuck-supplied secrets.
+- Data-plane release packaging: `scripts/release_macos.sh`, `scripts/release_windows.ps1`, checksums, provenance, optional GPG. GitHub Actions workflow `.github/workflows/dataplane-release.yml` builds those trees on `macos-latest` / `windows-latest`. Unsigned multi-OS dataplane packaging is automated. Apple Developer ID (`THIRP_MACOS_CODESIGN_IDENTITY`) and Authenticode (`THIRP_WINDOWS_PFX`) remain Chuck-supplied secrets.
 - Documentation: BUILDING.md, README.md, DEPENDENCIES.md, COMPATIBILITY.md, SECURITY.md updated for cross-platform release and verification
 - Agent and broker CLI signal handling split into `interrupt_{linux,darwin,windows}.odin`
 Agent stream cleanup on broker write failure. Protocol 1.0, the C ABI, and the Agent/Caller SDK surface are unchanged.

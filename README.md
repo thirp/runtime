@@ -29,7 +29,7 @@ operational problems.
 | What it is | Apache-2.0 Broker, Agent, Caller, CLI tools, Web Ingress, and embeddable SDK | Managed control plane and hosted Broker operation built on Thirp Runtime |
 | Access control | Standalone Broker: static credentials and file-backed, deny-by-default policy | Managed identity, customer approval, timed grants, revocation, audit, and usage |
 | Operating model | Self-hosted | Thirp-hosted |
-| Availability | Public Linux release artifacts and source; independently useful | Selective hosted pilot; not part of this repository |
+| Availability | Public Linux operator release, multi-OS dataplane artifacts, and source; independently useful | Selective hosted pilot; not part of this repository |
 
 The customer-side process used with Thirp Cloud is the same open-source
 `thirp-agent` provided by Runtime. Runtime does not require Thirp Cloud.
@@ -41,17 +41,36 @@ Learn about the managed pilot at [thirp.net](https://thirp.net/).
 - Source version: **0.16.3**
 - Wire protocol: **1.0**, frozen and documented in
   [docs/PROTOCOL.md](docs/PROTOCOL.md)
-- Current target: **Linux**, using OpenSSL 3
-- SDKs: Odin source packages and Linux `libthirp.so` C ABI
-- Release artifacts: Linux operator binaries, `libthirp.so`, SDK and Broker
-  tarballs, source, SBOM, checksums, and provenance
-- Not yet available: Windows/macOS CLIs and QUIC transport
+- Platforms: **Linux** (full operator release + dataplane), **macOS arm64** and
+  **Windows AMD64** (dataplane Agent/Caller CLIs and C ABI shared libraries).
+  macOS **amd64 (Intel)** is not published yet.
+- SDKs: Odin source packages and C ABI (`libthirp.so` Linux, `libthirp.dylib`
+  macOS, `libthirp.dll` Windows). The embed SDK tarball still ships the Linux
+  `.so` only; macOS/Windows `libthirp` ship in dataplane release trees.
+- Release artifacts:
+  - Linux operator: binaries, `libthirp.so`, SDK and Broker tarballs, source,
+    SBOM, checksums, and provenance (tag `v0.16.3` and later operator releases)
+  - Multi-OS **unsigned** dataplane:
+    [v0.16.3-dataplane-unsigned](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned)
+    — macOS arm64, Windows AMD64, and Linux x86_64 zips (`thirp-agent` /
+    `thirp-connect` / `libthirp` + `SHA256SUMS` + `UNSIGNED.md`). **Not signed**
+    (no Apple Developer ID, Authenticode, or GPG `SHA256SUMS.asc` on that tag).
+    Signing (Apple Developer ID, Authenticode, and GPG detached checksums) lands when certificates are available.
 
 The self-hosted Runtime implements TLS, role separation, deny-by-default
 production policy, bounded resources, reconnect, health/metrics, and graceful
-drain. Publishing Linux artifacts does not imply final production qualification:
-the 24-hour soak remains incomplete. Web Ingress has additional edge-facing
+drain. Publishing artifacts does not imply final production qualification: the
+24-hour soak remains incomplete. Web Ingress has additional edge-facing
 limitations described in the [security model](docs/SECURITY.md).
+
+Broker / Web Ingress / full operator stacks remain **Linux-primary** in the
+published operator Release. Dataplane Agent/Caller binaries on macOS and Windows
+are produced by `scripts/release_macos.sh` / `scripts/release_windows.ps1` and
+the green `dataplane-release` GitHub Actions workflow; they connect outbound to
+a Linux broker over TLS. Do not treat Gatekeeper or SmartScreen warnings as
+authenticity proofs until OS-level signing lands; see
+[Building](docs/BUILDING.md#macos-and-windows-data-plane-release) and
+[SECURITY.md](docs/SECURITY.md#release-signing).
 
 ## What is included
 
@@ -80,8 +99,12 @@ certificate, starts each component, and sends an HTTP request through the relay.
 **Start here: [Local TLS quickstart](docs/QUICKSTART.md).**
 
 Download published artifacts from
-[GitHub Releases](https://github.com/thirp/runtime/releases/latest). To compile
-individual components or produce the complete Linux artifact set, see
+[GitHub Releases](https://github.com/thirp/runtime/releases):
+Linux operator bits from the latest operator tag (e.g. `v0.16.3`); multi-OS
+dataplane zips from
+[v0.16.3-dataplane-unsigned](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned)
+(unsigned — verify with `SHA256SUMS`). To compile individual components, or to
+produce a platform release tree, see
 [Building, testing, and packaging](docs/BUILDING.md).
 
 ## How authorization works
@@ -126,9 +149,9 @@ and restart behavior are defined in [docs/COMPATIBILITY.md](docs/COMPATIBILITY.m
 Applications can host and dial services without spawning the command-line
 tools:
 
-- Odin applications import `thirp:agent` and `thirp:caller`.
-- C applications link the Linux shared library `libthirp.so` through
-  `thirp.h`.
+- Odin applications import `thirp:agent` and `thirp:caller` (all platforms).
+- C applications link the shared library `libthirp.so` (Linux), `libthirp.dylib`
+  (macOS), or `libthirp.dll` (Windows) through `thirp.h`.
 - Hosted Broker implementations can consume the Broker Odin collection and
   provide their own authenticator and authorizer.
 - Ephemeral hosting can generate a short join code for use cases such as

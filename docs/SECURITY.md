@@ -10,7 +10,20 @@ Release `SHA256SUMS` files may include a detached signature `SHA256SUMS.asc`. Th
 3B8559D8754FB3C5B21110C786897A405CF3D8C4
 ```
 
-Verify with `gpg --verify SHA256SUMS.asc SHA256SUMS`. Unsigned checksums are still usable; the signature is additional.
+Verify with `gpg --verify SHA256SUMS.asc SHA256SUMS`. Unsigned checksums are still usable; the signature is additional. The same fingerprint signs Linux operator `SHA256SUMS` and macOS/Windows data-plane `SHA256SUMS` when `THIRP_GPG_KEY` or the CI secret `THIRP_GPG_PRIVATE_KEY` is present.
+
+OS-level signatures are separate and optional:
+
+- macOS Developer ID: `THIRP_MACOS_CODESIGN_IDENTITY` (plus a `.p12` in CI). Notarization needs `THIRP_MACOS_NOTARY_PROFILE`.
+- Windows Authenticode: `THIRP_WINDOWS_PFX` / `WINDOWS_CERT_PFX`.
+
+Those certificates are not in this repository. Without them, Gatekeeper and SmartScreen warn; `SHA256SUMS` still identifies the files. See [BUILDING.md](BUILDING.md#signing-blockers-certs-pending).
+
+The pre-sign multi-OS dataplane Release
+([v0.16.3-dataplane-unsigned](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned))
+ships **unsigned** platform binaries and has **no** `SHA256SUMS.asc`. Verify that
+tag with `SHA256SUMS` only (and read `UNSIGNED.md` in the asset set). Do not claim
+Apple Developer ID, notarization, Authenticode, or GPG until a signed Release is published.
 
 This document is the threat model for a self-hosted Thirp Runtime deployment. It is not an external assessment and does not claim that the software is qualified for hostile public SaaS.
 

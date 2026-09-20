@@ -131,7 +131,7 @@ Caller: `conn_close` / `conn_destroy` for live streams, then `caller_destroy`.
 
 ## C ABI
 
-Linux shared library only. Header `c/include/thirp.h`, library `c/lib/linux-<arch>/libthirp.so`. Links system OpenSSL 3 (`libssl` / `libcrypto`). No static library. No versioned soname.
+The embed SDK tarball ships the Linux shared library only. Header `c/include/thirp.h`, library `c/lib/linux-<arch>/libthirp.so`. macOS `libthirp.dylib` and Windows `libthirp.dll` ship in the **dataplane** release trees (`dist/thirp-runtime-macos-<VERSION>/`, `dist/thirp-runtime-windows-<VERSION>/`, and the published [unsigned dataplane zips](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned)), not inside the SDK tarball. Links system OpenSSL 3 (`libssl` / `libcrypto`). No static library. No versioned soname.
 
 ```bash
 cc -o echo_client examples/c/echo_client/echo_client.c \

@@ -1,12 +1,15 @@
 # Building, testing, and packaging
 
-This document covers source builds and the Linux release pipeline. If you only
-want to see Runtime relay a service, begin with the
-[local TLS quickstart](QUICKSTART.md).
+This document covers source builds and the release pipeline. If you only want to
+see Runtime relay a service, begin with the [local TLS quickstart](QUICKSTART.md).
 
-## Supported build environment
+## Supported build environments
 
-The current release tooling targets Linux and requires:
+### Linux (full release artifacts)
+
+The Linux release tooling produces the complete operator artifact set
+(checksums always; GPG detached signature when the publish key is available) and
+requires:
 
 - [Odin](https://odin-lang.org/) `dev-2026-07` or later
 - OpenSSL 3 development files (`libssl` and `libcrypto`)
@@ -16,7 +19,25 @@ The current release tooling targets Linux and requires:
 The release script records the exact Odin and OpenSSL versions in generated
 provenance. See [DEPENDENCIES.md](DEPENDENCIES.md) for the dependency inventory.
 
+### macOS
+
+macOS builds are supported for CLIs and `libthirp.dylib`. Requirements:
+
+- [Odin](https://odin-lang.org/) `dev-2026-07` or later
+- OpenSSL 3 via Homebrew: `brew install openssl@3`
+- Xcode Command Line Tools
+
+### Windows
+
+Windows builds are supported for CLIs and `libthirp.dll`. Requirements:
+
+- [Odin](https://odin-lang.org/) `dev-2026-07` or later
+- OpenSSL 3 for Windows ([download](https://wiki.openssl.org/index.php/Binaries))
+- Visual Studio Build Tools or MSVC
+
 ## Build command-line components
+
+### Linux
 
 Run from the repository root:
 
@@ -37,18 +58,80 @@ odin build echo_http_cli -out:thirp-echo-http
 The installed command names are deliberately distinct from their source
 directories.
 
+### macOS
+
+```bash
+# Ensure OpenSSL 3 is installed
+brew install openssl@3
+
+# Build with linker flags pointing to Homebrew OpenSSL
+OPENSSL_LIB="$(brew --prefix openssl@3)/lib"
+odin build broker_cli -out:thirp-broker -extra-linker-flags:"-L${OPENSSL_LIB}"
+odin build agent_cli -out:thirp-agent -extra-linker-flags:"-L${OPENSSL_LIB}"
+odin build caller_cli -out:thirp-connect -extra-linker-flags:"-L${OPENSSL_LIB}"
+odin build web_ingress_cli -out:thirp-web-ingress -extra-linker-flags:"-L${OPENSSL_LIB}"
+```
+
+Or use the convenience script:
+
+```bash
+scripts/build_macos.sh
+```
+
+### Windows
+
+```cmd
+REM Ensure OpenSSL 3 is installed and in PATH
+odin build broker_cli -out:thirp-broker.exe
+odin build agent_cli -out:thirp-agent.exe
+odin build caller_cli -out:thirp-connect.exe
+odin build web_ingress_cli -out:thirp-web-ingress.exe
+```
+
+Or use the convenience script:
+
+```cmd
+scripts\build_windows.bat
+```
+
+`build_windows.bat` finds `libssl.lib` under `OPENSSL_ROOT_DIR` (or `C:\Program Files\OpenSSL`, then `OpenSSL-Win64`) and prepends that directory to `LIB`. Chocolatey OpenSSL 4 installs at `C:\Program Files\OpenSSL`.
+
 ## Build the C ABI
+
+### Linux
 
 ```bash
 odin build c_abi -build-mode:shared -out:libthirp.so
 cc -o thirp-c-smoke c_abi/smoke.c -I c_abi -L. -lthirp -Wl,-rpath,$PWD
 ```
 
-`libthirp.so` is currently Linux-only and links the system OpenSSL 3 libraries.
-The public header is `c_abi/thirp.h`. Consumer-oriented layout and link examples
-are documented in [SDK.md](SDK.md#c-abi).
+`libthirp.so` is the Linux operator/SDK library and links the system OpenSSL 3
+libraries. The public header is `c_abi/thirp.h`. macOS and Windows shared
+libraries are produced by the data-plane release scripts. Consumer-oriented
+layout and link examples are documented in [SDK.md](SDK.md#c-abi).
+
+### macOS
+
+```bash
+OPENSSL_LIB="$(brew --prefix openssl@3)/lib"
+odin build c_abi -build-mode:shared -out:libthirp.dylib -extra-linker-flags:"-L${OPENSSL_LIB}"
+cc -o thirp-c-smoke c_abi/smoke.c -I c_abi -L. -lthirp -Wl,-rpath,$PWD
+```
+
+`libthirp.dylib` links Homebrew OpenSSL 3.
+
+### Windows
+
+```cmd
+odin build c_abi -build-mode:shared -out:libthirp.dll
+cl /Fe:thirp-c-smoke.exe c_abi\smoke.c /I c_abi libthirp.lib
+```
+
+`libthirp.dll` links system OpenSSL 3 libraries.
 
 ## Run the test suite
+
+### All platforms
 
 ```bash
 odin test . -all-packages
@@ -57,20 +140,54 @@ odin test . -all-packages
 The full command runs the protocol, transport, authentication, Broker, Agent,
 Caller, configuration, logging, version, C ABI, and Web Ingress tests.
 
+On macOS, add the OpenSSL linker flags:
+
+```bash
+OPENSSL_LIB="$(brew --prefix openssl@3)/lib"
+odin test . -all-packages -extra-linker-flags:"-L${OPENSSL_LIB}"
+```
+
+On Windows, ensure OpenSSL 3 DLLs are in PATH.
+
 A test run is not successful if it logs `+++ leak`, even when the process exits
 with status 0. Known concurrency hazards and their required invariants are
 documented in [RACES.md](RACES.md).
 
 ## Build SDK examples
 
-The examples use the same `thirp:` collection paths supported by packaged SDKs:
+The examples use the same `thirp:` collection paths supported by packaged SDKs.
+On Linux:
 
 ```bash
 odin build examples/sdk/odin/ephemeral_host -collection:thirp=.
 odin build examples/sdk/odin/join_code_client -collection:thirp=.
 ```
 
+On macOS, add OpenSSL linker flags:
+
+```bash
+OPENSSL_LIB="$(brew --prefix openssl@3)/lib"
+odin build examples/sdk/odin/ephemeral_host -collection:thirp=. -extra-linker-flags:"-L${OPENSSL_LIB}"
+odin build examples/sdk/odin/join_code_client -collection:thirp=. -extra-linker-flags:"-L${OPENSSL_LIB}"
+```
+
 See [SDK.md](SDK.md) for lifecycle and API guidance.
+
+## Cross-platform status
+
+- **Linux**: Full operator release artifacts including packages, SBOM, and provenance (`scripts/release.sh`). Dataplane zip also on the unsigned multi-OS tag.
+- **macOS**: Data-plane release tree (`thirp-agent`, `thirp-connect`, `libthirp.dylib`) via `scripts/release_macos.sh`. Published today: **arm64** only; **amd64 (Intel)** is not published yet.
+- **Windows**: Data-plane release tree (`thirp-agent.exe`, `thirp-connect.exe`, `libthirp.dll`) via `scripts/release_windows.ps1` (AMD64).
+
+macOS and Windows agents and callers connect outbound to a Linux broker over TLS.
+Broker / Web Ingress / full operator stacks remain Linux-primary in published
+operator Releases. Convenience Broker/Web Ingress binaries still build from
+`scripts/build_macos.sh` and `scripts/build_windows.bat` without the `dataplane`
+argument; they are not part of the published data-plane trees.
+
+The `dataplane-release` GitHub Actions workflow (Origin-compatible GHA YAML in
+`.github/workflows/dataplane-release.yml`) runs `scripts/release_dataplane_test.sh`
+on Ubuntu and the native release scripts on `macos-latest` and `windows-latest`.
 
 ## Produce a Linux release tree
 
@@ -108,6 +225,118 @@ The script also:
 - packs the source archive from the public allowlist, not the private git tree
 
 If the Thirp publish key is in the local GPG agent, `scripts/release.sh` detaches `SHA256SUMS.asc` automatically. Override with `THIRP_GPG_KEY=<key-id>`. The published fingerprint and verification command are in [SECURITY.md](SECURITY.md#release-signing).
+
+## macOS and Windows data-plane release
+
+These scripts produce the same kind of checksummed tree as Linux, limited to
+the data plane: Agent CLI, Caller CLI, and `libthirp`. Protocol 1.0 is unchanged.
+
+### macOS
+
+Must run on Darwin with Homebrew OpenSSL 3 and Odin `dev-2026-07` or later:
+
+```bash
+scripts/release_macos.sh
+```
+
+Output:
+
+```text
+dist/thirp-runtime-macos-<VERSION>/
+dist/thirp-runtime-macos-<arch>-<VERSION>.tar.gz
+```
+
+The directory contains `thirp-agent`, `thirp-connect`, `libthirp.dylib`,
+`thirp.h`, `LICENSE`, `NOTICE`, changelog, dependency inventory, `PROVENANCE.txt`,
+and `SHA256SUMS`. `SHA256SUMS.asc` is added when the Thirp publish key is in the
+agent (`THIRP_GPG_KEY`, same fingerprint as Linux). The published pre-sign zip is
+`thirp-runtime-macos-arm64-<VERSION>-unsigned.zip` (arm64). Intel macOS is not
+published yet.
+
+Apple Developer ID signing is optional and skipped unless
+`THIRP_MACOS_CODESIGN_IDENTITY` is set. Notarization is skipped unless
+`THIRP_MACOS_NOTARY_PROFILE` names a `notarytool` keychain profile. The current
+public dataplane tag ships **unsigned** binaries.
+
+### Windows
+
+Must run on Windows with OpenSSL 3, MSVC, and Odin `dev-2026-07` or later:
+
+```cmd
+scripts\release_windows.bat
+```
+
+or:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\release_windows.ps1
+```
+
+Output:
+
+```text
+dist\thirp-runtime-windows-<VERSION>\
+dist\thirp-runtime-windows-<arch>-<VERSION>.zip
+```
+
+Authenticode signing is skipped unless `THIRP_WINDOWS_PFX` (and optional
+`THIRP_WINDOWS_PFX_PASSWORD`) is set and `signtool.exe` is on `PATH`.
+
+### Verify a downloaded tree
+
+```bash
+# macOS or Linux host checking a darwin tree
+sha256sum -c SHA256SUMS
+gpg --verify SHA256SUMS.asc SHA256SUMS   # when the detached signature is present
+bash scripts/verify_dataplane_release.sh dist/thirp-runtime-macos-<VERSION> darwin
+```
+
+```powershell
+# Windows: Get-FileHash against each SHA256SUMS line
+```
+
+The GPG fingerprint is in [SECURITY.md](SECURITY.md#release-signing). Unsigned
+checksums are still usable.
+
+### How artifacts are published
+
+1. Push or tag on GitHub runs `.github/workflows/dataplane-release.yml`.
+2. The `linux-test`, `macos`, and `windows` jobs run on hosted runners; native
+   macOS/Windows jobs are green and upload `dist/thirp-runtime-macos-*` and
+   `dist/thirp-runtime-windows-*` as Actions artifacts.
+3. Pre-sign multi-OS dataplane drop:
+   [v0.16.3-dataplane-unsigned](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned)
+   publishes macOS **arm64**, Windows **AMD64**, and Linux **x86_64** dataplane
+   zips plus `SHA256SUMS` and `UNSIGNED.md`. macOS **amd64 (Intel)** is not in
+   that Release. Binaries on that tag are **unsigned**.
+4. On a `v*` operator tag of `thirp/runtime`, the `publish` job can attach
+   dataplane trees to the GitHub Release (creates the release if
+   `scripts/publish_github.sh --release` has not already).
+5. The private publisher `scripts/publish_github.sh --release` still attaches
+   the Linux operator tree (and requires `SHA256SUMS.asc` when signing). If
+   `dist/thirp-runtime-macos-<VERSION>` or
+   `dist/thirp-runtime-windows-<VERSION>` exist, those files are attached too.
+
+`scripts/release_dataplane_test.sh` checks script syntax, allowlists, workflow
+wiring, and fixture trees. It does not compile `.dylib` / `.dll`.
+
+### Signing blockers (certs pending)
+
+Unsigned dataplane CI and the pre-sign Release are live. These are the remaining
+hard blockers Chuck must supply for a **signed** multi-OS Release; the
+scripts skip signing when they are absent:
+
+| Blocker | Env / secret | Effect if missing |
+|---|---|---|
+| Thirp publish GPG private key in CI | `THIRP_GPG_PRIVATE_KEY`, optional `THIRP_GPG_PASSPHRASE`; local override `THIRP_GPG_KEY` | `SHA256SUMS` is still produced; no `SHA256SUMS.asc` |
+| Apple Developer ID Application certificate | `THIRP_MACOS_CODESIGN_IDENTITY`, `THIRP_MACOS_CERT_P12`, `THIRP_MACOS_CERT_PASSWORD` | Gatekeeper warns; users can still run or build from source |
+| Apple notarization credentials | `THIRP_MACOS_NOTARY_PROFILE` (after `xcrun notarytool store-credentials`) | Signed but not notarized; first launch still needs explicit allow |
+| Windows Authenticode certificate | `WINDOWS_CERT_PFX` / `THIRP_WINDOWS_PFX`, `WINDOWS_CERT_PASSWORD` / `THIRP_WINDOWS_PFX_PASSWORD` | SmartScreen warns; users can still run or build from source |
+
+Do not invent or commit those keys. The GPG fingerprint that CI must match is
+the one already published in [SECURITY.md](SECURITY.md#release-signing). Hosted
+`macos-latest` / `windows-latest` runners for `dataplane-release` are already
+enabled on `thirp/runtime`.
 
 ## Artifact contracts
 

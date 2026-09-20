@@ -245,7 +245,7 @@ Restore: put the files back, start the broker, start agents. Agents re-register 
 
 A single-broker restart interrupts active sessions. There is no zero-downtime broker upgrade. Protocol and config compatibility: [COMPATIBILITY.md](COMPATIBILITY.md). User-visible changes: [CHANGELOG.md](CHANGELOG.md).
 
-Release trees from `scripts/release.sh` include Linux binaries, `libthirp.so`, a source archive, an SPDX SBOM, `NOTICE`, `PROVENANCE.txt`, and `SHA256SUMS`. Verify `SHA256SUMS` before install.
+Release trees from `scripts/release.sh` include Linux operator binaries, `libthirp.so`, a source archive, an SPDX SBOM, `NOTICE`, `PROVENANCE.txt`, and `SHA256SUMS`. Multi-OS dataplane trees from `scripts/release_macos.sh` and `scripts/release_windows.ps1` (and the published unsigned dataplane Release) include Agent/Caller and `libthirp` plus their own `SHA256SUMS`. Verify `SHA256SUMS` before install; treat unsigned dataplane binaries as integrity-checked but not OS-signed.
 
 1. Install the new binaries.
 2. Restart the broker (drain, then exit).

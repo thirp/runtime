@@ -49,6 +49,13 @@ chmod +x thirp-broker thirp-agent thirp-connect
 When `SHA256SUMS.asc` is present, verify it using the publish-key fingerprint
 and command in [SECURITY.md](SECURITY.md#release-signing).
 
+macOS (arm64) and Windows (AMD64) Agent/Caller binaries and `libthirp` are
+published as separate **unsigned** dataplane zips on
+[v0.16.3-dataplane-unsigned](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned).
+They are not used in this Linux walkthrough. Verify those trees with
+`SHA256SUMS` (no GPG on that tag) and
+[BUILDING.md](BUILDING.md#verify-a-downloaded-tree). macOS Intel is not published yet.
+
 ### Or build from source
 
 Run from the repository root:
