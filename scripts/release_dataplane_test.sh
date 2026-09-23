@@ -52,8 +52,17 @@ fi
 if ! grep -q "$FP" "${ROOT}/docs/SECURITY.md"; then
 	fail_msg "docs/SECURITY.md missing publish fingerprint"
 fi
-if ! grep -q "$FP" "${ROOT}/scripts/public/github_SECURITY.md"; then
-	fail_msg "scripts/public/github_SECURITY.md missing publish fingerprint"
+# Origin: scripts/public/github_SECURITY.md. Public squash: .github/SECURITY.md.
+if [[ -f "${ROOT}/scripts/public/github_SECURITY.md" ]]; then
+	if ! grep -q "$FP" "${ROOT}/scripts/public/github_SECURITY.md"; then
+		fail_msg "scripts/public/github_SECURITY.md missing publish fingerprint"
+	fi
+elif [[ -f "${ROOT}/.github/SECURITY.md" ]]; then
+	if ! grep -q "$FP" "${ROOT}/.github/SECURITY.md"; then
+		fail_msg ".github/SECURITY.md missing publish fingerprint"
+	fi
+else
+	fail_msg "no GitHub SECURITY.md with publish fingerprint"
 fi
 if ! grep -q 'release_sign_sha256sums' "${ROOT}/scripts/release.sh"; then
 	fail_msg "scripts/release.sh no longer uses release_sign_sha256sums"
@@ -77,8 +86,10 @@ do
 	if ! grep -q "$needle" "${ROOT}/scripts/stage_public_tree.sh"; then
 		fail_msg "stage_public_tree.sh allowlist missing ${needle}"
 	fi
-	if ! grep -q "$needle" "${ROOT}/scripts/publish_github.sh"; then
-		fail_msg "publish_github.sh public-path list missing ${needle}"
+	if [[ -f "${ROOT}/scripts/publish_github.sh" ]]; then
+		if ! grep -q "$needle" "${ROOT}/scripts/publish_github.sh"; then
+			fail_msg "publish_github.sh public-path list missing ${needle}"
+		fi
 	fi
 done
 
