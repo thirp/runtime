@@ -1,7 +1,9 @@
 # Data-plane release binaries for macOS and Windows.
 # GitHub Actions YAML; Origin-compatible if the forge runs GHA workflows.
-# Native compile jobs need macos-latest / windows-latest (or self-hosted
-# equivalents). This repository's Linux cloud agents cannot run those jobs.
+# Native compile jobs need macos-latest (arm64), macos-15-intel (x86_64),
+# and windows-latest (or self-hosted equivalents). This repository's Linux
+# cloud agents cannot run those jobs. macos-15-intel is the last Intel
+# image GitHub hosts.
 #
 # Secrets Chuck must supply for a signed publish (all optional; unsigned
 # checksums still upload):
@@ -41,22 +43,34 @@ jobs:
 
   macos:
     needs: check
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            arch: arm64
+          - os: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Confirm native arch
+        run: |
+          ARCH="$(uname -m)"
+          if [[ "$ARCH" != "${{ matrix.arch }}" ]]; then
+            echo "macos: runner arch ${ARCH} != ${{ matrix.arch }}" >&2
+            exit 1
+          fi
       - name: Install OpenSSL 3
         run: brew install openssl@3
       - name: Install Odin
         run: bash scripts/ci_setup_odin.sh
       - name: Import Apple Developer ID
+        if: ${{ secrets.THIRP_MACOS_CERT_P12 != '' }}
         env:
           THIRP_MACOS_CERT_P12: ${{ secrets.THIRP_MACOS_CERT_P12 }}
           THIRP_MACOS_CERT_PASSWORD: ${{ secrets.THIRP_MACOS_CERT_PASSWORD }}
         run: |
-          if [ -z "${THIRP_MACOS_CERT_P12:-}" ]; then
-            echo "No THIRP_MACOS_CERT_P12; skipping codesign import (unsigned OK)"
-            exit 0
-          fi
           printf '%s' "$THIRP_MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/developer-id.p12"
           KEYCHAIN="$RUNNER_TEMP/thirp.keychain-db"
           security create-keychain -p "" "$KEYCHAIN"
@@ -72,25 +86,23 @@ jobs:
           THIRP_GPG_KEY: ${{ secrets.THIRP_GPG_KEY }}
         run: bash scripts/release_macos.sh
       - name: Import GPG and re-sign if the private key is present
+        if: ${{ secrets.THIRP_GPG_PRIVATE_KEY != '' }}
         env:
           THIRP_GPG_PRIVATE_KEY: ${{ secrets.THIRP_GPG_PRIVATE_KEY }}
           THIRP_GPG_PASSPHRASE: ${{ secrets.THIRP_GPG_PASSPHRASE }}
         run: |
-          if [ -z "${THIRP_GPG_PRIVATE_KEY:-}" ]; then
-            echo "No THIRP_GPG_PRIVATE_KEY; skipping GPG sign (unsigned OK)"
-            exit 0
-          fi
           printf '%s\n' "$THIRP_GPG_PRIVATE_KEY" | gpg --batch --import
           VERSION="$(tr -d '[:space:]' < VERSION.txt)"
+          ARCH="$(uname -m)"
           export THIRP_GPG_KEY="3B8559D8754FB3C5B21110C786897A405CF3D8C4"
           # shellcheck source=scripts/release_common.sh
           source scripts/release_common.sh
-          release_sign_sha256sums "dist/thirp-runtime-macos-${VERSION}/SHA256SUMS"
+          release_sign_sha256sums "dist/thirp-runtime-macos-${ARCH}-${VERSION}/SHA256SUMS"
       - uses: actions/upload-artifact@v4
         with:
-          name: thirp-runtime-macos
+          name: thirp-runtime-macos-${{ matrix.arch }}
           path: |
-            dist/thirp-runtime-macos-*
+            dist/thirp-runtime-macos-${{ matrix.arch }}-*.tar.gz
           if-no-files-found: error
 
   windows:
@@ -118,15 +130,12 @@ jobs:
         shell: pwsh
         run: .\scripts\ci_setup_odin.ps1
       - name: Import Authenticode certificate
+        if: ${{ secrets.WINDOWS_CERT_PFX != '' }}
         env:
           WINDOWS_CERT_PFX: ${{ secrets.WINDOWS_CERT_PFX }}
           WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
         shell: pwsh
         run: |
-          if ([string]::IsNullOrEmpty($env:WINDOWS_CERT_PFX)) {
-            Write-Host "No WINDOWS_CERT_PFX; skipping Authenticode import (unsigned OK)"
-            exit 0
-          }
           $bytes = [Convert]::FromBase64String($env:WINDOWS_CERT_PFX)
           $path = Join-Path $env:RUNNER_TEMP "authenticode.pfx"
           [IO.File]::WriteAllBytes($path, $bytes)
@@ -134,32 +143,17 @@ jobs:
           if ($env:WINDOWS_CERT_PASSWORD) {
             Add-Content -Path $env:GITHUB_ENV -Value "THIRP_WINDOWS_PFX_PASSWORD=$($env:WINDOWS_CERT_PASSWORD)"
           }
-      - name: Locate MSVC vcvars
-        shell: pwsh
-        run: |
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          if (-not (Test-Path $vswhere)) { throw "vswhere.exe missing" }
-          $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-          if (-not $vsPath) { throw "No VS install with VC Tools found" }
-          $vcvars = Join-Path $vsPath "VC\Auxiliary\Build\vcvars64.bat"
-          if (-not (Test-Path $vcvars)) { throw "vcvars64.bat missing at $vcvars" }
-          Write-Host "Using vcvars: $vcvars"
-          Add-Content -Path $env:GITHUB_ENV -Value "VCVARS64=$vcvars"
-          if ($env:OPENSSL_ROOT_DIR) {
-            $opensslBin = Join-Path $env:OPENSSL_ROOT_DIR "bin"
-            if (Test-Path $opensslBin) { Add-Content -Path $env:GITHUB_PATH -Value $opensslBin }
-          }
       - name: Build data-plane release tree
         shell: cmd
         run: |
-          cd /d "%GITHUB_WORKSPACE%"
-          call "%VCVARS64%"
-          call scripts\build_windows.bat dataplane
-      - name: Package Windows release tree
-        shell: pwsh
-        run: |
-          pwsh -NoProfile -File scripts/release_windows.ps1 -SkipBuild
-          if ($LASTEXITCODE -ne 0) { throw "release_windows.ps1 -SkipBuild failed ($LASTEXITCODE)" }
+          if exist "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" (
+            call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          ) else if exist "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" (
+            call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+          ) else (
+            call "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+          )
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts\release_windows.ps1
       - uses: actions/upload-artifact@v4
         with:
           name: thirp-runtime-windows
@@ -194,5 +188,5 @@ jobs:
             gh release create "$TAG" "${files[@]}" \
               --repo thirp/runtime \
               --title "Thirp Runtime ${TAG#v}" \
-              --notes "Linux operator artifacts are attached by scripts/publish_github.sh --release. This job adds macOS and Windows data-plane Agent/Caller binaries and libthirp. Verify SHA256SUMS; see docs/BUILDING.md and docs/SECURITY.md."
+              --notes "Linux operator artifacts are attached by scripts/publish_github.sh --release. This job adds macOS arm64, macOS x86_64 (Intel), and Windows data-plane Agent/Caller archives and libthirp. Verify SHA256SUMS; see docs/BUILDING.md and docs/SECURITY.md."
           fi

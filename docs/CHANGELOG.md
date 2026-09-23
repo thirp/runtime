@@ -4,7 +4,7 @@ Project version is independent of the wire protocol version. This tree speaks pr
 
 ## Unreleased
 
-Docs: release matrix matches published unsigned multi-OS dataplane ([v0.16.3-dataplane-unsigned](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned)) — macOS arm64, Windows AMD64, Linux x86_64; embed SDK tarball still Linux `.so` only; operator/Broker stack remains Linux-primary; macOS Intel and OS-level signing not claimed.
+`dataplane-release` builds macOS **x86_64 (Intel)** on `macos-15-intel` in addition to arm64 (`macos-latest`) and Windows. Output trees are `dist/thirp-runtime-macos-<arch>-<VERSION>/`. Intel archive is published on [v0.16.3-dataplane-unsigned-mac-intel](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned-mac-intel) without bumping `VERSION.txt`; [v0.16.3-dataplane-unsigned](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned) stays the arm64 / Windows / Linux dataplane drop. Embed SDK tarball still Linux `.so` only; operator/Broker stack remains Linux-primary; OS-level signing not claimed.
 
 Windows dataplane link: `system:libssl.lib` / `system:libcrypto.lib` and `LIB` search under `OPENSSL_ROOT_DIR` / `C:\Program Files\OpenSSL` (OpenSSL 4). macOS: weak `_odin_entry_point` so Odin 2026-09 Darwin `posix_spawnp` link finds the symbol. CI downloads 2026-09 `.tar.gz` nightlies.
 
@@ -25,7 +25,7 @@ Caller no longer RESET finished or unknown streams. Broker delivers terminal CLO
 - Windows Ctrl-C/console close handling via SetConsoleCtrlHandler
 - Portable temp file paths in tests respect TEMP/TMP/TMPDIR environment variables
 - Build scripts: `scripts/build_macos.sh` and `scripts/build_windows.bat` (`dataplane` mode for Agent/Caller/`libthirp` only)
-- Data-plane release packaging: `scripts/release_macos.sh`, `scripts/release_windows.ps1`, checksums, provenance, optional GPG. GitHub Actions workflow `.github/workflows/dataplane-release.yml` builds those trees on `macos-latest` / `windows-latest`. Unsigned multi-OS dataplane packaging is automated. Apple Developer ID (`THIRP_MACOS_CODESIGN_IDENTITY`) and Authenticode (`THIRP_WINDOWS_PFX`) remain Chuck-supplied secrets.
+- Data-plane release packaging: `scripts/release_macos.sh`, `scripts/release_windows.ps1`, checksums, provenance, optional GPG. GitHub Actions workflow `.github/workflows/dataplane-release.yml` builds those trees on `macos-latest` (arm64), `macos-15-intel` (x86_64), and `windows-latest`. Unsigned multi-OS dataplane packaging is automated. Apple Developer ID (`THIRP_MACOS_CODESIGN_IDENTITY`) and Authenticode (`THIRP_WINDOWS_PFX`) remain Chuck-supplied secrets.
 - Documentation: BUILDING.md, README.md, DEPENDENCIES.md, COMPATIBILITY.md, SECURITY.md updated for cross-platform release and verification
 - Agent and broker CLI signal handling split into `interrupt_{linux,darwin,windows}.odin`
 Agent stream cleanup on broker write failure. Protocol 1.0, the C ABI, and the Agent/Caller SDK surface are unchanged.

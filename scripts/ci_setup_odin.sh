@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Install or verify Odin for CI (Linux/macOS). Honors ODIN_TAG (default
-# dev-2026-07, matching docs/DEPENDENCIES.md) and optional ODIN_RELEASE_URL.
+# dev-2026-09) and optional ODIN_RELEASE_URL.
 set -euo pipefail
 
-ODIN_TAG="${ODIN_TAG:-dev-2026-07}"
-MIN_ODIN_MONTH="${MIN_ODIN_MONTH:-2026-07}"
+ODIN_TAG="${ODIN_TAG:-dev-2026-09}"
+MIN_ODIN_MONTH="${MIN_ODIN_MONTH:-2026-09}"
 INSTALL_DIR="${ODIN_INSTALL_DIR:-${HOME}/.local/odin}"
 
 odin_month_ok() {
@@ -53,8 +53,15 @@ unpack_and_path() {
 		tar -C "${INSTALL_DIR}/tree" -xzf "$archive"
 		;;
 	*)
-		echo "ci_setup_odin: unknown archive type: ${archive}" >&2
-		return 1
+		# Dest is often odin-release.download (no extension).
+		if gzip -t "$archive" 2>/dev/null; then
+			tar -C "${INSTALL_DIR}/tree" -xzf "$archive"
+		elif unzip -t -q "$archive" >/dev/null 2>&1; then
+			unzip -q "$archive" -d "${INSTALL_DIR}/tree"
+		else
+			echo "ci_setup_odin: unknown archive type: ${archive}" >&2
+			return 1
+		fi
 		;;
 	esac
 	local found
@@ -75,12 +82,14 @@ else
 	case "$OS" in
 	Darwin)
 		CANDIDATES=(
+			"https://github.com/odin-lang/Odin/releases/download/${ODIN_TAG}/odin-macos-${ODIN_ARCH}-${ODIN_TAG}.tar.gz"
 			"https://github.com/odin-lang/Odin/releases/download/${ODIN_TAG}/odin-macos-${ODIN_ARCH}-${ODIN_TAG}.zip"
 			"https://github.com/odin-lang/Odin/releases/download/${ODIN_TAG}/macos-${ODIN_ARCH}.zip"
 		)
 		;;
 	Linux)
 		CANDIDATES=(
+			"https://github.com/odin-lang/Odin/releases/download/${ODIN_TAG}/odin-linux-${ODIN_ARCH}-${ODIN_TAG}.tar.gz"
 			"https://github.com/odin-lang/Odin/releases/download/${ODIN_TAG}/odin-linux-${ODIN_ARCH}-${ODIN_TAG}.zip"
 			"https://github.com/odin-lang/Odin/releases/download/${ODIN_TAG}/linux-${ODIN_ARCH}.zip"
 		)

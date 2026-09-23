@@ -120,24 +120,9 @@ export ROOT VERSION OUT ARCH DATE
 		> SHA256SUMS
 )
 
-THIRP_PUBLISH_GPG_FINGERPRINT="3B8559D8754FB3C5B21110C786897A405CF3D8C4"
-if [[ -z "${THIRP_GPG_KEY:-}" ]]; then
-	if gpg --list-secret-keys --with-colons "$THIRP_PUBLISH_GPG_FINGERPRINT" >/dev/null 2>&1; then
-		THIRP_GPG_KEY="$THIRP_PUBLISH_GPG_FINGERPRINT"
-	fi
-fi
-if [[ -n "${THIRP_GPG_KEY:-}" ]]; then
-	if ! grep -q "$THIRP_PUBLISH_GPG_FINGERPRINT" "${ROOT}/docs/SECURITY.md"; then
-		echo "release: signing fingerprint does not match docs/SECURITY.md" >&2
-		exit 1
-	fi
-	gpg --detach-sign --armor --local-user "${THIRP_GPG_KEY}" \
-		--output "${OUT}/SHA256SUMS.asc" "${OUT}/SHA256SUMS"
-	gpg --verify "${OUT}/SHA256SUMS.asc" "${OUT}/SHA256SUMS"
-	echo "release: signed SHA256SUMS with ${THIRP_GPG_KEY}"
-else
-	echo "release: GPG signatures not produced (publish key not in the agent; set THIRP_GPG_KEY)"
-fi
+# shellcheck source=release_common.sh
+source "${ROOT}/scripts/release_common.sh"
+release_sign_sha256sums "${OUT}/SHA256SUMS"
 
 (
 	cd "$OUT"

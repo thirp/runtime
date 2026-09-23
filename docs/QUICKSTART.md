@@ -49,12 +49,23 @@ chmod +x thirp-broker thirp-agent thirp-connect
 When `SHA256SUMS.asc` is present, verify it using the publish-key fingerprint
 and command in [SECURITY.md](SECURITY.md#release-signing).
 
-macOS (arm64) and Windows (AMD64) Agent/Caller binaries and `libthirp` are
-published as separate **unsigned** dataplane zips on
-[v0.16.3-dataplane-unsigned](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned).
-They are not used in this Linux walkthrough. Verify those trees with
-`SHA256SUMS` (no GPG on that tag) and
-[BUILDING.md](BUILDING.md#verify-a-downloaded-tree). macOS Intel is not published yet.
+### Other platforms (unsigned dataplane)
+
+This walkthrough uses the Linux operator binaries above. Agent/Caller/`libthirp`
+for other OSes ship as **unsigned** dataplane archives (no Apple Developer ID,
+Authenticode, or `SHA256SUMS.asc`). They are not used here. Verify with
+`SHA256SUMS` and [BUILDING.md](BUILDING.md#verify-a-downloaded-tree).
+
+Both dataplane tags keep product version `0.16.3`. They do not replace the
+Linux operator Release on
+[v0.16.3](https://github.com/thirp/runtime/releases/tag/v0.16.3).
+
+| Platform | Tag | Typical asset |
+|---|---|---|
+| Linux x86_64 dataplane | [v0.16.3-dataplane-unsigned](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned) | `thirp-runtime-linux-x86_64-0.16.3-unsigned.zip` |
+| macOS arm64 | same | `thirp-runtime-macos-arm64-0.16.3-unsigned.zip` |
+| Windows AMD64 | same | `thirp-runtime-windows-AMD64-0.16.3-unsigned.zip` |
+| macOS x86_64 (Intel) | [v0.16.3-dataplane-unsigned-mac-intel](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned-mac-intel) | `thirp-runtime-macos-x86_64-0.16.3.tar.gz` |
 
 ### Or build from source
 

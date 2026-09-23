@@ -32,7 +32,7 @@ OPENSSL_VER="$(openssl version 2>&1 | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
 ARCH="$(uname -m)"
 DATE="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
-OUT="${ROOT}/dist/thirp-runtime-macos-${VERSION}"
+OUT="${ROOT}/dist/thirp-runtime-macos-${ARCH}-${VERSION}"
 ARCHIVE="${ROOT}/dist/thirp-runtime-macos-${ARCH}-${VERSION}.tar.gz"
 rm -rf "$OUT"
 mkdir -p "$OUT"

@@ -42,9 +42,33 @@ agent_finish_stream :: proc(relay: ^AgentRelay, stream_id: proto.StreamId) {
 	if !found {
 		return
 	}
-	if stream.local != nil {
-		trans.connection_destroy(stream.local)
+	agent_destroy_local(stream.local)
+}
+
+// RESET only if this session still owns the stream. A write failure after
+// finish_stream / CLOSE must not emit RESET for an id the broker already
+// dropped — that is the StreamNotFound ping-pong.
+agent_reset_owned_stream :: proc(
+	relay: ^AgentRelay,
+	stream_id: proto.StreamId,
+	code: proto.WireError,
+) {
+	stream, found := agent_take_stream(relay, stream_id)
+	if !found {
+		return
 	}
+	_ = agent_write_failure(relay.broker, .Reset, code, stream_id)
+	agent_destroy_local(stream.local)
+}
+
+agent_destroy_local :: proc(local: ^trans.Connection) {
+	if local == nil {
+		return
+	}
+	// Shutdown first so the pump leaves recv; close() alone can RST and
+	// race fd reuse (docs/RACES.md).
+	trans.connection_shutdown_both(local)
+	trans.connection_destroy(local)
 }
 
 agent_clear_all :: proc(relay: ^AgentRelay) {
@@ -57,9 +81,7 @@ agent_clear_all :: proc(relay: ^AgentRelay) {
 	clear(&relay.streams)
 	sync.mutex_unlock(&relay.mutex)
 	for stream in taken {
-		if stream.local != nil {
-			trans.connection_destroy(stream.local)
-		}
+		agent_destroy_local(stream.local)
 	}
 	for sync.atomic_load(&relay.live_pumps) != 0 {
 		time.sleep(1 * time.Millisecond)
@@ -106,7 +128,10 @@ agent_pump_local :: proc(arg: ^AgentPumpArg) {
 			return
 		}
 		if err != .None {
-			_ = agent_write(broker, .HalfClose, nil, arg.stream_id)
+			if !agent_write(broker, .HalfClose, nil, arg.stream_id) {
+				agent_finish_stream(arg.relay, arg.stream_id)
+				return
+			}
 			if half {
 				_ = agent_write(broker, .Close, nil, arg.stream_id)
 				agent_finish_stream(arg.relay, arg.stream_id)
@@ -114,6 +139,7 @@ agent_pump_local :: proc(arg: ^AgentPumpArg) {
 			return
 		}
 		if !agent_write(broker, .Data, buf[:n], arg.stream_id) {
+			agent_reset_owned_stream(arg.relay, arg.stream_id, .InternalError)
 			return
 		}
 	}
@@ -165,20 +191,8 @@ agent_handle_open :: proc(relay: ^AgentRelay, frame: proto.Frame) {
 		return
 	}
 
-	local, derr := trans.connection_dial(target.address)
-	if derr != .None {
-		_ = agent_write_failure(
-			relay.broker,
-			.OpenFailed,
-			.LocalServiceUnavailable,
-			stream_id,
-		)
-		return
-	}
-
-	arg, aerr := new(AgentPumpArg)
+	arg, aerr := new(AgentOpenArg)
 	if aerr != .None {
-		trans.connection_destroy(local)
 		_ = agent_write_failure(
 			relay.broker,
 			.OpenFailed,
@@ -189,9 +203,49 @@ agent_handle_open :: proc(relay: ^AgentRelay, frame: proto.Frame) {
 	}
 	arg.relay = relay
 	arg.stream_id = stream_id
-	arg.local = local
-	if !trans.connection_acquire(local) {
+	arg.target = target
+	// Count the open worker as a live pump so clear/shutdown waits for dial.
+	sync.atomic_add(&relay.live_pumps, 1)
+	thread.run_with_poly_data(arg, agent_open_worker)
+}
+
+agent_open_worker :: proc(arg: ^AgentOpenArg) {
+	relay := arg.relay
+	stream_id := arg.stream_id
+	target := arg.target
+	defer {
 		free(arg)
+	}
+
+	if sync.atomic_load(&relay.agent.stop) {
+		_ = agent_write_failure(
+			relay.broker,
+			.OpenFailed,
+			.AgentUnavailable,
+			stream_id,
+		)
+		sync.atomic_sub(&relay.live_pumps, 1)
+		return
+	}
+
+	local, derr := trans.connection_dial(target.address)
+	if derr != .None {
+		_ = agent_write_failure(
+			relay.broker,
+			.OpenFailed,
+			.LocalServiceUnavailable,
+			stream_id,
+		)
+		sync.atomic_sub(&relay.live_pumps, 1)
+		return
+	}
+	// Bound local send so broker→local DATA cannot HOL-block forever if the
+	// target stops reading. Zero send_timeout on the broker TLS conn is set
+	// separately so pump DATA uses true TCP/TLS backpressure.
+	_ = trans.connection_set_send_timeout(local, 5 * time.Second)
+
+	pump, perr := new(AgentPumpArg)
+	if perr != .None {
 		trans.connection_destroy(local)
 		_ = agent_write_failure(
 			relay.broker,
@@ -199,15 +253,31 @@ agent_handle_open :: proc(relay: ^AgentRelay, frame: proto.Frame) {
 			.InternalError,
 			stream_id,
 		)
+		sync.atomic_sub(&relay.live_pumps, 1)
+		return
+	}
+	pump.relay = relay
+	pump.stream_id = stream_id
+	pump.local = local
+	if !trans.connection_acquire(local) {
+		free(pump)
+		trans.connection_destroy(local)
+		_ = agent_write_failure(
+			relay.broker,
+			.OpenFailed,
+			.InternalError,
+			stream_id,
+		)
+		sync.atomic_sub(&relay.live_pumps, 1)
 		return
 	}
 
 	sync.mutex_lock(&relay.mutex)
-	_, exists = relay.streams[stream_id]
+	_, exists := relay.streams[stream_id]
 	if exists {
 		sync.mutex_unlock(&relay.mutex)
 		trans.connection_release(local)
-		free(arg)
+		free(pump)
 		trans.connection_destroy(local)
 		_ = agent_write_failure(
 			relay.broker,
@@ -215,6 +285,7 @@ agent_handle_open :: proc(relay: ^AgentRelay, frame: proto.Frame) {
 			.StreamAlreadyExists,
 			stream_id,
 		)
+		sync.atomic_sub(&relay.live_pumps, 1)
 		return
 	}
 	relay.streams[stream_id] = AgentLocalStream {
@@ -222,9 +293,10 @@ agent_handle_open :: proc(relay: ^AgentRelay, frame: proto.Frame) {
 		broker_half_closed = false,
 		closed             = false,
 	}
-	sync.atomic_add(&relay.live_pumps, 1)
+	// live_pumps already counted for this open worker; transfer ownership to
+	// the pump thread (pump defer still atomic_sub).
 	sync.mutex_unlock(&relay.mutex)
-	thread.run_with_poly_data(arg, agent_pump_local)
+	thread.run_with_poly_data(pump, agent_pump_local)
 
 	if !agent_write(relay.broker, .OpenOk, nil, stream_id) {
 		agent_finish_stream(relay, stream_id)
@@ -234,17 +306,17 @@ agent_handle_open :: proc(relay: ^AgentRelay, frame: proto.Frame) {
 agent_handle_data :: proc(relay: ^AgentRelay, frame: proto.Frame) {
 	local, found := agent_lookup_local(relay, frame.header.stream_id)
 	if !found {
-		_ = agent_write_failure(
-			relay.broker,
-			.Reset,
-			.StreamNotFound,
-			frame.header.stream_id,
-		)
+		// Finished or never inserted. Do not RESET StreamNotFound —
+		// the broker answers the same code and the pair hot-loops
+		// for the rest of the agent session.
 		return
 	}
 	if local != nil {
-		_ = trans.connection_write(local, frame.payload)
+		werr := trans.connection_write(local, frame.payload)
 		trans.connection_release(local)
+		if werr != .None {
+			agent_reset_owned_stream(relay, frame.header.stream_id, .InternalError)
+		}
 	}
 }
 
@@ -253,14 +325,6 @@ agent_handle_half_close :: proc(relay: ^AgentRelay, frame: proto.Frame) {
 	stream, found := relay.streams[frame.header.stream_id]
 	if !found || stream.closed {
 		sync.mutex_unlock(&relay.mutex)
-		if !found {
-			_ = agent_write_failure(
-				relay.broker,
-				.Reset,
-				.StreamNotFound,
-				frame.header.stream_id,
-			)
-		}
 		return
 	}
 	stream.broker_half_closed = true
@@ -325,6 +389,9 @@ agent_relay_loop :: proc(relay: ^AgentRelay, decoder: ^proto.FrameDecoder) {
 			return
 		}
 		_ = trans.connection_set_recv_timeout(relay.broker, 50 * time.Millisecond)
+		// Force DATA writes to block on peer window instead of inheriting the
+		// 50ms read-poll timeout (which turned backpressure into RESET storms).
+		_ = trans.connection_set_send_timeout(relay.broker, 0)
 		frame, terr, perr := trans.read_frame(relay.broker, decoder)
 		if terr == .Timeout {
 			if time.since(last_ping) >= HEARTBEAT_INTERVAL {
@@ -361,15 +428,9 @@ agent_relay_loop :: proc(relay: ^AgentRelay, decoder: ^proto.FrameDecoder) {
 		case .HalfClose:
 			agent_handle_half_close(relay, frame)
 		case .Close, .Reset:
-			// RESET/CLOSE is terminal. Do not echo StreamNotFound — the
-			// broker already dropped the stream and a reply ping-pongs
-			// until the session dies. Shutdown the local conn so the
-			// pump leaves recv; destroy from this thread after that.
-			stream, found := agent_take_stream(relay, frame.header.stream_id)
-			if found && stream.local != nil {
-				trans.connection_shutdown_both(stream.local)
-				trans.connection_destroy(stream.local)
-			}
+			// Terminal. Do not echo StreamNotFound — that ping-pongs
+			// with the broker until the session dies.
+			agent_finish_stream(relay, frame.header.stream_id)
 		case .RegisterOk, .RegisterFailed:
 			agent_handle_register_reply(relay, frame)
 		case .UnregisterOk, .UnregisterFailed:
@@ -407,9 +468,7 @@ agent_reset_all_streams :: proc(relay: ^AgentRelay) {
 	sync.mutex_unlock(&relay.mutex)
 	for i in 0 ..< len(ids) {
 		_ = agent_write_failure(relay.broker, .Reset, .InternalError, ids[i])
-		if taken[i].local != nil {
-			trans.connection_destroy(taken[i].local)
-		}
+		agent_destroy_local(taken[i].local)
 	}
 	for sync.atomic_load(&relay.live_pumps) != 0 {
 		time.sleep(1 * time.Millisecond)

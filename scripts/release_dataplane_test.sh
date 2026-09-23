@@ -38,7 +38,6 @@ for f in scripts/release_common.sh scripts/release_macos.sh \
 	scripts/ci_setup_odin.sh scripts/release_dataplane_test.sh \
 	scripts/release.sh scripts/stage_public_tree.sh
 do
-	[[ -f "$f" ]] || continue
 	if ! bash -n "$f"; then
 		fail_msg "bash -n failed: $f"
 	fi
@@ -53,51 +52,53 @@ fi
 if ! grep -q "$FP" "${ROOT}/docs/SECURITY.md"; then
 	fail_msg "docs/SECURITY.md missing publish fingerprint"
 fi
-if [[ -f "${ROOT}/scripts/public/github_SECURITY.md" ]]; then
-	if ! grep -q "$FP" "${ROOT}/scripts/public/github_SECURITY.md"; then
-		fail_msg "scripts/public/github_SECURITY.md missing publish fingerprint"
-	fi
-else
-	echo "release_dataplane_test: public tree — skip scripts/public/github_SECURITY.md"
+if ! grep -q "$FP" "${ROOT}/scripts/public/github_SECURITY.md"; then
+	fail_msg "scripts/public/github_SECURITY.md missing publish fingerprint"
 fi
-if [[ -f "${ROOT}/scripts/release.sh" ]]; then
-	if ! grep -q 'release_sign_sha256sums' "${ROOT}/scripts/release.sh"; then
-		echo "release_dataplane_test: WARN scripts/release.sh missing release_sign_sha256sums (public snapshot OK)"
-	fi
+if ! grep -q 'release_sign_sha256sums' "${ROOT}/scripts/release.sh"; then
+	fail_msg "scripts/release.sh no longer uses release_sign_sha256sums"
 fi
 if ! grep -q "$FP" "${ROOT}/scripts/release_windows.ps1"; then
 	fail_msg "scripts/release_windows.ps1 missing publish fingerprint"
 fi
 
-if [[ -f "${ROOT}/scripts/stage_public_tree.sh" && -f "${ROOT}/scripts/publish_github.sh" ]]; then
-	for needle in \
-		scripts/release_common.sh \
-		scripts/release_macos.sh \
-		scripts/release_windows.ps1 \
-		scripts/release_windows.bat \
-		scripts/verify_dataplane_release.sh \
-		scripts/build_macos.sh \
-		scripts/build_windows.bat \
-		scripts/ci_setup_odin.sh \
-		scripts/ci_setup_odin.ps1 \
-		scripts/release_dataplane_test.sh
-	do
-		if ! grep -q "$needle" "${ROOT}/scripts/stage_public_tree.sh"; then
-			fail_msg "stage_public_tree.sh allowlist missing ${needle}"
-		fi
-		if ! grep -q "$needle" "${ROOT}/scripts/publish_github.sh"; then
-			fail_msg "publish_github.sh public-path list missing ${needle}"
-		fi
-	done
-	if ! grep -q 'dataplane-release.yml' "${ROOT}/scripts/stage_public_tree.sh"; then
-		fail_msg "stage_public_tree.sh does not publish the GitHub Actions workflow"
+for needle in \
+	scripts/release_common.sh \
+	scripts/release_macos.sh \
+	scripts/release_windows.ps1 \
+	scripts/release_windows.bat \
+	scripts/verify_dataplane_release.sh \
+	scripts/build_macos.sh \
+	scripts/build_windows.bat \
+	scripts/ci_setup_odin.sh \
+	scripts/ci_setup_odin.ps1 \
+	scripts/release_dataplane_test.sh
+do
+	if ! grep -q "$needle" "${ROOT}/scripts/stage_public_tree.sh"; then
+		fail_msg "stage_public_tree.sh allowlist missing ${needle}"
 	fi
-else
-	echo "release_dataplane_test: public tree — skip stage_public_tree/publish_github allowlists"
-fi
+	if ! grep -q "$needle" "${ROOT}/scripts/publish_github.sh"; then
+		fail_msg "publish_github.sh public-path list missing ${needle}"
+	fi
+done
 
+if ! grep -q 'dataplane-release.yml' "${ROOT}/scripts/stage_public_tree.sh"; then
+	fail_msg "stage_public_tree.sh does not publish the GitHub Actions workflow"
+fi
 if ! grep -q 'macos-latest' "${ROOT}/.github/workflows/dataplane-release.yml"; then
 	fail_msg "workflow missing macos-latest"
+fi
+if ! grep -q 'macos-15-intel' "${ROOT}/.github/workflows/dataplane-release.yml"; then
+	fail_msg "workflow missing macos-15-intel"
+fi
+if ! grep -q 'arch: x86_64' "${ROOT}/.github/workflows/dataplane-release.yml"; then
+	fail_msg "workflow missing macos x86_64 (Intel) matrix arch"
+fi
+if ! grep -q 'arch: arm64' "${ROOT}/.github/workflows/dataplane-release.yml"; then
+	fail_msg "workflow missing macos arm64 matrix arch"
+fi
+if ! grep -q 'thirp-runtime-macos-${{ matrix.arch }}' "${ROOT}/.github/workflows/dataplane-release.yml"; then
+	fail_msg "workflow macos artifact name is not arch-specific"
 fi
 if ! grep -q 'windows-latest' "${ROOT}/.github/workflows/dataplane-release.yml"; then
 	fail_msg "workflow missing windows-latest"
@@ -108,17 +109,53 @@ fi
 if ! grep -q 'release_windows.ps1' "${ROOT}/.github/workflows/dataplane-release.yml"; then
 	fail_msg "workflow does not invoke release_windows.ps1"
 fi
+if ! grep -q 'C:\\Program Files\\OpenSSL"' "${ROOT}/.github/workflows/dataplane-release.yml"; then
+	fail_msg "workflow does not search C:\\Program Files\\OpenSSL"
+fi
+if ! grep -q 'system:libssl.lib' "${ROOT}/transport/openssl.odin"; then
+	fail_msg "openssl.odin Windows import missing system:libssl.lib"
+fi
+if ! grep -q 'OPENSSL_LIBPATH' "${ROOT}/scripts/build_windows.bat"; then
+	fail_msg "build_windows.bat does not locate OPENSSL_LIBPATH"
+fi
+if ! grep -q 'set "LIB=%OPENSSL_LIBPATH%;%LIB%"' "${ROOT}/scripts/build_windows.bat"; then
+	fail_msg "build_windows.bat does not prepend OPENSSL_LIBPATH to LIB"
+fi
+if ! grep -q '_odin_entry_point' "${ROOT}/transport/entry_darwin.odin"; then
+	fail_msg "transport/entry_darwin.odin missing _odin_entry_point"
+fi
+if ! grep -q 'odin-macos-${ODIN_ARCH}-${ODIN_TAG}.tar.gz' "${ROOT}/scripts/ci_setup_odin.sh"; then
+	fail_msg "ci_setup_odin.sh missing macos tar.gz candidate"
+fi
+if ! grep -q 'gzip -t' "${ROOT}/scripts/ci_setup_odin.sh"; then
+	fail_msg "ci_setup_odin.sh does not sniff gzip archives"
+fi
 
 if grep -q 'release packaging for macOS and Windows is not yet automated' "${ROOT}/README.md"; then
 	fail_msg "README still says macOS/Windows release packaging is not automated"
 fi
-if [[ -f "${ROOT}/docs/BUILDING.md" ]] && grep -q 'release_macos.sh' "${ROOT}/docs/BUILDING.md" 2>/dev/null; then
-	:
-elif [[ -f "${ROOT}/docs/BUILDING.md" ]]; then
-	# Public snapshot docs may lag Origin; warn only when file exists but incomplete
-	if ! grep -q 'release_macos.sh' "${ROOT}/docs/BUILDING.md"; then
-		echo "release_dataplane_test: WARN BUILDING.md missing release_macos.sh (public tree OK)"
-	fi
+if grep -qE 'amd64 \(Intel\) is not published yet|macOS Intel is not published yet' \
+	"${ROOT}/README.md" "${ROOT}/docs/BUILDING.md" \
+	"${ROOT}/docs/COMPATIBILITY.md" "${ROOT}/docs/QUICKSTART.md"; then
+	fail_msg "docs still say macOS Intel is not published yet"
+fi
+if ! grep -q 'macos-15-intel' "${ROOT}/docs/BUILDING.md"; then
+	fail_msg "BUILDING.md missing macos-15-intel"
+fi
+if ! grep -q 'v0.16.3-dataplane-unsigned-mac-intel' "${ROOT}/docs/QUICKSTART.md"; then
+	fail_msg "QUICKSTART.md missing v0.16.3-dataplane-unsigned-mac-intel"
+fi
+if ! grep -q 'v0.16.3-dataplane-unsigned-mac-intel' "${ROOT}/README.md"; then
+	fail_msg "README.md missing v0.16.3-dataplane-unsigned-mac-intel"
+fi
+if ! grep -q 'release_macos.sh' "${ROOT}/docs/BUILDING.md"; then
+	fail_msg "BUILDING.md missing release_macos.sh"
+fi
+if ! grep -q 'THIRP_MACOS_CODESIGN_IDENTITY' "${ROOT}/docs/BUILDING.md"; then
+	fail_msg "BUILDING.md missing Apple Developer ID blocker name"
+fi
+if ! grep -q 'THIRP_WINDOWS_PFX' "${ROOT}/docs/BUILDING.md"; then
+	fail_msg "BUILDING.md missing Authenticode blocker name"
 fi
 
 # Fixture: darwin tree verifies; broker binary is rejected.
@@ -154,6 +191,22 @@ EOF
 write_sums "${FIX}/darwin" thirp-agent thirp-connect libthirp.dylib thirp.h LICENSE NOTICE CHANGELOG.md DEPENDENCIES.md PROVENANCE.txt
 if ! bash "${ROOT}/scripts/verify_dataplane_release.sh" "${FIX}/darwin" darwin; then
 	fail_msg "verify_dataplane_release.sh rejected a valid darwin fixture"
+fi
+
+mkdir -p "${FIX}/darwin-intel"
+cp -a "${FIX}/darwin/." "${FIX}/darwin-intel/"
+cat > "${FIX}/darwin-intel/PROVENANCE.txt" <<'EOF'
+name: thirp-runtime
+version: 0.16.3
+source_commit: deadbeef
+target: darwin x86_64
+artifact_kind: dataplane
+components: thirp-agent thirp-connect libthirp
+build_command: scripts/release_macos.sh
+EOF
+write_sums "${FIX}/darwin-intel" thirp-agent thirp-connect libthirp.dylib thirp.h LICENSE NOTICE CHANGELOG.md DEPENDENCIES.md PROVENANCE.txt
+if ! bash "${ROOT}/scripts/verify_dataplane_release.sh" "${FIX}/darwin-intel" darwin; then
+	fail_msg "verify_dataplane_release.sh rejected a valid darwin x86_64 fixture"
 fi
 
 for name in thirp-agent.exe thirp-connect.exe libthirp.dll thirp.h LICENSE NOTICE CHANGELOG.md DEPENDENCIES.md; do

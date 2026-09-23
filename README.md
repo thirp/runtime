@@ -41,21 +41,29 @@ Learn about the managed pilot at [thirp.net](https://thirp.net/).
 - Source version: **0.16.3**
 - Wire protocol: **1.0**, frozen and documented in
   [docs/PROTOCOL.md](docs/PROTOCOL.md)
-- Platforms: **Linux** (full operator release + dataplane), **macOS arm64** and
-  **Windows AMD64** (dataplane Agent/Caller CLIs and C ABI shared libraries).
-  macOS **amd64 (Intel)** is not published yet.
+- Platforms: **Linux** (full operator release + dataplane), **macOS arm64**,
+  **macOS x86_64 (Intel)**, and **Windows AMD64** (dataplane Agent/Caller CLIs
+  and C ABI shared libraries). Download locations:
+  [v0.16.3](https://github.com/thirp/runtime/releases/tag/v0.16.3) (Linux
+  operator),
+  [v0.16.3-dataplane-unsigned](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned)
+  (macOS arm64, Windows AMD64, Linux dataplane),
+  [v0.16.3-dataplane-unsigned-mac-intel](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned-mac-intel)
+  (macOS x86_64 Intel).
 - SDKs: Odin source packages and C ABI (`libthirp.so` Linux, `libthirp.dylib`
   macOS, `libthirp.dll` Windows). The embed SDK tarball still ships the Linux
   `.so` only; macOS/Windows `libthirp` ship in dataplane release trees.
 - Release artifacts:
   - Linux operator: binaries, `libthirp.so`, SDK and Broker tarballs, source,
     SBOM, checksums, and provenance (tag `v0.16.3` and later operator releases)
-  - Multi-OS **unsigned** dataplane:
+  - Multi-OS **unsigned** dataplane (`thirp-agent` / `thirp-connect` /
+    `libthirp` + `SHA256SUMS` + `UNSIGNED.md` where present). **Not signed**
+    (no Apple Developer ID, Authenticode, or GPG `SHA256SUMS.asc`).
     [v0.16.3-dataplane-unsigned](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned)
-    — macOS arm64, Windows AMD64, and Linux x86_64 zips (`thirp-agent` /
-    `thirp-connect` / `libthirp` + `SHA256SUMS` + `UNSIGNED.md`). **Not signed**
-    (no Apple Developer ID, Authenticode, or GPG `SHA256SUMS.asc` on that tag).
-    Signing (Apple Developer ID, Authenticode, and GPG detached checksums) lands when certificates are available.
+    — macOS arm64, Windows AMD64, Linux x86_64 zips.
+    [v0.16.3-dataplane-unsigned-mac-intel](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned-mac-intel)
+    — macOS x86_64 (Intel) tarball. Signing (Apple Developer ID, Authenticode,
+    and GPG detached checksums) lands when certificates are available.
 
 The self-hosted Runtime implements TLS, role separation, deny-by-default
 production policy, bounded resources, reconnect, health/metrics, and graceful
@@ -100,9 +108,11 @@ certificate, starts each component, and sends an HTTP request through the relay.
 
 Download published artifacts from
 [GitHub Releases](https://github.com/thirp/runtime/releases):
-Linux operator bits from the latest operator tag (e.g. `v0.16.3`); multi-OS
-dataplane zips from
-[v0.16.3-dataplane-unsigned](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned)
+Linux operator bits from the latest operator tag (e.g. `v0.16.3`);
+macOS arm64 / Windows / Linux dataplane zips from
+[v0.16.3-dataplane-unsigned](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned);
+macOS Intel from
+[v0.16.3-dataplane-unsigned-mac-intel](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned-mac-intel)
 (unsigned — verify with `SHA256SUMS`). To compile individual components, or to
 produce a platform release tree, see
 [Building, testing, and packaging](docs/BUILDING.md).

@@ -17,4 +17,4 @@ Release `SHA256SUMS` files may include a detached signature `SHA256SUMS.asc`. Th
 3B8559D8754FB3C5B21110C786897A405CF3D8C4
 ```
 
-Verify with `gpg --verify SHA256SUMS.asc SHA256SUMS`. See [SECURITY.md](../docs/SECURITY.md) for the self-hosted threat model.
+Verify with `gpg --verify SHA256SUMS.asc SHA256SUMS`. The same fingerprint signs Linux and macOS/Windows data-plane `SHA256SUMS` when the publish key is present. See [SECURITY.md](../docs/SECURITY.md) for the self-hosted threat model and OS-level signing blockers.

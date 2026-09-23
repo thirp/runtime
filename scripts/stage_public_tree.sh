@@ -58,11 +58,25 @@ ALLOW_SCRIPTS=(
 	scripts/release.sh
 	scripts/release_broker.sh
 	scripts/release_sdk.sh
+	scripts/release_common.sh
+	scripts/release_macos.sh
+	scripts/release_windows.ps1
+	scripts/release_windows.bat
+	scripts/release_dataplane_test.sh
+	scripts/verify_dataplane_release.sh
+	scripts/build_macos.sh
+	scripts/build_windows.bat
+	scripts/ci_setup_odin.sh
+	scripts/ci_setup_odin.ps1
 	scripts/sbom.spdx.json.in
 	scripts/sdk_lib.sh
 	scripts/stage_public_tree.sh
 	scripts/verify_broker.sh
 	scripts/verify_sdk.sh
+)
+
+ALLOW_GITHUB_WORKFLOWS=(
+	.github/workflows/dataplane-release.yml
 )
 
 ALLOW_DEPLOY=(
@@ -178,6 +192,10 @@ else
 	echo "stage_public_tree: missing GitHub security policy" >&2
 	exit 1
 fi
+
+for f in "${ALLOW_GITHUB_WORKFLOWS[@]}"; do
+	copy_file "$f"
+done
 
 if compgen -G "${STAGE}/deploy/systemd/rendez-*" > /dev/null; then
 	echo "stage_public_tree: staged tree contains rendez systemd units" >&2

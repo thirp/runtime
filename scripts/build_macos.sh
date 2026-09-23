@@ -22,8 +22,9 @@ fi
 
 VERSION="$(tr -d '[:space:]' < VERSION.txt)"
 COMMIT="$(git rev-parse HEAD 2>/dev/null || echo "unknown")"
+ARCH="$(uname -m)"
 
-echo "Building thirp-runtime ${VERSION} for macOS (${MODE})..."
+echo "Building thirp-runtime ${VERSION} for macOS ${ARCH} (${MODE})..."
 
 if ! command -v odin >/dev/null 2>&1; then
 	echo "Error: odin compiler not found. Install from https://odin-lang.org/" >&2
@@ -38,7 +39,7 @@ fi
 OPENSSL_PREFIX="$(brew --prefix openssl@3)"
 OPENSSL_LIB="${OPENSSL_PREFIX}/lib"
 
-OUT="${ROOT}/dist/thirp-runtime-macos-${VERSION}"
+OUT="${ROOT}/dist/thirp-runtime-macos-${ARCH}-${VERSION}"
 rm -rf "$OUT"
 mkdir -p "$OUT"
 

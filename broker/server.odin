@@ -63,6 +63,7 @@ Server :: struct {
 	tls_ctx:                   ^trans.TlsServerContext,
 	metrics:                   Metrics,
 	logger:                    ^log.Logger,
+	stream_not_found_log_at:   i64,
 	draining:                  bool,
 	shutdown_grace:            time.Duration,
 	metrics_listener:          trans.Listener,

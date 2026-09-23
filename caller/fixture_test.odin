@@ -6,6 +6,7 @@ import brk "../broker"
 import proto "../protocol"
 import trans "../transport"
 import "core:net"
+import "core:sync"
 import "core:testing"
 import "core:thread"
 import "core:time"
@@ -23,13 +24,20 @@ TestBroker :: struct {
 }
 
 EchoWorker :: struct {
-	ln: ^trans.Listener,
+	ln:   ^trans.Listener,
+	live: ^int,
+}
+
+EchoMirrorArg :: struct {
+	conn: ^trans.Connection,
+	live: ^int,
 }
 
 EchoFixture :: struct {
-	ln:     trans.Listener,
-	worker: EchoWorker,
-	th:     ^thread.Thread,
+	ln:         trans.Listener,
+	worker:     EchoWorker,
+	th:         ^thread.Thread,
+	live_conns: int,
 }
 
 AgentRunArg :: struct {
@@ -70,7 +78,9 @@ start_echo :: proc(t: ^testing.T, fx: ^EchoFixture, loc := #caller_location) -> 
 	_ = trans.listener_set_recv_timeout(&fx.ln, 50 * time.Millisecond)
 	ep, eerr := trans.listener_endpoint(fx.ln)
 	testing.expect_value(t, eerr, trans.TransportError.None, loc)
+	fx.live_conns = 0
 	fx.worker.ln = &fx.ln
+	fx.worker.live = &fx.live_conns
 	fx.th = thread.create_and_start_with_poly_data(&fx.worker, echo_accept_loop)
 	return ep
 }
@@ -93,12 +103,30 @@ echo_accept_loop :: proc(w: ^EchoWorker) {
 		if err != .None {
 			return
 		}
-		thread.run_with_poly_data(conn, echo_mirror_one)
+		arg, aerr := new(EchoMirrorArg)
+		if aerr != .None {
+			trans.connection_destroy(conn)
+			return
+		}
+		arg.conn = conn
+		arg.live = w.live
+		thread.run_with_poly_data(arg, echo_mirror_one)
 	}
 }
 
-echo_mirror_one :: proc(conn: ^trans.Connection) {
-	defer trans.connection_destroy(conn)
+echo_mirror_one :: proc(arg: ^EchoMirrorArg) {
+	conn := arg.conn
+	live := arg.live
+	free(arg)
+	if live != nil {
+		sync.atomic_add(live, 1)
+	}
+	defer {
+		if live != nil {
+			sync.atomic_sub(live, 1)
+		}
+		trans.connection_destroy(conn)
+	}
 	buf: [1024]u8
 	for {
 		n, err := trans.connection_read(conn, buf[:])

@@ -887,6 +887,8 @@ conn_handle_connect :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 	open_payload, perr := proto.encode_open(proto.Open{service_id = msg.service_id}, h.server.allocator)
 	if perr != .None {
 		trans.connection_release(agent_conn)
+		stream, _ := relay_lookup_stream(h.server, stream_id)
+		server_drop_stream_queues(h.server, stream)
 		relay_drop_stream(h.server, stream_id)
 		metrics_inc_connect_failure(&h.server.metrics, .InternalError)
 		_ = conn_send_failure(h, .ConnectFailed, .InternalError)
@@ -896,6 +898,8 @@ conn_handle_connect :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 	delete(open_payload, h.server.allocator)
 	trans.connection_release(agent_conn)
 	if qerr != .None {
+		stream, _ := relay_lookup_stream(h.server, stream_id)
+		server_drop_stream_queues(h.server, stream)
 		relay_drop_stream(h.server, stream_id)
 		metrics_inc_connect_failure(&h.server.metrics, .AgentUnavailable)
 		_ = conn_send_failure(h, .ConnectFailed, .AgentUnavailable)
@@ -915,12 +919,7 @@ conn_handle_open_ok :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 	stream, err := relay_apply(h.server, frame.header.stream_id, .OpenOk, .Agent)
 	if err == .NotFound {
 		metrics_inc_reset(&h.server.metrics, .StreamNotFound)
-		conn_log(
-			h,
-			.Info,
-			LOG_EVENT_STREAM_RESET,
-			log.LogFields{stream_id = u64(frame.header.stream_id), error_code = wire_error_name(.StreamNotFound), reason = reset_reason_label(.StreamNotFound)},
-		)
+		conn_log_stream_not_found(h, frame.header.stream_id)
 		_ = conn_send_failure_stream(h, .Reset, .StreamNotFound, frame.header.stream_id)
 		return false
 	}
@@ -931,6 +930,7 @@ conn_handle_open_ok :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 	metrics_observe(&h.server.metrics, .OpenOk, time.since(stream.opened_at))
 	peer, _, ok := relay_acquire_peer(h.server, stream.id, .Caller)
 	if !ok {
+		server_drop_stream_queues(h.server, stream)
 		relay_drop_stream(h.server, stream.id)
 		metrics_inc_connect_failure(&h.server.metrics, .AgentUnavailable)
 		return false
@@ -938,6 +938,8 @@ conn_handle_open_ok :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 	qerr := server_enqueue_frame(h.server, peer, .ConnectOk, nil, stream.id)
 	trans.connection_release(peer)
 	if qerr != .None {
+		latest, _ := relay_lookup_stream(h.server, stream.id)
+		server_drop_stream_queues(h.server, latest)
 		relay_drop_stream(h.server, stream.id)
 		metrics_inc_connect_failure(&h.server.metrics, .AgentUnavailable)
 		return false
@@ -996,6 +998,7 @@ conn_handle_open_failed :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 			error_code = wire_error_name(.LocalServiceUnavailable),
 		},
 	)
+	server_drop_stream_queues(h.server, stream)
 	relay_drop_stream(h.server, stream.id)
 	return false
 }
@@ -1031,16 +1034,7 @@ conn_handle_stream_frame :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 	stream, err := relay_apply(h.server, frame.header.stream_id, event, from)
 	if err == .NotFound {
 		metrics_inc_reset(&h.server.metrics, .StreamNotFound)
-		conn_log(
-			h,
-			.Info,
-			LOG_EVENT_STREAM_RESET,
-			log.LogFields {
-				stream_id  = u64(frame.header.stream_id),
-				error_code = wire_error_name(.StreamNotFound),
-				reason     = reset_reason_label(.StreamNotFound),
-			},
-		)
+		conn_log_stream_not_found(h, frame.header.stream_id)
 		_ = conn_send_failure_stream(h, .Reset, .StreamNotFound, frame.header.stream_id)
 		return false
 	}
@@ -1062,6 +1056,16 @@ conn_handle_stream_frame :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 
 	dest := stream_peer_opposite(from)
 	peer, _, ok := relay_acquire_peer(h.server, stream.id, dest)
+	// Terminal CLOSE/RESET/second HALF_CLOSE must reach the peer. PR #3
+	// called drop_stream_queues after enqueue, which deleted the frame
+	// that tells the agent to finish_stream — origin fds stayed open
+	// (N=256 → ~258 stuck agent fds) and late DATA hit a caller that
+	// had already dropped the stream. Drop leftover DATA first, then
+	// enqueue this terminal frame, then remove the table entry.
+	terminal := stream_state_is_terminal(stream.state)
+	if terminal {
+		server_drop_stream_queues(h.server, stream)
+	}
 	if ok {
 		if !conn_enqueue_stream(h, peer, frame.header.opcode, frame.payload, frame.header.stream_id, from) {
 			trans.connection_release(peer)
@@ -1069,7 +1073,7 @@ conn_handle_stream_frame :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 		}
 		trans.connection_release(peer)
 	}
-	if stream_state_is_terminal(stream.state) {
+	if terminal {
 		if event == .Close {
 			latest, found := relay_lookup_stream(h.server, stream.id)
 			if found {
@@ -1173,13 +1177,12 @@ conn_reset_overflow :: proc(h: ^ConnHandler, stream_id: proto.StreamId, limit: L
 	if !found {
 		return
 	}
+	server_drop_stream_queues(h.server, stream)
 	if caller := server_lookup_outbox(h.server, stream.caller_conn); caller != nil {
-		outbox_drop_stream(caller, stream_id)
 		_ = outbox_enqueue_failure(caller, .Reset, .InternalError, stream_id, diagnostic)
 		outbox_release(caller)
 	}
 	if agent := server_lookup_outbox(h.server, stream.agent_conn); agent != nil {
-		outbox_drop_stream(agent, stream_id)
 		_ = outbox_enqueue_failure(agent, .Reset, .InternalError, stream_id, diagnostic)
 		outbox_release(agent)
 	}
@@ -1215,6 +1218,7 @@ conn_reset_idle_stream :: proc(h: ^ConnHandler, stream_id: proto.StreamId) {
 			reason     = reset_reason_label(.StreamIdle),
 		},
 	)
+	server_drop_stream_queues(h.server, stream)
 	if stream.state == .Opening {
 		if trans.connection_acquire(stream.caller_conn) {
 			_ = server_enqueue_failure(
@@ -1232,12 +1236,10 @@ conn_reset_idle_stream :: proc(h: ^ConnHandler, stream_id: proto.StreamId) {
 		}
 	} else {
 		if caller := server_lookup_outbox(h.server, stream.caller_conn); caller != nil {
-			outbox_drop_stream(caller, stream_id)
 			_ = outbox_enqueue_failure(caller, .Reset, .Timeout, stream_id)
 			outbox_release(caller)
 		}
 		if agent := server_lookup_outbox(h.server, stream.agent_conn); agent != nil {
-			outbox_drop_stream(agent, stream_id)
 			_ = outbox_enqueue_failure(agent, .Reset, .Timeout, stream_id)
 			outbox_release(agent)
 		}
@@ -1275,6 +1277,7 @@ conn_reset_grant_stream :: proc(h: ^ConnHandler, stream_id: proto.StreamId, reas
 			reason     = reset_reason_label(reason),
 		},
 	)
+	server_drop_stream_queues(h.server, stream)
 	if stream.state == .Opening {
 		if trans.connection_acquire(stream.caller_conn) {
 			_ = server_enqueue_failure(
@@ -1292,12 +1295,10 @@ conn_reset_grant_stream :: proc(h: ^ConnHandler, stream_id: proto.StreamId, reas
 		}
 	} else {
 		if caller := server_lookup_outbox(h.server, stream.caller_conn); caller != nil {
-			outbox_drop_stream(caller, stream_id)
 			_ = outbox_enqueue_failure(caller, .Reset, code, stream_id)
 			outbox_release(caller)
 		}
 		if agent := server_lookup_outbox(h.server, stream.agent_conn); agent != nil {
-			outbox_drop_stream(agent, stream_id)
 			_ = outbox_enqueue_failure(agent, .Reset, code, stream_id)
 			outbox_release(agent)
 		}
@@ -1314,13 +1315,12 @@ conn_abort_stream :: proc(h: ^ConnHandler, stream_id: proto.StreamId, from: Stre
 		LOG_EVENT_STREAM_RESET,
 		log.LogFields{stream_id = u64(stream_id), error_code = wire_error_name(.ProtocolError), reason = reset_reason_label(.ProtocolError)},
 	)
+	if stream, found := relay_lookup_stream(h.server, stream_id); found {
+		server_drop_stream_queues(h.server, stream)
+	}
 	dest := stream_peer_opposite(from)
 	peer, _, ok := relay_acquire_peer(h.server, stream_id, dest)
 	if ok {
-		if box := server_lookup_outbox(h.server, peer); box != nil {
-			outbox_drop_stream(box, stream_id)
-			outbox_release(box)
-		}
 		_ = server_enqueue_failure(h.server, peer, .Reset, .ProtocolError, stream_id)
 		trans.connection_release(peer)
 	}

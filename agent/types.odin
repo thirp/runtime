@@ -95,6 +95,14 @@ AgentPumpArg :: struct {
 	local:     ^trans.Connection,
 }
 
+// OPEN is dialed off the relay reader so inbound DATA/control for other
+// streams is not stalled behind a synchronous local dial.
+AgentOpenArg :: struct {
+	relay:     ^AgentRelay,
+	stream_id: proto.StreamId,
+	target:    LocalTarget,
+}
+
 AgentRelay :: struct {
 	mutex:      sync.Mutex,
 	agent:      ^Agent,

@@ -15,6 +15,8 @@ DEFAULT_CONNECT_RATE_LIMIT :: 600
 DEFAULT_MAX_BUFFERED_BYTES :: 256 * 1024 * 1024
 DEFAULT_STREAM_IDLE_TIMEOUT :: 0
 DEFAULT_RATE_LIMIT_WINDOW :: 60 * time.Second
+// One Info stream_reset for STREAM_NOT_FOUND per window. Metrics still count every RESET.
+STREAM_NOT_FOUND_LOG_WINDOW :: 1 * time.Second
 READYZ_READY :: "ready"
 READYZ_NOT_READY :: "not_ready"
 READYZ_DRAINING :: "draining"

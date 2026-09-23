@@ -10,7 +10,7 @@ set ROOT=%CD%
 set MODE=all
 if /i "%~1"=="dataplane" set MODE=dataplane
 if not "%~1"=="" if /i not "%~1"=="dataplane" (
-    echo build_windows: unknown mode: %~1 - use all or dataplane >&2
+    echo build_windows: unknown mode: %~1 (use all or dataplane) >&2
     exit /b 1
 )
 
@@ -43,29 +43,31 @@ set OUT=%ROOT%\dist\thirp-runtime-windows-%VERSION%
 if exist "%OUT%" rd /s /q "%OUT%"
 mkdir "%OUT%"
 
-REM Locate libssl.lib for MSVC (OpenSSL 3/4 Shining Light layouts).
-REM Prefer MD over MDd. Prepend to LIB so spaces in Program Files are fine.
+REM OpenSSL 3/4: Chocolatey now uses C:\Program Files\OpenSSL (not OpenSSL-Win64).
+REM Shining Light layouts put import libs under lib\ or lib\VC\x64\MD\.
 set "OPENSSL_ROOT=%OPENSSL_ROOT_DIR%"
-if "%OPENSSL_ROOT%"=="" set "OPENSSL_ROOT=C:\Program Files\OpenSSL"
+if "%OPENSSL_ROOT%"=="" (
+    if exist "C:\Program Files\OpenSSL\bin\openssl.exe" set "OPENSSL_ROOT=C:\Program Files\OpenSSL"
+)
+if "%OPENSSL_ROOT%"=="" (
+    if exist "C:\Program Files\OpenSSL-Win64\bin\openssl.exe" set "OPENSSL_ROOT=C:\Program Files\OpenSSL-Win64"
+)
 set "OPENSSL_LIBPATH="
 for %%D in (
     "%OPENSSL_ROOT%\lib\VC\x64\MD"
     "%OPENSSL_ROOT%\lib\VC\x64\MT"
     "%OPENSSL_ROOT%\lib"
     "%OPENSSL_ROOT%\lib64"
-    "%OPENSSL_ROOT%\lib\VC\x64\MDd"
 ) do (
-    if "!OPENSSL_LIBPATH!"=="" if exist "%%~D\libssl.lib" set "OPENSSL_LIBPATH=%%~D"
-    if "!OPENSSL_LIBPATH!"=="" if exist "%%~D\libssl-3-x64.lib" set "OPENSSL_LIBPATH=%%~D"
+    if exist "%%~D\libssl.lib" set "OPENSSL_LIBPATH=%%~D"
 )
 if "%OPENSSL_LIBPATH%"=="" (
     echo Error: libssl.lib not found under %OPENSSL_ROOT% >&2
-    dir /s /b "%OPENSSL_ROOT%\*ssl*.lib" 2>nul
+    if not "%OPENSSL_ROOT%"=="" dir /s /b "%OPENSSL_ROOT%\*ssl*.lib" 2>nul
     exit /b 1
 )
 echo Using OPENSSL_LIBPATH=%OPENSSL_LIBPATH%
 set "LIB=%OPENSSL_LIBPATH%;%LIB%"
-set "PATH=%OPENSSL_ROOT%\bin;%PATH%"
 
 echo Building binaries...
 if /i "%MODE%"=="all" (

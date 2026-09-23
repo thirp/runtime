@@ -36,7 +36,7 @@ This inventory is the source of truth for the release SBOM (`scripts/sbom.spdx.j
 - **Used for:** same TLS operations as Linux
 - **License:** Apache-2.0
 - **Install:** official Windows binaries from [wiki.openssl.org](https://wiki.openssl.org/index.php/Binaries) or via package manager (vcpkg, Chocolatey)
-- **Link:** `foreign import "system:libssl"` and `"system:libcrypto"` (note the `lib` prefix on Windows)
+- **Link:** `foreign import "system:libssl.lib"` and `"system:libcrypto.lib"` (MSVC needs the `.lib` suffix; without it the linker looks for `libssl.obj`). `scripts/build_windows.bat` adds the directory containing `libssl.lib` to `LIB` (`OPENSSL_ROOT_DIR`, then `C:\Program Files\OpenSSL`, then `OpenSSL-Win64`; including `lib\VC\x64\MD`). OpenSSL 4 via Chocolatey installs at `C:\Program Files\OpenSSL`.
 - **CA verification:** Windows ROOT certificate store via `CertOpenSystemStoreW` / `d2i_X509` / `X509_STORE_add_cert` (`crypt32.lib`, a Windows system library)
 
 ## Platform-specific system libraries

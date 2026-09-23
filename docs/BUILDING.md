@@ -176,7 +176,7 @@ See [SDK.md](SDK.md) for lifecycle and API guidance.
 ## Cross-platform status
 
 - **Linux**: Full operator release artifacts including packages, SBOM, and provenance (`scripts/release.sh`). Dataplane zip also on the unsigned multi-OS tag.
-- **macOS**: Data-plane release tree (`thirp-agent`, `thirp-connect`, `libthirp.dylib`) via `scripts/release_macos.sh`. Published today: **arm64** only; **amd64 (Intel)** is not published yet.
+- **macOS**: Data-plane release tree (`thirp-agent`, `thirp-connect`, `libthirp.dylib`) via `scripts/release_macos.sh` on **arm64** (`macos-latest`) and **x86_64 (Intel)** (`macos-15-intel`). Published: arm64 on [v0.16.3-dataplane-unsigned](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned); Intel on [v0.16.3-dataplane-unsigned-mac-intel](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned-mac-intel).
 - **Windows**: Data-plane release tree (`thirp-agent.exe`, `thirp-connect.exe`, `libthirp.dll`) via `scripts/release_windows.ps1` (AMD64).
 
 macOS and Windows agents and callers connect outbound to a Linux broker over TLS.
@@ -187,7 +187,8 @@ argument; they are not part of the published data-plane trees.
 
 The `dataplane-release` GitHub Actions workflow (Origin-compatible GHA YAML in
 `.github/workflows/dataplane-release.yml`) runs `scripts/release_dataplane_test.sh`
-on Ubuntu and the native release scripts on `macos-latest` and `windows-latest`.
+on Ubuntu and the native release scripts on `macos-latest` (arm64),
+`macos-15-intel` (x86_64), and `windows-latest`.
 
 ## Produce a Linux release tree
 
@@ -242,16 +243,20 @@ scripts/release_macos.sh
 Output:
 
 ```text
-dist/thirp-runtime-macos-<VERSION>/
+dist/thirp-runtime-macos-<arch>-<VERSION>/
 dist/thirp-runtime-macos-<arch>-<VERSION>.tar.gz
 ```
 
 The directory contains `thirp-agent`, `thirp-connect`, `libthirp.dylib`,
 `thirp.h`, `LICENSE`, `NOTICE`, changelog, dependency inventory, `PROVENANCE.txt`,
 and `SHA256SUMS`. `SHA256SUMS.asc` is added when the Thirp publish key is in the
-agent (`THIRP_GPG_KEY`, same fingerprint as Linux). The published pre-sign zip is
-`thirp-runtime-macos-arm64-<VERSION>-unsigned.zip` (arm64). Intel macOS is not
-published yet.
+agent (`THIRP_GPG_KEY`, same fingerprint as Linux). CI uploads
+`thirp-runtime-macos-arm64-<VERSION>.tar.gz` and
+`thirp-runtime-macos-x86_64-<VERSION>.tar.gz`. Published pre-sign archives:
+`thirp-runtime-macos-arm64-0.16.3-unsigned.zip` on
+[v0.16.3-dataplane-unsigned](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned);
+`thirp-runtime-macos-x86_64-0.16.3.tar.gz` on
+[v0.16.3-dataplane-unsigned-mac-intel](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned-mac-intel).
 
 Apple Developer ID signing is optional and skipped unless
 `THIRP_MACOS_CODESIGN_IDENTITY` is set. Notarization is skipped unless
@@ -288,7 +293,7 @@ Authenticode signing is skipped unless `THIRP_WINDOWS_PFX` (and optional
 # macOS or Linux host checking a darwin tree
 sha256sum -c SHA256SUMS
 gpg --verify SHA256SUMS.asc SHA256SUMS   # when the detached signature is present
-bash scripts/verify_dataplane_release.sh dist/thirp-runtime-macos-<VERSION> darwin
+bash scripts/verify_dataplane_release.sh dist/thirp-runtime-macos-<arch>-<VERSION> darwin
 ```
 
 ```powershell
@@ -301,21 +306,25 @@ checksums are still usable.
 ### How artifacts are published
 
 1. Push or tag on GitHub runs `.github/workflows/dataplane-release.yml`.
-2. The `linux-test`, `macos`, and `windows` jobs run on hosted runners; native
-   macOS/Windows jobs are green and upload `dist/thirp-runtime-macos-*` and
-   `dist/thirp-runtime-windows-*` as Actions artifacts.
-3. Pre-sign multi-OS dataplane drop:
+2. The `check`, `macos` (arm64 + x86_64 matrix), and `windows` jobs run on
+   hosted runners; native jobs upload `thirp-runtime-macos-arm64-*.tar.gz`,
+   `thirp-runtime-macos-x86_64-*.tar.gz`, and `dist/thirp-runtime-windows-*`
+   as Actions artifacts.
+3. Pre-sign multi-OS dataplane drops (both **unsigned**):
    [v0.16.3-dataplane-unsigned](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned)
    publishes macOS **arm64**, Windows **AMD64**, and Linux **x86_64** dataplane
-   zips plus `SHA256SUMS` and `UNSIGNED.md`. macOS **amd64 (Intel)** is not in
-   that Release. Binaries on that tag are **unsigned**.
-4. On a `v*` operator tag of `thirp/runtime`, the `publish` job can attach
-   dataplane trees to the GitHub Release (creates the release if
-   `scripts/publish_github.sh --release` has not already).
+   zips plus `SHA256SUMS` and `UNSIGNED.md`.
+   [v0.16.3-dataplane-unsigned-mac-intel](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned-mac-intel)
+   adds the macOS **x86_64 (Intel)** tarball without bumping `VERSION.txt` or
+   replacing `v0.16.3`.
+4. On a `v*` tag of `thirp/runtime` (operator or dataplane-suffix), the
+   `publish` job can attach dataplane archives to the GitHub Release (creates
+   the release if `scripts/publish_github.sh --release` has not already).
 5. The private publisher `scripts/publish_github.sh --release` still attaches
    the Linux operator tree (and requires `SHA256SUMS.asc` when signing). If
-   `dist/thirp-runtime-macos-<VERSION>` or
-   `dist/thirp-runtime-windows-<VERSION>` exist, those files are attached too.
+   `dist/thirp-runtime-macos-<arch>-<VERSION>.tar.gz` or
+   `dist/thirp-runtime-windows-<arch>-<VERSION>.zip` exist, those archives
+   are attached too.
 
 `scripts/release_dataplane_test.sh` checks script syntax, allowlists, workflow
 wiring, and fixture trees. It does not compile `.dylib` / `.dll`.
@@ -335,8 +344,8 @@ scripts skip signing when they are absent:
 
 Do not invent or commit those keys. The GPG fingerprint that CI must match is
 the one already published in [SECURITY.md](SECURITY.md#release-signing). Hosted
-`macos-latest` / `windows-latest` runners for `dataplane-release` are already
-enabled on `thirp/runtime`.
+`macos-latest` / `macos-15-intel` / `windows-latest` runners for
+`dataplane-release` must be available on `thirp/runtime`.
 
 ## Artifact contracts
 

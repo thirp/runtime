@@ -19,11 +19,14 @@ OS-level signatures are separate and optional:
 
 Those certificates are not in this repository. Without them, Gatekeeper and SmartScreen warn; `SHA256SUMS` still identifies the files. See [BUILDING.md](BUILDING.md#signing-blockers-certs-pending).
 
-The pre-sign multi-OS dataplane Release
-([v0.16.3-dataplane-unsigned](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned))
-ships **unsigned** platform binaries and has **no** `SHA256SUMS.asc`. Verify that
-tag with `SHA256SUMS` only (and read `UNSIGNED.md` in the asset set). Do not claim
-Apple Developer ID, notarization, Authenticode, or GPG until a signed Release is published.
+The pre-sign multi-OS dataplane Releases
+([v0.16.3-dataplane-unsigned](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned)
+and
+[v0.16.3-dataplane-unsigned-mac-intel](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned-mac-intel))
+ship **unsigned** platform binaries and have **no** `SHA256SUMS.asc`. Verify those
+tags with `SHA256SUMS` only (and read `UNSIGNED.md` when it is in the asset set).
+Do not claim Apple Developer ID, notarization, Authenticode, or GPG until a
+signed Release is published.
 
 This document is the threat model for a self-hosted Thirp Runtime deployment. It is not an external assessment and does not claim that the software is qualified for hostile public SaaS.
 

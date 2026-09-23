@@ -11,7 +11,23 @@ EXAMPLES_DIR :: #directory + "../examples/production/"
 
 write_temp_config :: proc(label, contents: string) -> (path: string, ok: bool) {
 	n := sync.atomic_add(&config_temp_seq, 1)
-	path = fmt.aprintf("/tmp/thirp-config-%s-%d.conf", label, n)
+	temp_dir := os.get_env("TEMP", context.temp_allocator)
+	if len(temp_dir) == 0 {
+		temp_dir = os.get_env("TMP", context.temp_allocator)
+	}
+	if len(temp_dir) == 0 {
+		temp_dir = os.get_env("TMPDIR", context.temp_allocator)
+	}
+	when ODIN_OS == .Windows {
+		if len(temp_dir) == 0 {
+			temp_dir = "C:\\Windows\\Temp"
+		}
+	} else {
+		if len(temp_dir) == 0 {
+			temp_dir = "/tmp"
+		}
+	}
+	path = fmt.aprintf("%s%cthirp-config-%s-%d.conf", temp_dir, os.Path_Separator, label, n)
 	err := os.write_entire_file(path, transmute([]u8)contents)
 	if err != nil {
 		delete(path)

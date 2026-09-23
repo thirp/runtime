@@ -53,11 +53,27 @@ INGRESS_TEST_KEY :: string(#load("testdata/ingress.key"))
 ORIGIN_TEST_CERT :: string(#load("testdata/origin.crt"))
 ORIGIN_TEST_KEY :: string(#load("testdata/origin.key"))
 
-tls_temp_seq: int
+ingress_tls_temp_seq: int
 
 write_temp_pem :: proc(label, contents: string) -> (path: string, ok: bool) {
-	n := sync.atomic_add(&tls_temp_seq, 1)
-	path = fmt.aprintf("/tmp/thirp-ingress-%s-%d.pem", label, n)
+	n := sync.atomic_add(&ingress_tls_temp_seq, 1)
+	temp_dir := os.get_env("TEMP", context.temp_allocator)
+	if len(temp_dir) == 0 {
+		temp_dir = os.get_env("TMP", context.temp_allocator)
+	}
+	if len(temp_dir) == 0 {
+		temp_dir = os.get_env("TMPDIR", context.temp_allocator)
+	}
+	when ODIN_OS == .Windows {
+		if len(temp_dir) == 0 {
+			temp_dir = "C:\\Windows\\Temp"
+		}
+	} else {
+		if len(temp_dir) == 0 {
+			temp_dir = "/tmp"
+		}
+	}
+	path = fmt.aprintf("%s%cthirp-ingress-%s-%d.pem", temp_dir, os.Path_Separator, label, n)
 	err := os.write_entire_file(path, transmute([]u8)contents)
 	if err != nil {
 		delete(path)

@@ -510,6 +510,56 @@ test_relay_duplicate_open_ok_protocol_error :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_relay_caller_close_is_delivered_to_agent :: proc(t: ^testing.T) {
+	reg: Registry
+	store: auth.StaticTokenAuth
+	server: Server
+	quiet_test_server(t, &server, &reg, &store)
+	defer stop_test_server(&server, &store, &reg)
+
+	agent, agent_dec := register_test_agent(t, &server)
+	defer trans.connection_destroy(agent)
+	defer proto.decoder_destroy(&agent_dec)
+
+	caller := dial_server(t, &server)
+	defer trans.connection_destroy(caller)
+	caller_dec: proto.FrameDecoder
+	handshake_caller(t, caller, &caller_dec)
+	defer proto.decoder_destroy(&caller_dec)
+
+	sid := open_test_stream(t, agent, &agent_dec, caller, &caller_dec)
+	// Queue DATA then CLOSE without the agent reading first so the writer
+	// is busy. drop_stream_queues after enqueue used to delete the CLOSE.
+	payload := []u8{'x', 'y', 'z'}
+	must_write_stream(t, caller, .Data, payload, sid)
+	must_write_stream(t, caller, .Close, nil, sid)
+
+	got_close := false
+	start := time.now()
+	for time.since(start) < 2 * time.Second {
+		_ = trans.connection_set_recv_timeout(agent, 100 * time.Millisecond)
+		frame, terr, perr := trans.read_frame(agent, &agent_dec)
+		if terr == .Timeout {
+			continue
+		}
+		testing.expect_value(t, terr, trans.TransportError.None)
+		testing.expect_value(t, perr, proto.ProtocolError.None)
+		opcode := frame.header.opcode
+		got_sid := frame.header.stream_id
+		proto.frame_destroy(&frame)
+		if opcode == .Data {
+			continue
+		}
+		testing.expect_value(t, opcode, proto.Opcode.Close)
+		testing.expect_value(t, got_sid, sid)
+		got_close = true
+		break
+	}
+	testing.expect(t, got_close)
+	testing.expect_value(t, metrics_snapshot(&server).active_relay_streams, 0)
+}
+
+@(test)
 test_relay_close_unknown_stream_reset_not_found :: proc(t: ^testing.T) {
 	reg: Registry
 	store: auth.StaticTokenAuth

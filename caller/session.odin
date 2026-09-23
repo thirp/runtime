@@ -457,7 +457,9 @@ caller_handle_data :: proc(c: ^Caller, frame: proto.Frame) {
 	stream, found := c.streams[frame.header.stream_id]
 	sync.mutex_unlock(&c.mutex)
 	if !found || stream == nil {
-		_ = caller_write_failure(c.conn, .Reset, .StreamNotFound, frame.header.stream_id)
+		// Finished or never bound. Do not RESET StreamNotFound —
+		// the broker answers the same code and the pair hot-loops
+		// for the rest of the caller session (field: ~383k/s idle).
 		return
 	}
 	conn_push_inbound(stream, frame.payload)
@@ -468,7 +470,6 @@ caller_handle_half_close :: proc(c: ^Caller, stream_id: proto.StreamId) {
 	stream, found := c.streams[stream_id]
 	sync.mutex_unlock(&c.mutex)
 	if !found || stream == nil {
-		_ = caller_write_failure(c.conn, .Reset, .StreamNotFound, stream_id)
 		return
 	}
 	conn_set_eof(stream)
@@ -483,9 +484,10 @@ caller_handle_close :: proc(c: ^Caller, stream_id: proto.StreamId, kind: ConnErr
 	sync.mutex_unlock(&c.mutex)
 	if found && stream != nil {
 		conn_finish(stream, kind)
-	} else {
-		_ = caller_write_failure(c.conn, .Reset, .StreamNotFound, stream_id)
 	}
+	// Incoming RESET/CLOSE for a stream this session already dropped
+	// (conn_close removes the map entry before the broker's reply)
+	// must not echo StreamNotFound.
 }
 
 caller_fail_all :: proc(c: ^Caller, err: CallerError) {

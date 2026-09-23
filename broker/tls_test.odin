@@ -18,7 +18,23 @@ broker_tls_temp_seq: int
 
 broker_write_temp_pem :: proc(label, contents: string) -> (path: string, ok: bool) {
 	n := sync.atomic_add(&broker_tls_temp_seq, 1)
-	path = fmt.aprintf("/tmp/thirp-broker-tls-%s-%d.pem", label, n)
+	temp_dir := os.get_env("TEMP", context.temp_allocator)
+	if len(temp_dir) == 0 {
+		temp_dir = os.get_env("TMP", context.temp_allocator)
+	}
+	if len(temp_dir) == 0 {
+		temp_dir = os.get_env("TMPDIR", context.temp_allocator)
+	}
+	when ODIN_OS == .Windows {
+		if len(temp_dir) == 0 {
+			temp_dir = "C:\\Windows\\Temp"
+		}
+	} else {
+		if len(temp_dir) == 0 {
+			temp_dir = "/tmp"
+		}
+	}
+	path = fmt.aprintf("%s%cthirp-broker-tls-%s-%d.pem", temp_dir, os.Path_Separator, label, n)
 	err := os.write_entire_file(path, transmute([]u8)contents)
 	if err != nil {
 		delete(path)
