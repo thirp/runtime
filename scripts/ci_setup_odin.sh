@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Install or verify Odin for CI (Linux/macOS). Honors ODIN_TAG (default
-# dev-2026-09) and optional ODIN_RELEASE_URL.
+# dev-2026-07, matching docs/DEPENDENCIES.md) and optional ODIN_RELEASE_URL.
 set -euo pipefail
 
-ODIN_TAG="${ODIN_TAG:-dev-2026-09}"
-MIN_ODIN_MONTH="${MIN_ODIN_MONTH:-2026-09}"
+ODIN_TAG="${ODIN_TAG:-dev-2026-07}"
+MIN_ODIN_MONTH="${MIN_ODIN_MONTH:-2026-07}"
 INSTALL_DIR="${ODIN_INSTALL_DIR:-${HOME}/.local/odin}"
 
 odin_month_ok() {

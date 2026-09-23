@@ -1,9 +1,9 @@
 # Install or verify Odin for Windows CI. Honors ODIN_TAG (default
-# dev-2026-09) and optional ODIN_RELEASE_URL.
+# dev-2026-07, matching docs/DEPENDENCIES.md) and optional ODIN_RELEASE_URL.
 $ErrorActionPreference = "Stop"
 
-$OdinTag = if ($env:ODIN_TAG) { $env:ODIN_TAG } else { "dev-2026-09" }
-$MinMonth = "2026-09"
+$OdinTag = if ($env:ODIN_TAG) { $env:ODIN_TAG } else { "dev-2026-07" }
+$MinMonth = "2026-07"
 $InstallDir = if ($env:ODIN_INSTALL_DIR) { $env:ODIN_INSTALL_DIR } else {
 	Join-Path $env:USERPROFILE ".local\odin"
 }

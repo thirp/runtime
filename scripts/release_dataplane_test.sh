@@ -135,8 +135,14 @@ fi
 if ! grep -q 'set "LIB=%OPENSSL_LIBPATH%;%LIB%"' "${ROOT}/scripts/build_windows.bat"; then
 	fail_msg "build_windows.bat does not prepend OPENSSL_LIBPATH to LIB"
 fi
-if ! grep -q '_odin_entry_point' "${ROOT}/transport/entry_darwin.odin"; then
-	fail_msg "transport/entry_darwin.odin missing _odin_entry_point"
+if [[ -f "${ROOT}/transport/entry_darwin.odin" ]]; then
+	fail_msg "transport/entry_darwin.odin is a 2026-09-only stub; CI is pinned to 2026-07"
+fi
+if ! grep -q 'ODIN_TAG="${ODIN_TAG:-dev-2026-07}"' "${ROOT}/scripts/ci_setup_odin.sh"; then
+	fail_msg "ci_setup_odin.sh default tag is not dev-2026-07"
+fi
+if ! grep -q '"dev-2026-07"' "${ROOT}/scripts/ci_setup_odin.ps1"; then
+	fail_msg "ci_setup_odin.ps1 default tag is not dev-2026-07"
 fi
 if ! grep -q 'odin-macos-${ODIN_ARCH}-${ODIN_TAG}.tar.gz' "${ROOT}/scripts/ci_setup_odin.sh"; then
 	fail_msg "ci_setup_odin.sh missing macos tar.gz candidate"
