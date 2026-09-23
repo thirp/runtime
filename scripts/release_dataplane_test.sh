@@ -129,6 +129,9 @@ fi
 if ! grep -q 'system:libssl.lib' "${ROOT}/transport/openssl.odin"; then
 	fail_msg "openssl.odin Windows import missing system:libssl.lib"
 fi
+if ! grep -q 'system:crypt32.lib' "${ROOT}/transport/tls_verify_windows.odin"; then
+	fail_msg "tls_verify_windows.odin missing local crypt32 FFI for Odin 2026-07"
+fi
 if ! grep -q 'OPENSSL_LIBPATH' "${ROOT}/scripts/build_windows.bat"; then
 	fail_msg "build_windows.bat does not locate OPENSSL_LIBPATH"
 fi
