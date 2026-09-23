@@ -135,6 +135,12 @@ fi
 if ! grep -q 'set "LIB=%OPENSSL_LIBPATH%;%LIB%"' "${ROOT}/scripts/build_windows.bat"; then
 	fail_msg "build_windows.bat does not prepend OPENSSL_LIBPATH to LIB"
 fi
+if grep -q 'use all or dataplane)' "${ROOT}/scripts/build_windows.bat"; then
+	fail_msg "build_windows.bat unknown-mode echo still has cmd.exe-breaking parentheses"
+fi
+if ! grep -q 'vswhere' "${ROOT}/.github/workflows/dataplane-release.yml"; then
+	fail_msg "workflow does not locate MSVC via vswhere"
+fi
 if [[ -f "${ROOT}/transport/entry_darwin.odin" ]]; then
 	fail_msg "transport/entry_darwin.odin is a 2026-09-only stub; CI is pinned to 2026-07"
 fi

@@ -10,7 +10,7 @@ set ROOT=%CD%
 set MODE=all
 if /i "%~1"=="dataplane" set MODE=dataplane
 if not "%~1"=="" if /i not "%~1"=="dataplane" (
-    echo build_windows: unknown mode: %~1 (use all or dataplane) >&2
+    echo build_windows: unknown mode: %~1 - use all or dataplane >&2
     exit /b 1
 )
 

@@ -152,16 +152,23 @@ jobs:
           if ($env:WINDOWS_CERT_PASSWORD) {
             Add-Content -Path $env:GITHUB_ENV -Value "THIRP_WINDOWS_PFX_PASSWORD=$($env:WINDOWS_CERT_PASSWORD)"
           }
+      - name: Locate MSVC vcvars
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { throw "vswhere.exe missing" }
+          $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsPath) { throw "No VS install with VC Tools found" }
+          $vcvars = Join-Path $vsPath "VC\Auxiliary\Build\vcvars64.bat"
+          if (-not (Test-Path $vcvars)) { throw "vcvars64.bat missing at $vcvars" }
+          Write-Host "Using vcvars: $vcvars"
+          Add-Content -Path $env:GITHUB_ENV -Value "VCVARS64=$vcvars"
       - name: Build data-plane release tree
         shell: cmd
         run: |
-          if exist "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" (
-            call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-          ) else if exist "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" (
-            call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
-          ) else (
-            call "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
-          )
+          cd /d "%GITHUB_WORKSPACE%"
+          call "%VCVARS64%"
+          if errorlevel 1 exit /b 1
           powershell -NoProfile -ExecutionPolicy Bypass -File scripts\release_windows.ps1
       - uses: actions/upload-artifact@v4
         with:
