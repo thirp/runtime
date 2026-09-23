@@ -132,6 +132,12 @@ fi
 if ! grep -q 'system:crypt32.lib' "${ROOT}/transport/tls_verify_windows.odin"; then
 	fail_msg "tls_verify_windows.odin missing local crypt32 FFI for Odin 2026-07"
 fi
+if grep -E '\$existing = & gpg --list-secret-keys' "${ROOT}/scripts/release_windows.ps1"; then
+	fail_msg "release_windows.ps1 GPG probe uses native stderr under ErrorAction Stop"
+fi
+if ! grep -q 'cmd /c "gpg --list-secret-keys' "${ROOT}/scripts/release_windows.ps1"; then
+	fail_msg "release_windows.ps1 GPG probe must go through cmd /c so first-run stderr is not fatal"
+fi
 if ! grep -q 'OPENSSL_LIBPATH' "${ROOT}/scripts/build_windows.bat"; then
 	fail_msg "build_windows.bat does not locate OPENSSL_LIBPATH"
 fi

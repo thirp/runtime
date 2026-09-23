@@ -1,6 +1,6 @@
 name: thirp-runtime
 version: 0.16.3
-private_source_commit: aedbb179e1e1f1777641659be29386977ad3c59b
-source_ref: source-aedbb179e1e1f1777641659be29386977ad3c59b
+private_source_commit: 48c05a2b4c77ed793471296488f8d3504dceaf05
+source_ref: source-48c05a2b4c77ed793471296488f8d3504dceaf05
 public_destination: git@github.com:thirp/runtime.git
 public_branch: main

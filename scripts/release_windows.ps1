@@ -161,8 +161,10 @@ $GpgKey = $env:THIRP_GPG_KEY
 $PublishFp = "3B8559D8754FB3C5B21110C786897A405CF3D8C4"
 $Gpg = Get-Command gpg -ErrorAction SilentlyContinue
 if (-not $GpgKey -and $Gpg) {
-	$existing = & gpg --list-secret-keys --with-colons $PublishFp 2>$null
-	if ($LASTEXITCODE -eq 0 -and $existing) {
+	# gpg writes "directory ... created" on stderr the first time. $ErrorActionPreference
+	# Stop treats that as fatal even with 2>$null (Windows PowerShell 5.1).
+	cmd /c "gpg --list-secret-keys --with-colons $PublishFp >nul 2>nul"
+	if ($LASTEXITCODE -eq 0) {
 		$GpgKey = $PublishFp
 	}
 }
