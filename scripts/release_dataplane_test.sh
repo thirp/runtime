@@ -100,6 +100,9 @@ fi
 if ! grep -q 'thirp-runtime-macos-${{ matrix.arch }}' "${ROOT}/.github/workflows/dataplane-release.yml"; then
 	fail_msg "workflow macos artifact name is not arch-specific"
 fi
+if grep -q 'if: \${{ secrets\.' "${ROOT}/.github/workflows/dataplane-release.yml"; then
+	fail_msg "workflow uses secrets in if: (GitHub rejects Unrecognized named-value: secrets)"
+fi
 if ! grep -q 'windows-latest' "${ROOT}/.github/workflows/dataplane-release.yml"; then
 	fail_msg "workflow missing windows-latest"
 fi

@@ -66,11 +66,14 @@ jobs:
       - name: Install Odin
         run: bash scripts/ci_setup_odin.sh
       - name: Import Apple Developer ID
-        if: ${{ secrets.THIRP_MACOS_CERT_P12 != '' }}
         env:
           THIRP_MACOS_CERT_P12: ${{ secrets.THIRP_MACOS_CERT_P12 }}
           THIRP_MACOS_CERT_PASSWORD: ${{ secrets.THIRP_MACOS_CERT_PASSWORD }}
         run: |
+          if [ -z "${THIRP_MACOS_CERT_P12:-}" ]; then
+            echo "No THIRP_MACOS_CERT_P12; skipping codesign import (unsigned OK)"
+            exit 0
+          fi
           printf '%s' "$THIRP_MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/developer-id.p12"
           KEYCHAIN="$RUNNER_TEMP/thirp.keychain-db"
           security create-keychain -p "" "$KEYCHAIN"
@@ -86,11 +89,14 @@ jobs:
           THIRP_GPG_KEY: ${{ secrets.THIRP_GPG_KEY }}
         run: bash scripts/release_macos.sh
       - name: Import GPG and re-sign if the private key is present
-        if: ${{ secrets.THIRP_GPG_PRIVATE_KEY != '' }}
         env:
           THIRP_GPG_PRIVATE_KEY: ${{ secrets.THIRP_GPG_PRIVATE_KEY }}
           THIRP_GPG_PASSPHRASE: ${{ secrets.THIRP_GPG_PASSPHRASE }}
         run: |
+          if [ -z "${THIRP_GPG_PRIVATE_KEY:-}" ]; then
+            echo "No THIRP_GPG_PRIVATE_KEY; skipping GPG sign (unsigned OK)"
+            exit 0
+          fi
           printf '%s\n' "$THIRP_GPG_PRIVATE_KEY" | gpg --batch --import
           VERSION="$(tr -d '[:space:]' < VERSION.txt)"
           ARCH="$(uname -m)"
@@ -130,12 +136,15 @@ jobs:
         shell: pwsh
         run: .\scripts\ci_setup_odin.ps1
       - name: Import Authenticode certificate
-        if: ${{ secrets.WINDOWS_CERT_PFX != '' }}
         env:
           WINDOWS_CERT_PFX: ${{ secrets.WINDOWS_CERT_PFX }}
           WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
         shell: pwsh
         run: |
+          if ([string]::IsNullOrEmpty($env:WINDOWS_CERT_PFX)) {
+            Write-Host "No WINDOWS_CERT_PFX; skipping Authenticode import (unsigned OK)"
+            exit 0
+          }
           $bytes = [Convert]::FromBase64String($env:WINDOWS_CERT_PFX)
           $path = Join-Path $env:RUNNER_TEMP "authenticode.pfx"
           [IO.File]::WriteAllBytes($path, $bytes)
