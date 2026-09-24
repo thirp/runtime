@@ -313,11 +313,13 @@ checksums are still usable.
    The `check`, `linux-lib`, `macos` (arm64 and x86_64), and `windows` jobs
    build on hosted runners. Native jobs upload `libthirp.so`,
    `thirp-runtime-macos-arm64-*.tar.gz`, `thirp-runtime-macos-x86_64-*.tar.gz`,
-   and `dist/thirp-runtime-windows-*`.
+   and `thirp-runtime-windows-*.zip`. The unpacked Windows directory stays off
+   the artifact. It shares names with the Linux operator release.
 4. The workflow `publish` job downloads those artifacts, runs
-   `scripts/assemble_sdk.sh`, and attaches the SDK tarball plus the data-plane
-   archives to the same GitHub Release. That job produces the final multi-OS
-   asset list. The dry-run does not upload those files.
+   `scripts/assemble_sdk.sh`, and attaches four archives to the same GitHub
+   Release: the SDK tarball, both macOS tarballs, and the Windows zip. It does
+   not upload loose files from those trees and it does not replace operator
+   assets. The dry-run does not upload those files.
 5. If `dist/thirp-runtime-macos-<arch>-<VERSION>.tar.gz` or
    `dist/thirp-runtime-windows-<arch>-<VERSION>.zip` already exist locally,
    `scripts/publish_github.sh --release` attaches those archives too.

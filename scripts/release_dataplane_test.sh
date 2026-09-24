@@ -127,6 +127,15 @@ fi
 if ! grep -q 'release_windows.ps1' "${ROOT}/.github/workflows/dataplane-release.yml"; then
 	fail_msg "workflow does not invoke release_windows.ps1"
 fi
+if ! grep -q 'thirp-runtime-windows-\*\.zip' "${ROOT}/.github/workflows/dataplane-release.yml"; then
+	fail_msg "workflow windows artifact must be the zip only"
+fi
+if grep -q -- '--clobber' "${ROOT}/.github/workflows/dataplane-release.yml"; then
+	fail_msg "workflow publish must not clobber operator release assets"
+fi
+if ! grep -q 'thirp-runtime-sdk-\*\.tar.gz' "${ROOT}/.github/workflows/dataplane-release.yml"; then
+	fail_msg "workflow publish must attach only the SDK tarball and platform archives"
+fi
 if ! grep -q 'assemble_sdk.sh' "${ROOT}/.github/workflows/dataplane-release.yml"; then
 	fail_msg "workflow does not assemble the multi-OS SDK"
 fi

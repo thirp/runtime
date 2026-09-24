@@ -192,8 +192,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: thirp-runtime-windows
-          path: |
-            dist/thirp-runtime-windows-*
+          path: dist/thirp-runtime-windows-*.zip
           if-no-files-found: error
 
   publish:
@@ -213,21 +212,25 @@ jobs:
           # The operator Release already attaches Linux libthirp.so. The SDK
           # tarball has its own copy. A loose .so here would clobber that asset.
           find dist/ci -type f -name 'libthirp.so' -delete
-      - name: Attach platform artifacts to the GitHub Release
+      - name: Attach platform archives to the GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${GITHUB_REF_NAME}"
-          mapfile -t files < <(find dist/ci -type f | sort)
-          if [[ "${#files[@]}" -eq 0 ]]; then
-            echo "publish: no artifacts downloaded" >&2
+          # Archives only. The Windows tree shares names with the Linux
+          # operator release (thirp.h, SHA256SUMS, LICENSE). Uploading those
+          # files replaces the operator checksums.
+          mapfile -t files < <(find dist/ci -type f \
+            \( -name 'thirp-runtime-sdk-*.tar.gz' \
+               -o -name 'thirp-runtime-macos-*.tar.gz' \
+               -o -name 'thirp-runtime-windows-*.zip' \) | sort)
+          if [[ "${#files[@]}" -ne 4 ]]; then
+            echo "publish: expected 4 archives (sdk, macos arm64, macos x86_64, windows zip), got ${#files[@]}" >&2
+            printf '%s\n' "${files[@]:-<none>}" >&2
             exit 1
           fi
-          if gh release view "$TAG" --repo thirp/runtime >/dev/null 2>&1; then
-            gh release upload "$TAG" "${files[@]}" --repo thirp/runtime --clobber
-          else
-            gh release create "$TAG" "${files[@]}" \
-              --repo thirp/runtime \
-              --title "Thirp Runtime ${TAG#v}" \
-              --notes "Linux operator artifacts are attached by scripts/publish_github.sh --release. This job adds the embed SDK tarball (linux-x86_64, darwin-arm64, darwin-x86_64, windows-amd64 libthirp) plus macOS arm64, macOS x86_64 (Intel), and Windows data-plane archives. Verify SHA256SUMS; see docs/BUILDING.md and docs/SECURITY.md."
+          if ! gh release view "$TAG" --repo thirp/runtime >/dev/null 2>&1; then
+            echo "publish: release ${TAG} is missing; scripts/publish_github.sh --release creates it" >&2
+            exit 1
           fi
+          gh release upload "$TAG" "${files[@]}" --repo thirp/runtime
