@@ -66,7 +66,7 @@ agent_destroy_local :: proc(local: ^trans.Connection) {
 		return
 	}
 	// Shutdown first so the pump leaves recv; close() alone can RST and
-	// race fd reuse (docs/RACES.md).
+	// race fd reuse.
 	trans.connection_shutdown_both(local)
 	trans.connection_destroy(local)
 }

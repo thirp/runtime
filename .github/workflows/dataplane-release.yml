@@ -1,9 +1,9 @@
-# Data-plane release binaries for macOS and Windows.
+# Data-plane release binaries for macOS and Windows, plus the embed SDK
+# tarball that packs every libthirp (Linux, macOS arm64, macOS x86_64, Windows).
 # GitHub Actions YAML; Origin-compatible if the forge runs GHA workflows.
-# Native compile jobs need macos-latest (arm64), macos-15-intel (x86_64),
-# and windows-latest (or self-hosted equivalents). This repository's Linux
-# cloud agents cannot run those jobs. macos-15-intel is the last Intel
-# image GitHub hosts.
+# Native compile jobs need ubuntu-latest (libthirp.so), macos-latest (arm64),
+# macos-15-intel (x86_64), and windows-latest (or self-hosted equivalents).
+# macos-15-intel is the last Intel image GitHub hosts.
 #
 # Secrets Chuck must supply for a signed publish (all optional; unsigned
 # checksums still upload):
@@ -111,6 +111,25 @@ jobs:
             dist/thirp-runtime-macos-${{ matrix.arch }}-*.tar.gz
           if-no-files-found: error
 
+  linux-lib:
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install OpenSSL
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+      - name: Install Odin
+        run: bash scripts/ci_setup_odin.sh
+      - name: Build libthirp.so
+        run: |
+          mkdir -p dist
+          odin build c_abi -build-mode:shared -out:dist/libthirp.so
+      - uses: actions/upload-artifact@v4
+        with:
+          name: thirp-runtime-linux-lib
+          path: dist/libthirp.so
+          if-no-files-found: error
+
   windows:
     needs: check
     runs-on: windows-latest
@@ -179,7 +198,7 @@ jobs:
 
   publish:
     if: github.repository == 'thirp/runtime' && startsWith(github.ref, 'refs/tags/v')
-    needs: [macos, windows]
+    needs: [linux-lib, macos, windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -188,6 +207,12 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: dist/ci
+      - name: Assemble the multi-OS SDK tarball
+        run: |
+          bash scripts/assemble_sdk.sh dist/ci
+          # The operator Release already attaches Linux libthirp.so. The SDK
+          # tarball has its own copy. A loose .so here would clobber that asset.
+          find dist/ci -type f -name 'libthirp.so' -delete
       - name: Attach platform artifacts to the GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -204,5 +229,5 @@ jobs:
             gh release create "$TAG" "${files[@]}" \
               --repo thirp/runtime \
               --title "Thirp Runtime ${TAG#v}" \
-              --notes "Linux operator artifacts are attached by scripts/publish_github.sh --release. This job adds macOS arm64, macOS x86_64 (Intel), and Windows data-plane Agent/Caller archives and libthirp. Verify SHA256SUMS; see docs/BUILDING.md and docs/SECURITY.md."
+              --notes "Linux operator artifacts are attached by scripts/publish_github.sh --release. This job adds the embed SDK tarball (linux-x86_64, darwin-arm64, darwin-x86_64, windows-amd64 libthirp) plus macOS arm64, macOS x86_64 (Intel), and Windows data-plane archives. Verify SHA256SUMS; see docs/BUILDING.md and docs/SECURITY.md."
           fi

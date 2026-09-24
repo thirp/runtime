@@ -49,23 +49,23 @@ chmod +x thirp-broker thirp-agent thirp-connect
 When `SHA256SUMS.asc` is present, verify it using the publish-key fingerprint
 and command in [SECURITY.md](SECURITY.md#release-signing).
 
-### Other platforms (unsigned dataplane)
+### Other platforms
 
-This walkthrough uses the Linux operator binaries above. Agent/Caller/`libthirp`
-for other OSes ship as **unsigned** dataplane archives (no Apple Developer ID,
-Authenticode, or `SHA256SUMS.asc`). They are not used here. Verify with
-`SHA256SUMS` and [BUILDING.md](BUILDING.md#verify-a-downloaded-tree).
+This walkthrough uses the Linux operator binaries above. Agent, Caller, and
+`libthirp` for macOS and Windows are on the same Release,
+[v0.16.4](https://github.com/thirp/runtime/releases/tag/v0.16.4). GitHub Actions
+builds those archives and attaches them after the tag is pushed. They are not
+used in this walkthrough. Apple Developer ID and Authenticode are not claimed
+unless those certificates were present at build time. Verify with `SHA256SUMS`
+and [BUILDING.md](BUILDING.md#verify-a-downloaded-tree).
 
-Both dataplane tags keep product version `0.16.3`. They do not replace the
-Linux operator Release on
-[v0.16.3](https://github.com/thirp/runtime/releases/tag/v0.16.3).
-
-| Platform | Tag | Typical asset |
-|---|---|---|
-| Linux x86_64 dataplane | [v0.16.3-dataplane-unsigned](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned) | `thirp-runtime-linux-x86_64-0.16.3-unsigned.zip` |
-| macOS arm64 | same | `thirp-runtime-macos-arm64-0.16.3-unsigned.zip` |
-| Windows AMD64 | same | `thirp-runtime-windows-AMD64-0.16.3-unsigned.zip` |
-| macOS x86_64 (Intel) | [v0.16.3-dataplane-unsigned-mac-intel](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned-mac-intel) | `thirp-runtime-macos-x86_64-0.16.3.tar.gz` |
+| Platform | Asset on `v0.16.4` |
+|---|---|
+| Linux operator (this walkthrough) | `thirp-broker`, `thirp-agent`, `thirp-connect`, `thirp-web-ingress` |
+| Embed SDK (all four `libthirp` targets) | `thirp-runtime-sdk-0.16.4.tar.gz` |
+| macOS arm64 | `thirp-runtime-macos-arm64-0.16.4.tar.gz` |
+| macOS x86_64 (Intel) | `thirp-runtime-macos-x86_64-0.16.4.tar.gz` |
+| Windows AMD64 | `thirp-runtime-windows-AMD64-0.16.4.zip` |
 
 ### Or build from source
 

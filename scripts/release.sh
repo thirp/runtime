@@ -5,6 +5,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+# shellcheck source=release_common.sh
+source "${ROOT}/scripts/release_common.sh"
 
 if [[ ! -f VERSION.txt ]]; then
 	echo "release: VERSION.txt is missing" >&2
@@ -16,6 +18,7 @@ if [[ ! "$VERSION" =~ ^0\.[0-9]+\.[0-9]+$ ]]; then
 	echo "release: VERSION.txt must be 0.x.y, got: ${VERSION}" >&2
 	exit 1
 fi
+release_require_project_version "$VERSION"
 
 COMMIT="$(git rev-parse HEAD)"
 WORKTREE="clean"
@@ -92,6 +95,9 @@ EOF
 
 export ROOT VERSION OUT ARCH DATE
 "${ROOT}/scripts/check_sdk_api.sh"
+# Host library only. The published multi-OS SDK is scripts/assemble_sdk.sh,
+# which runs after the other libthirp binaries exist. That tarball is not
+# part of this operator SHA256SUMS.
 "${ROOT}/scripts/release_sdk.sh"
 "${ROOT}/scripts/release_broker.sh"
 
@@ -105,7 +111,6 @@ export ROOT VERSION OUT ARCH DATE
 		libthirp.so \
 		thirp.h \
 		"thirp-runtime-${VERSION}.tar.gz" \
-		"thirp-runtime-sdk-${VERSION}.tar.gz" \
 		"thirp-runtime-broker-${VERSION}.tar.gz" \
 		LICENSE \
 		NOTICE \

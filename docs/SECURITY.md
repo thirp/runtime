@@ -19,14 +19,11 @@ OS-level signatures are separate and optional:
 
 Those certificates are not in this repository. Without them, Gatekeeper and SmartScreen warn; `SHA256SUMS` still identifies the files. See [BUILDING.md](BUILDING.md#signing-blockers-certs-pending).
 
-The pre-sign multi-OS dataplane Releases
-([v0.16.3-dataplane-unsigned](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned)
-and
-[v0.16.3-dataplane-unsigned-mac-intel](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned-mac-intel))
-ship **unsigned** platform binaries and have **no** `SHA256SUMS.asc`. Verify those
-tags with `SHA256SUMS` only (and read `UNSIGNED.md` when it is in the asset set).
-Do not claim Apple Developer ID, notarization, Authenticode, or GPG until a
-signed Release is published.
+Data-plane archives on `v0.16.4` are checksummed. They include `SHA256SUMS.asc`
+only when the publish key was present at build time, and they are not Apple- or
+Authenticode-signed unless those certificates were present. Verify with
+`SHA256SUMS`. Do not claim Developer ID, notarization, or Authenticode until a
+signed build is published.
 
 This document is the threat model for a self-hosted Thirp Runtime deployment. It is not an external assessment and does not claim that the software is qualified for hostile public SaaS.
 
@@ -114,4 +111,4 @@ Broker-facing TLS reuses the existing Caller verification path. A public product
 
 Metrics and health HTTP have no TLS and no authentication; bind them to loopback or a protected network.
 
-This tree does not implement HTTP/2, a WAF, request rewriting, trusted client-IP propagation, or dynamic route revocation. There is no 24-hour soak and no external assessment. Connection churn (20 sequential), 8 concurrent GETs, backpressure isolation, Agent/Caller session loss, and ingress restart were measured in-process; counters returned to zero. That is qualification under those tests, not a capacity rating and not a claim that the software is assessed for hostile public SaaS.
+This tree does not implement HTTP/2, a WAF, request rewriting, trusted client-IP propagation, or dynamic route revocation. There is no external assessment. Web Ingress in-process tests covered connection churn (20 sequential), 8 concurrent GETs, backpressure isolation, Agent/Caller session loss, and ingress restart; counters returned to zero. Relay burst load (N=256 CLOSE, then idle) exposed RESET storms and RSS growth; those are fixed, and the regressions keep `stream_not_found` flat. See [OPERATIONS.md](OPERATIONS.md#resource-limits). The 24-hour soak has not been run. None of this is a capacity rating or a claim that the software is assessed for hostile public SaaS.

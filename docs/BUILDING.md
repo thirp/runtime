@@ -105,10 +105,12 @@ odin build c_abi -build-mode:shared -out:libthirp.so
 cc -o thirp-c-smoke c_abi/smoke.c -I c_abi -L. -lthirp -Wl,-rpath,$PWD
 ```
 
-`libthirp.so` is the Linux operator/SDK library and links the system OpenSSL 3
-libraries. The public header is `c_abi/thirp.h`. macOS and Windows shared
-libraries are produced by the data-plane release scripts. Consumer-oriented
-layout and link examples are documented in [SDK.md](SDK.md#c-abi).
+`libthirp.so` is the Linux operator library and links the system OpenSSL 3
+libraries. The public header is `c_abi/thirp.h`. The published SDK tarball
+contains this library plus the macOS and Windows shared libraries. Those are
+produced by the data-plane release scripts and packed by
+`scripts/assemble_sdk.sh`. Consumer-oriented layout and link examples are
+documented in [SDK.md](SDK.md#c-abi).
 
 ### macOS
 
@@ -150,8 +152,7 @@ odin test . -all-packages -extra-linker-flags:"-L${OPENSSL_LIB}"
 On Windows, ensure OpenSSL 3 DLLs are in PATH.
 
 A test run is not successful if it logs `+++ leak`, even when the process exits
-with status 0. Known concurrency hazards and their required invariants are
-documented in [RACES.md](RACES.md).
+with status 0.
 
 ## Build SDK examples
 
@@ -175,9 +176,9 @@ See [SDK.md](SDK.md) for lifecycle and API guidance.
 
 ## Cross-platform status
 
-- **Linux**: Full operator release artifacts including packages, SBOM, and provenance (`scripts/release.sh`). Dataplane zip also on the unsigned multi-OS tag.
-- **macOS**: Data-plane release tree (`thirp-agent`, `thirp-connect`, `libthirp.dylib`) via `scripts/release_macos.sh` on **arm64** (`macos-latest`) and **x86_64 (Intel)** (`macos-15-intel`). Published: arm64 on [v0.16.3-dataplane-unsigned](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned); Intel on [v0.16.3-dataplane-unsigned-mac-intel](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned-mac-intel).
-- **Windows**: Data-plane release tree (`thirp-agent.exe`, `thirp-connect.exe`, `libthirp.dll`) via `scripts/release_windows.ps1` (AMD64).
+- **Linux**: Operator release from `scripts/release.sh` (`thirp-broker`, `thirp-agent`, `thirp-connect`, `thirp-web-ingress`, `libthirp.so`, SDK and Broker tarballs, source, SBOM, provenance). Attached to `v<VERSION>` by `scripts/publish_github.sh --release`.
+- **macOS**: Data-plane release tree (`thirp-agent`, `thirp-connect`, `libthirp.dylib`) via `scripts/release_macos.sh` on **arm64** (`macos-latest`) and **x86_64 (Intel)** (`macos-15-intel`). The workflow attaches both archives to the same `v<VERSION>` Release.
+- **Windows**: Data-plane release tree (`thirp-agent.exe`, `thirp-connect.exe`, `libthirp.dll`) via `scripts/release_windows.ps1` (AMD64), attached to that same Release.
 
 macOS and Windows agents and callers connect outbound to a Linux broker over TLS.
 Broker / Web Ingress / full operator stacks remain Linux-primary in published
@@ -209,7 +210,7 @@ It contains:
 - `thirp-broker`, `thirp-agent`, `thirp-connect`, and `thirp-web-ingress`
 - `libthirp.so` and `thirp.h`
 - the public source archive
-- Agent/Caller SDK and Broker Odin collection tarballs
+- a host SDK tarball (the `libthirp` this machine just built) and the Broker Odin collection tarball. The host SDK is what `scripts/verify_sdk.sh` links. It is not listed in `SHA256SUMS` and it is not the published SDK. The published SDK is `scripts/assemble_sdk.sh`, which packs linux-x86_64, darwin-arm64, darwin-x86_64, and windows-amd64.
 - the SPDX SBOM
 - `LICENSE`, `NOTICE`, changelog, dependency inventory, and provenance
 - Web Ingress deployment examples
@@ -252,16 +253,12 @@ The directory contains `thirp-agent`, `thirp-connect`, `libthirp.dylib`,
 and `SHA256SUMS`. `SHA256SUMS.asc` is added when the Thirp publish key is in the
 agent (`THIRP_GPG_KEY`, same fingerprint as Linux). CI uploads
 `thirp-runtime-macos-arm64-<VERSION>.tar.gz` and
-`thirp-runtime-macos-x86_64-<VERSION>.tar.gz`. Published pre-sign archives:
-`thirp-runtime-macos-arm64-0.16.3-unsigned.zip` on
-[v0.16.3-dataplane-unsigned](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned);
-`thirp-runtime-macos-x86_64-0.16.3.tar.gz` on
-[v0.16.3-dataplane-unsigned-mac-intel](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned-mac-intel).
+`thirp-runtime-macos-x86_64-<VERSION>.tar.gz` onto the `v<VERSION>` Release.
 
 Apple Developer ID signing is optional and skipped unless
 `THIRP_MACOS_CODESIGN_IDENTITY` is set. Notarization is skipped unless
-`THIRP_MACOS_NOTARY_PROFILE` names a `notarytool` keychain profile. The current
-public dataplane tag ships **unsigned** binaries.
+`THIRP_MACOS_NOTARY_PROFILE` names a `notarytool` keychain profile. Without
+those secrets the archives are checksummed and not OS-signed.
 
 ### Windows
 
@@ -305,35 +302,33 @@ checksums are still usable.
 
 ### How artifacts are published
 
-1. Push or tag on GitHub runs `.github/workflows/dataplane-release.yml`.
-2. The `check`, `macos` (arm64 + x86_64 matrix), and `windows` jobs run on
-   hosted runners; native jobs upload `thirp-runtime-macos-arm64-*.tar.gz`,
-   `thirp-runtime-macos-x86_64-*.tar.gz`, and `dist/thirp-runtime-windows-*`
-   as Actions artifacts.
-3. Pre-sign multi-OS dataplane drops (both **unsigned**):
-   [v0.16.3-dataplane-unsigned](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned)
-   publishes macOS **arm64**, Windows **AMD64**, and Linux **x86_64** dataplane
-   zips plus `SHA256SUMS` and `UNSIGNED.md`.
-   [v0.16.3-dataplane-unsigned-mac-intel](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned-mac-intel)
-   adds the macOS **x86_64 (Intel)** tarball without bumping `VERSION.txt` or
-   replacing `v0.16.3`.
-4. On a `v*` tag of `thirp/runtime` (operator or dataplane-suffix), the
-   `publish` job can attach dataplane archives to the GitHub Release (creates
-   the release if `scripts/publish_github.sh --release` has not already).
-5. The private publisher `scripts/publish_github.sh --release` still attaches
-   the Linux operator tree (and requires `SHA256SUMS.asc` when signing). If
-   `dist/thirp-runtime-macos-<arch>-<VERSION>.tar.gz` or
-   `dist/thirp-runtime-windows-<arch>-<VERSION>.zip` exist, those archives
-   are attached too.
+1. `scripts/publish_github.sh` is a dry-run until `--push`. It stages the
+   public tree, scans it, and writes `PUBLISH_MANIFEST.txt` plus
+   `RELEASE_NOTES.md` under `dist/publish-github/`.
+2. `--push --release` (with `--qualified`) fast-forwards `thirp/runtime` and
+   attaches the Linux operator tree from `dist/thirp-runtime-<VERSION>/`,
+   including `thirp-web-ingress` and the Broker collection. `--release`
+   requires `SHA256SUMS.asc`. It does not attach the embed SDK tarball.
+3. The tag push `v<VERSION>` runs `.github/workflows/dataplane-release.yml`.
+   The `check`, `linux-lib`, `macos` (arm64 and x86_64), and `windows` jobs
+   build on hosted runners. Native jobs upload `libthirp.so`,
+   `thirp-runtime-macos-arm64-*.tar.gz`, `thirp-runtime-macos-x86_64-*.tar.gz`,
+   and `dist/thirp-runtime-windows-*`.
+4. The workflow `publish` job downloads those artifacts, runs
+   `scripts/assemble_sdk.sh`, and attaches the SDK tarball plus the data-plane
+   archives to the same GitHub Release. That job produces the final multi-OS
+   asset list. The dry-run does not upload those files.
+5. If `dist/thirp-runtime-macos-<arch>-<VERSION>.tar.gz` or
+   `dist/thirp-runtime-windows-<arch>-<VERSION>.zip` already exist locally,
+   `scripts/publish_github.sh --release` attaches those archives too.
 
 `scripts/release_dataplane_test.sh` checks script syntax, allowlists, workflow
 wiring, and fixture trees. It does not compile `.dylib` / `.dll`.
 
 ### Signing blockers (certs pending)
 
-Unsigned dataplane CI and the pre-sign Release are live. These are the remaining
-hard blockers Chuck must supply for a **signed** multi-OS Release; the
-scripts skip signing when they are absent:
+Data-plane CI uploads checksummed archives without OS-level signatures until
+these secrets are set. The scripts skip signing when they are absent:
 
 | Blocker | Env / secret | Effect if missing |
 |---|---|---|
@@ -353,7 +348,8 @@ One project version produces two developer-facing Odin artifacts in addition
 to the operator binaries:
 
 - `thirp-runtime-sdk-<VERSION>.tar.gz` contains Agent and Caller source
-  packages, their compile closure, the Linux C ABI, and SDK examples.
+  packages, their compile closure, `libthirp` for linux-x86_64, darwin-arm64,
+  darwin-x86_64, and windows-amd64, and SDK examples.
 - `thirp-runtime-broker-<VERSION>.tar.gz` contains the Broker-capable Odin
   collection, including authentication and authorization packages.
 

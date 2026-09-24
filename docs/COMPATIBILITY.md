@@ -20,7 +20,7 @@ Any agent or caller that speaks protocol 1.0 can talk to a protocol 1.0 broker. 
 Do not infer protocol compatibility from the executable version. `--version` always prints both, for example:
 
 ```text
-thirp-broker 0.16.3 (commit <sha>, protocol 1.0)
+thirp-broker 0.16.4 (commit <sha>, protocol 1.0)
 ```
 
 A single-broker restart interrupts active sessions. Drain rejects new `REGISTER` / `CONNECT`, lets existing streams finish within `shutdown_grace`, then exits. Agents reconnect and re-register the desired set. `thirp-connect` reconnects the broker session; lost local sockets still close. See [OPERATIONS.md](OPERATIONS.md).
@@ -34,7 +34,7 @@ A single-broker restart interrupts active sessions. Drain rejects new `REGISTER`
 - After 0.16.0, existing function signatures and numeric error codes do not change silently.
 - Project `0.x` may add functions. Removals or signature changes require a [CHANGELOG.md](CHANGELOG.md) entry.
 - Handles are opaque. Do not depend on Odin struct layout, allocators, or `context`.
-- Linux operator and SDK artifacts publish `libthirp.so`. macOS and Windows data-plane release trees publish `libthirp.dylib` and `libthirp.dll`. Each library links system OpenSSL (`libssl` / `libcrypto`), same as [DEPENDENCIES.md](DEPENDENCIES.md).
+- The published SDK tarball contains `libthirp.so`, both `libthirp.dylib` builds, and `libthirp.dll` under `c/lib/<target>/`. Data-plane release trees also carry the shared library next to the Agent and Caller CLIs. Each library links system OpenSSL (`libssl` / `libcrypto`), same as [DEPENDENCIES.md](DEPENDENCIES.md).
 - `THIRP_VERSION_STRING` is the project version, not the protocol version. Identify a built `.so` with `SHA256SUMS` and `PROVENANCE.txt`.
 - `thirp_conn_read` / `thirp_conn_write` block. Language bindings that cannot block the main thread must call them from a worker thread.
 
@@ -57,7 +57,7 @@ import thirp_caller "thirp:caller"
 
 ## Artifact and target matrix
 
-This release publishes Linux operator binaries, `libthirp.so`, the Agent/Caller SDK tarball, and the Broker Odin collection tarball. Multi-OS **dataplane** trees publish `thirp-agent`, `thirp-connect`, and `libthirp.dylib` / `libthirp.dll` for **macOS arm64**, **macOS x86_64 (Intel)**, **Windows AMD64**, and **Linux x86_64** (see [BUILDING.md](BUILDING.md#macos-and-windows-data-plane-release)). Download: [v0.16.3](https://github.com/thirp/runtime/releases/tag/v0.16.3) (Linux operator); [v0.16.3-dataplane-unsigned](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned) (macOS arm64, Windows AMD64, Linux dataplane); [v0.16.3-dataplane-unsigned-mac-intel](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned-mac-intel) (macOS Intel). The embed SDK tarball still ships the Linux C ABI only — distinguish that from dataplane trees, which include macOS/Windows shared libraries. Broker / Web Ingress / full operator stacks remain Linux-primary. No static `libthirp.a`. OpenSSL 3 (`libssl` / `libcrypto`) is required at runtime for TLS.
+`v0.16.4` publishes Linux operator binaries (`thirp-broker`, `thirp-agent`, `thirp-connect`, `thirp-web-ingress`), `libthirp.so`, and the Broker Odin collection tarball. The same Release carries one embed SDK tarball with `libthirp` for **linux-x86_64**, **darwin-arm64**, **darwin-x86_64**, and **windows-amd64**, plus data-plane archives with `thirp-agent`, `thirp-connect`, and the shared library for **macOS arm64**, **macOS x86_64 (Intel)**, and **Windows AMD64** (see [BUILDING.md](BUILDING.md#macos-and-windows-data-plane-release)). GitHub Actions builds those libraries and packs the SDK; the publisher dry-run does not. Broker and Web Ingress remain Linux-primary. No static `libthirp.a`. OpenSSL 3 (`libssl` / `libcrypto`) is required at runtime for TLS. CI pins the Odin compiler to `dev-2026-07`.
 
 The embed SDK (`thirp-runtime-sdk-<VERSION>.tar.gz`) does not include Broker or `auth`. The Broker collection (`thirp-runtime-broker-<VERSION>.tar.gz`) adds those Odin packages and does not include the C ABI. There is no third foundation tarball. Sibling checkout is still the repository root.
 

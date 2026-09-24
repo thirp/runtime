@@ -36,7 +36,8 @@ done
 for f in scripts/release_common.sh scripts/release_macos.sh \
 	scripts/verify_dataplane_release.sh scripts/build_macos.sh \
 	scripts/ci_setup_odin.sh scripts/release_dataplane_test.sh \
-	scripts/release.sh scripts/stage_public_tree.sh
+	scripts/release.sh scripts/release_sdk.sh scripts/assemble_sdk.sh \
+	scripts/stage_public_tree.sh
 do
 	if ! bash -n "$f"; then
 		fail_msg "bash -n failed: $f"
@@ -45,6 +46,8 @@ done
 
 # shellcheck source=release_common.sh
 source "${ROOT}/scripts/release_common.sh"
+VERSION="$(tr -d '[:space:]' < "${ROOT}/VERSION.txt")"
+release_require_project_version "$VERSION"
 FP="$THIRP_PUBLISH_GPG_FINGERPRINT"
 if [[ "$FP" != "3B8559D8754FB3C5B21110C786897A405CF3D8C4" ]]; then
 	fail_msg "release_common.sh fingerprint drifted"
@@ -81,6 +84,7 @@ for needle in \
 	scripts/build_windows.bat \
 	scripts/ci_setup_odin.sh \
 	scripts/ci_setup_odin.ps1 \
+	scripts/assemble_sdk.sh \
 	scripts/release_dataplane_test.sh
 do
 	if ! grep -q "$needle" "${ROOT}/scripts/stage_public_tree.sh"; then
@@ -122,6 +126,12 @@ if ! grep -q 'release_macos.sh' "${ROOT}/.github/workflows/dataplane-release.yml
 fi
 if ! grep -q 'release_windows.ps1' "${ROOT}/.github/workflows/dataplane-release.yml"; then
 	fail_msg "workflow does not invoke release_windows.ps1"
+fi
+if ! grep -q 'assemble_sdk.sh' "${ROOT}/.github/workflows/dataplane-release.yml"; then
+	fail_msg "workflow does not assemble the multi-OS SDK"
+fi
+if ! grep -q 'odin build c_abi -build-mode:shared -out:dist/libthirp.so' "${ROOT}/.github/workflows/dataplane-release.yml"; then
+	fail_msg "workflow does not build Linux libthirp.so for the SDK"
 fi
 if ! grep -q 'C:\\Program Files\\OpenSSL"' "${ROOT}/.github/workflows/dataplane-release.yml"; then
 	fail_msg "workflow does not search C:\\Program Files\\OpenSSL"
@@ -177,12 +187,20 @@ fi
 if ! grep -q 'macos-15-intel' "${ROOT}/docs/BUILDING.md"; then
 	fail_msg "BUILDING.md missing macos-15-intel"
 fi
-if ! grep -q 'v0.16.3-dataplane-unsigned-mac-intel' "${ROOT}/docs/QUICKSTART.md"; then
-	fail_msg "QUICKSTART.md missing v0.16.3-dataplane-unsigned-mac-intel"
+if ! grep -q 'v0.16.4' "${ROOT}/docs/QUICKSTART.md"; then
+	fail_msg "QUICKSTART.md missing v0.16.4"
 fi
-if ! grep -q 'v0.16.3-dataplane-unsigned-mac-intel' "${ROOT}/README.md"; then
-	fail_msg "README.md missing v0.16.3-dataplane-unsigned-mac-intel"
+if ! grep -q 'v0.16.4' "${ROOT}/README.md"; then
+	fail_msg "README.md missing v0.16.4"
 fi
+if ! grep -q 'dev-2026-07' "${ROOT}/docs/CHANGELOG.md"; then
+	fail_msg "CHANGELOG.md missing the dev-2026-07 Odin pin note"
+fi
+for doc in README.md docs/QUICKSTART.md docs/BUILDING.md docs/COMPATIBILITY.md docs/SDK.md docs/SECURITY.md docs/OPERATIONS.md; do
+	if grep -q 'v0.16.3-dataplane-unsigned' "${ROOT}/${doc}"; then
+		fail_msg "${doc} still points at a split v0.16.3 dataplane tag"
+	fi
+done
 if ! grep -q 'release_macos.sh' "${ROOT}/docs/BUILDING.md"; then
 	fail_msg "BUILDING.md missing release_macos.sh"
 fi
@@ -265,6 +283,54 @@ cp -a "${FIX}/darwin/." "${FIX}/bad/"
 printf 'nope\n' > "${FIX}/bad/thirp-broker"
 if bash "${ROOT}/scripts/verify_dataplane_release.sh" "${FIX}/bad" darwin >/dev/null 2>&1; then
 	fail_msg "verify_dataplane_release.sh accepted a tree that contains thirp-broker"
+fi
+
+# Fixture: four dummy libraries become one SDK tarball.
+SDK_FIX="${FIX}/sdk-ci"
+rm -rf "$SDK_FIX"
+mkdir -p "$SDK_FIX"
+printf 'linux-so\n' > "${SDK_FIX}/libthirp.so"
+for arch in arm64 x86_64; do
+	tree="$(mktemp -d)"
+	printf 'dylib-%s\n' "$arch" > "${tree}/libthirp.dylib"
+	tar -C "$tree" -czf "${SDK_FIX}/thirp-runtime-macos-${arch}-test.tar.gz" libthirp.dylib
+	rm -rf "$tree"
+done
+python3 - "${SDK_FIX}/thirp-runtime-windows-AMD64-test.zip" <<'PY'
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1], "w") as z:
+    z.writestr("thirp-runtime-windows-test/libthirp.dll", b"dll\n")
+PY
+if ! bash "${ROOT}/scripts/assemble_sdk.sh" "$SDK_FIX"; then
+	fail_msg "assemble_sdk.sh rejected a complete four-library fixture"
+else
+	ver="$(tr -d '[:space:]' < "${ROOT}/VERSION.txt")"
+	sdk_tar="${SDK_FIX}/thirp-runtime-sdk-${ver}.tar.gz"
+	manifest="$(tar -xOzf "$sdk_tar" "thirp-runtime-sdk-${ver}/SDK_MANIFEST.json")"
+	for needle in \
+		'"target": "linux-x86_64"' \
+		'"target": "darwin-arm64"' \
+		'"target": "darwin-x86_64"' \
+		'"target": "windows-amd64"' \
+		"c/lib/linux-x86_64/libthirp.so" \
+		"c/lib/darwin-arm64/libthirp.dylib" \
+		"c/lib/darwin-x86_64/libthirp.dylib" \
+		"c/lib/windows-amd64/libthirp.dll"
+	do
+		if ! grep -q -F "$needle" <<<"$manifest"; then
+			fail_msg "SDK manifest missing ${needle}"
+		fi
+	done
+fi
+
+SHORT="${FIX}/sdk-short"
+rm -rf "$SHORT"
+mkdir -p "$SHORT"
+cp "${SDK_FIX}/libthirp.so" "$SHORT/"
+cp "${SDK_FIX}/thirp-runtime-macos-arm64-test.tar.gz" "$SHORT/"
+cp "${SDK_FIX}/thirp-runtime-macos-x86_64-test.tar.gz" "$SHORT/"
+if bash "${ROOT}/scripts/assemble_sdk.sh" "$SHORT" >/dev/null 2>&1; then
+	fail_msg "assemble_sdk.sh accepted a fixture with no Windows library"
 fi
 
 rm -rf "$FIX"

@@ -30,6 +30,16 @@ $Version = (Get-Content -Raw $VersionPath).Trim()
 if ($Version -notmatch '^0\.[0-9]+\.[0-9]+$') {
 	throw "release_windows: VERSION.txt must be 0.x.y, got: $Version"
 }
+$Header = Join-Path $Root "c_abi\thirp.h"
+$Values = Join-Path $Root "version\values.odin"
+$headerNeedle = "#define THIRP_VERSION_STRING `"$Version`""
+$valuesNeedle = "THIRP_VERSION, `"$Version`""
+if (-not (Select-String -Path $Header -SimpleMatch -Quiet $headerNeedle)) {
+	throw "release_windows: c_abi/thirp.h THIRP_VERSION_STRING is not $Version"
+}
+if (-not (Select-String -Path $Values -SimpleMatch -Quiet $valuesNeedle)) {
+	throw "release_windows: version/values.odin THIRP_VERSION default is not $Version"
+}
 
 $Commit = "unknown"
 $Worktree = "clean"

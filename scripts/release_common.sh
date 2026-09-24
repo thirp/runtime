@@ -74,6 +74,29 @@ release_sign_sha256sums() {
 	echo "release: signed SHA256SUMS with ${THIRP_GPG_KEY}"
 }
 
+# VERSION.txt, the Odin default, and the C ABI macro are one project version.
+# release.sh does not run `odin test version`, so this is the pack-time stop.
+release_require_project_version() {
+	local version="${1:-${VERSION:-}}"
+	local header="${ROOT}/c_abi/thirp.h"
+	local values="${ROOT}/version/values.odin"
+	local needle
+	if [[ -z "$version" ]]; then
+		echo "release: project version is empty" >&2
+		exit 1
+	fi
+	needle="#define THIRP_VERSION_STRING \"${version}\""
+	if [[ ! -f "$header" ]] || ! grep -q -F "$needle" "$header"; then
+		echo "release: ${header} THIRP_VERSION_STRING is not ${version}" >&2
+		exit 1
+	fi
+	needle="THIRP_VERSION, \"${version}\""
+	if [[ ! -f "$values" ]] || ! grep -q -F "$needle" "$values"; then
+		echo "release: ${values} THIRP_VERSION default is not ${version}" >&2
+		exit 1
+	fi
+}
+
 release_write_dataplane_provenance() {
 	local out="$1"
 	local target="$2"

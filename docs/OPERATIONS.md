@@ -202,6 +202,10 @@ Defaults (override in the broker config or flags):
 
 Sizing is workload-dependent. Start with the defaults on a single host and raise connection/buffer caps after measuring. Do not treat these numbers as a capacity claim.
 
+#### Some Qualification Notes
+
+Burst load on the relay was run after these defaults existed. It is not a 24-hour soak, and it did not drive the 4096 connection cap. An N=256 graceful CLOSE (`thirp-connect` / ingress `conn_destroy`) then idle left about 258 agent origin fds open, about 383k `stream_not_found` RESETs/s, and broker RSS moving from 121 MiB to 2749 MiB over 5 minutes. An earlier cut of the same storm was about 288k RESET/s with unbounded RSS, and the matching Info logs were about 23 GiB over 5 minutes. Those leaks are fixed: terminal frames are delivered before the stream is dropped, finished streams do not echo RESET, and `STREAM_NOT_FOUND` Info is one line per second. Regressions are `caller/reset_test.odin` (N=32) and `agent/reset_test.odin` (N=64); both keep `resets_total{reason=stream_not_found}` flat and return origin fds to 0. The idle in those tests is short because a storm at that rate shows up immediately. The 24-hour soak has not been run at the time of this authoring.
+
 ## Startup and shutdown
 
 Startup validates configuration, loads TLS and credentials, then listens. Development policy and argv `--token` in production print warnings on stderr.
@@ -245,7 +249,7 @@ Restore: put the files back, start the broker, start agents. Agents re-register 
 
 A single-broker restart interrupts active sessions. There is no zero-downtime broker upgrade. Protocol and config compatibility: [COMPATIBILITY.md](COMPATIBILITY.md). User-visible changes: [CHANGELOG.md](CHANGELOG.md).
 
-Release trees from `scripts/release.sh` include Linux operator binaries, `libthirp.so`, a source archive, an SPDX SBOM, `NOTICE`, `PROVENANCE.txt`, and `SHA256SUMS`. Multi-OS dataplane trees from `scripts/release_macos.sh` and `scripts/release_windows.ps1` (and the published unsigned dataplane Releases [v0.16.3-dataplane-unsigned](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned) and [v0.16.3-dataplane-unsigned-mac-intel](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned-mac-intel)) include Agent/Caller and `libthirp` plus their own `SHA256SUMS`. Verify `SHA256SUMS` before install; treat unsigned dataplane binaries as integrity-checked but not OS-signed.
+`v0.16.4` is one Release. `scripts/release.sh` supplies the Linux operator binaries (including `thirp-web-ingress`), `libthirp.so`, the Broker tarball, a source archive, an SPDX SBOM, `NOTICE`, `PROVENANCE.txt`, and `SHA256SUMS`. The embed SDK tarball is packed by `scripts/assemble_sdk.sh` in GitHub Actions from the Linux, macOS, and Windows `libthirp` builds and attached to that same Release. macOS and Windows data-plane trees from `scripts/release_macos.sh` and `scripts/release_windows.ps1` are attached there too; they include Agent/Caller and `libthirp` plus their own `SHA256SUMS`. Verify `SHA256SUMS` before install. The SDK tarball has its own `SHA256SUMS` inside. Treat data-plane binaries as integrity-checked. They are not OS-signed unless Developer ID or Authenticode was configured for that build.
 
 1. Install the new binaries.
 2. Restart the broker (drain, then exit).
@@ -349,7 +353,7 @@ In-process tests in `web_ingress/qualify_test.odin` measured:
 - Slow-writer backpressure next to a fast sibling, then idle
 - Agent loss, Caller session loss, and Web Ingress restart: in-flight fails, later GET succeeds
 
-Those numbers are measured results on the machine that ran the suite. They are not a capacity claim. The configured 4096 connection cap was not load-tested.
+Those numbers are measured results on the machine that ran the suite. They are not a capacity claim. The configured 4096 connection cap was not part of this suite. Relay burst load and the still-outstanding 24-hour soak are under [Resource limits](#resource-limits).
 
 Threat model: [SECURITY.md](SECURITY.md).
 

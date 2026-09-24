@@ -46,7 +46,6 @@ ALLOW_DOCS=(
 	docs/NAMING.md
 	docs/OPERATIONS.md
 	docs/PROTOCOL.md
-	docs/RACES.md
 	docs/SDK.md
 	docs/SECURITY.md
 	docs/TRADEMARKS.md
@@ -58,6 +57,7 @@ ALLOW_SCRIPTS=(
 	scripts/release.sh
 	scripts/release_broker.sh
 	scripts/release_sdk.sh
+	scripts/assemble_sdk.sh
 	scripts/release_common.sh
 	scripts/release_macos.sh
 	scripts/release_windows.ps1
@@ -93,6 +93,8 @@ FORBIDDEN_REL_PATTERNS=(
 	'docs/inventions/'*
 	'docs/STUDIO.md'
 	'docs/MIGRATION.md'
+	'docs/os-signing.md'
+	'docs/RACES.md'
 	'docs/named-service-rendezvous-broker-spec-v3-acquisition.md'
 	'docs/named-service-rendezvous-production-readiness-amendment.md'
 	'docs/broker-packaging-change.md'
@@ -231,6 +233,8 @@ for forbidden in \
 	"${STAGE}/docs/inventions" \
 	"${STAGE}/docs/STUDIO.md" \
 	"${STAGE}/docs/MIGRATION.md" \
+	"${STAGE}/docs/os-signing.md" \
+	"${STAGE}/docs/RACES.md" \
 	"${STAGE}/docs/named-service-rendezvous-broker-spec-v3-acquisition.md" \
 	"${STAGE}/docs/named-service-rendezvous-production-readiness-amendment.md" \
 	"${STAGE}/docs/broker-packaging-change.md" \
@@ -262,6 +266,10 @@ excluded = {
     "docs/named-service-rendezvous-broker-spec-v3-acquisition.md",
     "docs/named-service-rendezvous-production-readiness-amendment.md",
     "docs/STUDIO.md",
+    "docs/os-signing.md",
+    "os-signing.md",
+    "docs/RACES.md",
+    "RACES.md",
     "docs/broker-packaging-change.md",
     "docs/rendez-authenticator-seam.md",
     "docs/rendez-authorizer-seam.md",

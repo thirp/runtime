@@ -38,38 +38,35 @@ Learn about the managed pilot at [thirp.net](https://thirp.net/).
 
 ## Project status
 
-- Source version: **0.16.3**
+- Source version: **0.16.4**
 - Wire protocol: **1.0**, frozen and documented in
   [docs/PROTOCOL.md](docs/PROTOCOL.md)
-- Platforms: **Linux** (full operator release + dataplane), **macOS arm64**,
-  **macOS x86_64 (Intel)**, and **Windows AMD64** (dataplane Agent/Caller CLIs
-  and C ABI shared libraries). Download locations:
-  [v0.16.3](https://github.com/thirp/runtime/releases/tag/v0.16.3) (Linux
-  operator),
-  [v0.16.3-dataplane-unsigned](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned)
-  (macOS arm64, Windows AMD64, Linux dataplane),
-  [v0.16.3-dataplane-unsigned-mac-intel](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned-mac-intel)
-  (macOS x86_64 Intel).
-- SDKs: Odin source packages and C ABI (`libthirp.so` Linux, `libthirp.dylib`
-  macOS, `libthirp.dll` Windows). The embed SDK tarball still ships the Linux
-  `.so` only; macOS/Windows `libthirp` ship in dataplane release trees.
-- Release artifacts:
-  - Linux operator: binaries, `libthirp.so`, SDK and Broker tarballs, source,
-    SBOM, checksums, and provenance (tag `v0.16.3` and later operator releases)
-  - Multi-OS **unsigned** dataplane (`thirp-agent` / `thirp-connect` /
-    `libthirp` + `SHA256SUMS` + `UNSIGNED.md` where present). **Not signed**
-    (no Apple Developer ID, Authenticode, or GPG `SHA256SUMS.asc`).
-    [v0.16.3-dataplane-unsigned](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned)
-    — macOS arm64, Windows AMD64, Linux x86_64 zips.
-    [v0.16.3-dataplane-unsigned-mac-intel](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned-mac-intel)
-    — macOS x86_64 (Intel) tarball. Signing (Apple Developer ID, Authenticode,
-    and GPG detached checksums) lands when certificates are available.
+- Platforms: **Linux** (operator release), **macOS arm64**, **macOS x86_64
+  (Intel)**, and **Windows AMD64** (data-plane Agent/Caller CLIs and C ABI
+  shared libraries). One download:
+  [v0.16.4](https://github.com/thirp/runtime/releases/tag/v0.16.4).
+- SDKs: Odin source packages and one embed SDK tarball whose `c/lib/` holds
+  `libthirp.so` (linux-x86_64), `libthirp.dylib` (darwin-arm64 and
+  darwin-x86_64), and `libthirp.dll` (windows-amd64).
+- Release artifacts on `v0.16.4`:
+  - Linux operator, attached by `scripts/publish_github.sh --release`:
+    `thirp-broker`, `thirp-agent`, `thirp-connect`, `thirp-web-ingress`,
+    `libthirp.so`, the Broker tarball, source archive, SBOM, checksums, and
+    provenance
+  - Embed SDK and data-plane archives, attached by the `dataplane-release`
+    workflow on that same tag: `thirp-runtime-sdk-0.16.4.tar.gz`,
+    `thirp-runtime-macos-arm64-0.16.4.tar.gz`,
+    `thirp-runtime-macos-x86_64-0.16.4.tar.gz`, and
+    `thirp-runtime-windows-AMD64-0.16.4.zip`. Apple Developer ID and
+    Authenticode are not claimed until those certificates are present at
+    build time.
 
 The self-hosted Runtime implements TLS, role separation, deny-by-default
 production policy, bounded resources, reconnect, health/metrics, and graceful
-drain. Publishing artifacts does not imply final production qualification: the
-24-hour soak remains incomplete. Web Ingress has additional edge-facing
-limitations described in the [security model](docs/SECURITY.md).
+drain. The 24-hour soak has not been run. Some qualification work is documented
+at ([OPERATIONS.md](docs/OPERATIONS.md#resource-limits)). Web
+Ingress has additional edge-facing limitations described in the
+[security model](docs/SECURITY.md).
 
 Broker / Web Ingress / full operator stacks remain **Linux-primary** in the
 published operator Release. Dataplane Agent/Caller binaries on macOS and Windows
@@ -107,14 +104,12 @@ certificate, starts each component, and sends an HTTP request through the relay.
 **Start here: [Local TLS quickstart](docs/QUICKSTART.md).**
 
 Download published artifacts from
-[GitHub Releases](https://github.com/thirp/runtime/releases):
-Linux operator bits from the latest operator tag (e.g. `v0.16.3`);
-macOS arm64 / Windows / Linux dataplane zips from
-[v0.16.3-dataplane-unsigned](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned);
-macOS Intel from
-[v0.16.3-dataplane-unsigned-mac-intel](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned-mac-intel)
-(unsigned — verify with `SHA256SUMS`). To compile individual components, or to
-produce a platform release tree, see
+[v0.16.4](https://github.com/thirp/runtime/releases/tag/v0.16.4):
+Linux operator binaries (including `thirp-web-ingress`) and the Broker
+collection come from the Linux release tree. The SDK tarball and the macOS and
+Windows data-plane archives are attached by GitHub Actions. Verify with
+`SHA256SUMS`. To
+compile individual components, or to produce a platform release tree, see
 [Building, testing, and packaging](docs/BUILDING.md).
 
 ## How authorization works
@@ -187,7 +182,6 @@ instructions are in [docs/SDK.md](docs/SDK.md).
 Additional project references:
 
 - [Dependencies](docs/DEPENDENCIES.md)
-- [Known concurrency hazards](docs/RACES.md)
 - [Odin naming conventions](docs/NAMING.md)
 - [Trademark notice](docs/TRADEMARKS.md)
 

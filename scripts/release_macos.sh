@@ -14,6 +14,7 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
 fi
 
 release_read_version
+release_require_project_version "$VERSION"
 release_git_state
 release_require_odin
 

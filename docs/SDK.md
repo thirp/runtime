@@ -8,7 +8,7 @@ Join codes identify a service; they are not credentials. AUTH still uses a token
 
 One project version, two tarballs. There is no third “foundation SDK.” `protocol`, `transport`, and `logging` are a layer inside both artifacts. Protocol 1.0 is unchanged.
 
-`thirp-runtime-sdk-<VERSION>.tar.gz` is the embed SDK: Odin `agent` and `caller` plus their compile closure, Linux `libthirp.so`, and C examples. It does not include Broker, `auth`, CLIs, Web Ingress, or operator configuration.
+`thirp-runtime-sdk-<VERSION>.tar.gz` is the embed SDK: Odin `agent` and `caller` plus their compile closure, `libthirp` for every published target, and C examples. It does not include Broker, `auth`, CLIs, Web Ingress, or operator configuration.
 
 `thirp-runtime-broker-<VERSION>.tar.gz` is the Broker Odin collection: the embed SDK Odin packages plus `auth` and `broker` (non-test sources). It has no C ABI, CLIs, tests, `config`, `web_ingress`, or `version`. One collection compiles Agent and Broker together.
 
@@ -131,7 +131,16 @@ Caller: `conn_close` / `conn_destroy` for live streams, then `caller_destroy`.
 
 ## C ABI
 
-The embed SDK tarball ships the Linux shared library only. Header `c/include/thirp.h`, library `c/lib/linux-<arch>/libthirp.so`. macOS `libthirp.dylib` and Windows `libthirp.dll` ship in the **dataplane** release trees (`dist/thirp-runtime-macos-<arch>-<VERSION>/`, `dist/thirp-runtime-windows-<VERSION>/`, and the published unsigned dataplane archives on [v0.16.3-dataplane-unsigned](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned) and [v0.16.3-dataplane-unsigned-mac-intel](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned-mac-intel)), not inside the SDK tarball. Links system OpenSSL 3 (`libssl` / `libcrypto`). No static library. No versioned soname.
+The published embed SDK tarball ships every `libthirp` next to one header, `c/include/thirp.h`:
+
+| Target | Library |
+|---|---|
+| `linux-x86_64` | `c/lib/linux-x86_64/libthirp.so` |
+| `darwin-arm64` | `c/lib/darwin-arm64/libthirp.dylib` |
+| `darwin-x86_64` | `c/lib/darwin-x86_64/libthirp.dylib` |
+| `windows-amd64` | `c/lib/windows-amd64/libthirp.dll` |
+
+`scripts/assemble_sdk.sh` builds that tarball from the platform artifacts. `scripts/release.sh` on one machine still packs only the library it just built, so `scripts/verify_sdk.sh` can link it; that host tarball is not the published SDK. Each library links system OpenSSL 3 (`libssl` / `libcrypto`). No static library. No versioned soname. Data-plane archives still ship the Agent and Caller CLIs beside their own copy of `libthirp`.
 
 ```bash
 cc -o echo_client examples/c/echo_client/echo_client.c \

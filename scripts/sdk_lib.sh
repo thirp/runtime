@@ -180,6 +180,32 @@ sdk_read_odin_min_version() {
 	printf '%s\n' "$ver"
 }
 
+# Published embed-SDK C ABI targets, in manifest order.
+# shellcheck disable=SC2034
+SDK_C_TARGETS=(
+	linux-x86_64
+	darwin-arm64
+	darwin-x86_64
+	windows-amd64
+)
+
+sdk_c_lib_name() {
+	case "$1" in
+	linux-*)
+		printf '%s\n' libthirp.so
+		;;
+	darwin-*)
+		printf '%s\n' libthirp.dylib
+		;;
+	windows-*)
+		printf '%s\n' libthirp.dll
+		;;
+	*)
+		return 1
+		;;
+	esac
+}
+
 sdk_json_escape() {
 	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }

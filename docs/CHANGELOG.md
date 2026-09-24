@@ -2,38 +2,14 @@
 
 Project version is independent of the wire protocol version. This tree speaks protocol 1.0. See [COMPATIBILITY.md](COMPATIBILITY.md).
 
-## Unreleased
+## 0.16.4
 
-`dataplane-release` builds macOS **x86_64 (Intel)** on `macos-15-intel` in addition to arm64 (`macos-latest`) and Windows. Output trees are `dist/thirp-runtime-macos-<arch>-<VERSION>/`. Intel archive is published on [v0.16.3-dataplane-unsigned-mac-intel](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned-mac-intel) without bumping `VERSION.txt`; [v0.16.3-dataplane-unsigned](https://github.com/thirp/runtime/releases/tag/v0.16.3-dataplane-unsigned) stays the arm64 / Windows / Linux dataplane drop. Embed SDK tarball still Linux `.so` only; operator/Broker stack remains Linux-primary; OS-level signing not claimed.
+One GitHub Release for the Linux operator tree, the multi-OS data-plane archives, and one embed SDK tarball. Protocol 1.0, the C ABI, and the Agent/Caller SDK surface are unchanged. CI pins Odin to `dev-2026-07`.
 
-Windows dataplane link: `system:libssl.lib` / `system:libcrypto.lib` and `LIB` search under `OPENSSL_ROOT_DIR` / `C:\Program Files\OpenSSL` (OpenSSL 4). ROOT store uses local `crypt32` FFI (`CertOpenSystemStoreW`) because Odin 2026-07 `core:sys/windows` does not declare Cert*. Unsigned Windows CI: GPG key probe goes through `cmd /c` so first-run stderr is not fatal under `$ErrorActionPreference = Stop`. `build_windows.bat` unknown-mode echo no longer uses parentheses (cmd.exe `exit /b 1` trap). CI finds `vcvars64.bat` via vswhere, not hardcoded VS 2022 paths. CI Odin pin restored to `dev-2026-07` (docs floor / last successful dataplane publish). The 2026-09 bump and Darwin `_odin_entry_point` stub were agent-only; a compiler move is backlog.
-
-Caller no longer RESET finished or unknown streams. Broker delivers terminal CLOSE/RESET after dropping leftover DATA (fixes CLOSE-delivery / stuck agent fds). Broker rate-limits `STREAM_NOT_FOUND` stream_reset Info logs. Agent no longer RESET finished or unknown streams. Broker outbox cleanup on stream termination. macOS and Windows CLIs, C ABI libraries, and automated data-plane release packaging. Protocol 1.0 unchanged.
-
-- **Caller + Broker**: Post-stop idle RESET storm after PR #4. Two remaining bugs, no protocol change. (1) `conn_handle_stream_frame` called `server_drop_stream_queues` *after* enqueueing the terminal CLOSE/RESET/second HALF_CLOSE, so the peer never got the frame. Agent origin fds stayed open (N=256 → ~258 stuck). (2) Caller still echoed `RESET` / `STREAM_NOT_FOUND` on DATA / HALF_CLOSE / CLOSE / RESET for a stream `conn_close` had already removed — same ping-pong PR #4 stopped on the agent (~383k `stream_not_found`/s, broker RSS 121→2749 MiB / 5 min). Fix: drop leftover DATA first, then enqueue the terminal frame, then `relay_drop_stream`. Caller ignores unknown/finished stream frames. Regression: N=32 Caller `conn_destroy` burst then idle — `resets_total{reason=stream_not_found}` stays flat and echo origin conns return to 0. Broker test: caller CLOSE is readable on the agent after queued DATA.
-- **Broker**: `stream_reset` Info for `STREAM_NOT_FOUND` is rate-limited to one line per `STREAM_NOT_FOUND_LOG_WINDOW` (1s). A RESET flood still increments `thirp_resets_total{reason=stream_not_found}` on every reply; it no longer allocates a log line per RESET (~23 GiB / 5 min and ~60 B/RESET heap at ~288k/s).
-
-- **Agent**: DATA / HALF_CLOSE for a finished or unknown `stream_id` no longer emit `RESET` / `STREAM_NOT_FOUND`. `agent_finish_stream` shuts down the origin socket before destroy so the local pump leaves `recv`. Write-failure RESET is sent only while the agent still owns the stream. Broker queue drop (PR #3) did not stop the idle storm because the agent kept initiating; remeasure after that fix was ~288k `stream_not_found` RESET/s and ~258 stuck agent fds. Regression: N=64 echo burst then idle — `resets_total{reason=stream_not_found}` stays flat.
-- **Broker**: Overflow, stream-idle, grant-expiry, and abort now call `server_drop_stream_queues` before enqueueing the terminal RESET and `relay_drop_stream`. PR #3 missed those four `conn.odin` drop paths; leftover DATA/HalfClose on either outbox could still be written after the stream table entry was gone.
-- **Broker**: Fixed agent RESET hot-loop leak. Streams reaching terminal state now call `server_drop_stream_queues` before `relay_drop_stream` to clear any queued frames, preventing the broker from sending DATA/HalfClose to agents for already-dropped stream_ids. Without this, agents responded with RESET+StreamNotFound, broker enqueued RESET back, creating a hot loop (~288k RESET/s, unbounded RSS growth).
-- macOS: `thirp-broker`, `thirp-agent`, `thirp-connect`, `thirp-web-ingress` CLIs and `libthirp.dylib`
-- Windows: same CLIs plus `libthirp.dll`
-- Platform-specific TLS socket wait: `core:sys/windows` WSAPoll (Windows POLLIN/POLLOUT/POLLERR/POLLHUP/POLLNVAL) on Windows, poll on POSIX
-- Windows TCP peek uses winsock `recv`/`MSG_PEEK`; `SO_RCVLOWAT` is a no-op (not a TCP option there)
-- Windows ROOT certificate store for TLS client verification via `CertOpenSystemStoreW`
-- macOS TLS falls back to `/etc/ssl/cert.pem` when Homebrew OpenSSL default paths are empty
-- Windows Ctrl-C/console close handling via SetConsoleCtrlHandler
-- Portable temp file paths in tests respect TEMP/TMP/TMPDIR environment variables
-- Build scripts: `scripts/build_macos.sh` and `scripts/build_windows.bat` (`dataplane` mode for Agent/Caller/`libthirp` only)
-- Data-plane release packaging: `scripts/release_macos.sh`, `scripts/release_windows.ps1`, checksums, provenance, optional GPG. GitHub Actions workflow `.github/workflows/dataplane-release.yml` builds those trees on `macos-latest` (arm64), `macos-15-intel` (x86_64), and `windows-latest`. Unsigned multi-OS dataplane packaging is automated. Apple Developer ID (`THIRP_MACOS_CODESIGN_IDENTITY`) and Authenticode (`THIRP_WINDOWS_PFX`) remain Chuck-supplied secrets.
-- Documentation: BUILDING.md, README.md, DEPENDENCIES.md, COMPATIBILITY.md, SECURITY.md updated for cross-platform release and verification
-- Agent and broker CLI signal handling split into `interrupt_{linux,darwin,windows}.odin`
-Agent stream cleanup on broker write failure. Protocol 1.0, the C ABI, and the Agent/Caller SDK surface are unchanged.
-
-- `agent_pump_local` sends RESET and calls `agent_finish_stream` when DATA write to broker fails, preventing wedged streams. Matches cleanup pattern used for OpenOk write failures (line 230).
-- Transport `Connection.send_timeout` / `connection_set_send_timeout`: TLS WANT_WRITE polls no longer reuse `recv_timeout`. Agent relay keeps 50ms read polling for heartbeats but DATA writes block on peer window (send_timeout=0), so backpressure is not turned into RESET storms.
-- Agent OPEN is dialed on a worker thread (`agent_open_worker`) so the relay reader is not stalled behind `connection_dial` while other streams' DATA/control arrive.
-- Agent DATA to local: on `connection_write` failure, send RESET and `agent_finish_stream` (was ignored). Local dials get a 5s send timeout to bound reader HOL if the target stops reading.
+- `v0.16.4` replaces the split `v0.16.3` dataplane tags. Linux operator artifacts come from `scripts/release.sh`. macOS arm64, macOS x86_64, and Windows AMD64 Agent/Caller/`libthirp` archives are attached by the data-plane workflow. OS-level signing is not claimed.
+- The published SDK tarball carries `libthirp` for linux-x86_64, darwin-arm64, darwin-x86_64, and windows-amd64. Broker and Web Ingress stay Linux-primary.
+- Caller and Agent no longer RESET finished or unknown streams. The Broker drops leftover DATA before the terminal CLOSE/RESET. `STREAM_NOT_FOUND` Info logs are rate-limited.
+- Agent OPEN is dialed off the relay reader. A failed DATA write sends RESET and finishes the stream. TLS writes no longer reuse the recv timeout.
 
 ## 0.16.3
 
