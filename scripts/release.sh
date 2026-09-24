@@ -175,4 +175,31 @@ export ROOT VERSION OUT ARCH
 "${ROOT}/scripts/verify_sdk.sh"
 "${ROOT}/scripts/verify_broker.sh"
 
+# One published Linux asset. Checksums stay inside the archive. The host SDK
+# tarball is not in SHA256SUMS and is not copied in.
+LINUX_INNER="thirp-runtime-linux-${ARCH}-${VERSION}"
+LINUX_ARCHIVE="${ROOT}/dist/${LINUX_INNER}.tar.gz"
+LINUX_STAGE="$(mktemp -d)"
+mkdir -p "${LINUX_STAGE}/${LINUX_INNER}"
+while read -r _ name; do
+	[[ -z "${name:-}" ]] && continue
+	cp "${OUT}/${name}" "${LINUX_STAGE}/${LINUX_INNER}/${name}"
+done < "${OUT}/SHA256SUMS"
+cp "${OUT}/SHA256SUMS" "${LINUX_STAGE}/${LINUX_INNER}/SHA256SUMS"
+if [[ -f "${OUT}/SHA256SUMS.asc" ]]; then
+	cp "${OUT}/SHA256SUMS.asc" "${LINUX_STAGE}/${LINUX_INNER}/SHA256SUMS.asc"
+fi
+tar -C "$LINUX_STAGE" -czf "$LINUX_ARCHIVE" "$LINUX_INNER"
+rm -rf "$LINUX_STAGE"
+# grep -q would SIGPIPE tar, and pipefail would report a present file as missing.
+if ! tar -tzf "$LINUX_ARCHIVE" | grep -x "${LINUX_INNER}/thirp-web-ingress" >/dev/null; then
+	echo "release: ${LINUX_ARCHIVE} missing thirp-web-ingress" >&2
+	exit 1
+fi
+if tar -tzf "$LINUX_ARCHIVE" | grep -F "thirp-runtime-sdk-" >/dev/null; then
+	echo "release: ${LINUX_ARCHIVE} contains the host SDK tarball" >&2
+	exit 1
+fi
+
 echo "release: wrote ${OUT}"
+echo "release: wrote ${LINUX_ARCHIVE}"

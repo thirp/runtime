@@ -4,9 +4,9 @@ Project version is independent of the wire protocol version. This tree speaks pr
 
 ## 0.16.4
 
-One GitHub Release for the Linux operator tree, the multi-OS data-plane archives, and one embed SDK tarball. Protocol 1.0, the C ABI, and the Agent/Caller SDK surface are unchanged. CI pins Odin to `dev-2026-07`.
+One GitHub Release of archives: the Linux operator tarball (including Web Ingress), the multi-OS data-plane archives, and one embed SDK tarball. Protocol 1.0, the C ABI, and the Agent/Caller SDK surface are unchanged. CI pins Odin to `dev-2026-07`.
 
-- `v0.16.4` replaces the split `v0.16.3` dataplane tags. Linux operator artifacts come from `scripts/release.sh`. macOS arm64, macOS x86_64, and Windows AMD64 Agent/Caller/`libthirp` archives are attached by the data-plane workflow. OS-level signing is not claimed.
+- `v0.16.4` replaces the split `v0.16.3` dataplane tags. The Linux operator archive from `scripts/release.sh` is `thirp-runtime-linux-x86_64-<version>.tar.gz` and includes `thirp-web-ingress`. macOS arm64, macOS x86_64, and Windows AMD64 Agent/Caller/`libthirp` archives are attached by the data-plane workflow. OS-level signing is not claimed.
 - The published SDK tarball carries `libthirp` for linux-x86_64, darwin-arm64, darwin-x86_64, and windows-amd64. Broker and Web Ingress stay Linux-primary.
 - Caller and Agent no longer RESET finished or unknown streams. The Broker drops leftover DATA before the terminal CLOSE/RESET. `STREAM_NOT_FOUND` Info logs are rate-limited.
 - Agent OPEN is dialed off the relay reader. A failed DATA write sends RESET and finishes the stream. TLS writes no longer reuse the recv timeout.

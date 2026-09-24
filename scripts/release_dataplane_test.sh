@@ -127,6 +127,15 @@ fi
 if ! grep -q 'release_windows.ps1' "${ROOT}/.github/workflows/dataplane-release.yml"; then
 	fail_msg "workflow does not invoke release_windows.ps1"
 fi
+if ! grep -q 'thirp-runtime-linux-' "${ROOT}/scripts/publish_github.sh"; then
+	fail_msg "publish_github.sh does not attach the Linux operator archive"
+fi
+if ! grep -q 'thirp-web-ingress' "${ROOT}/scripts/publish_github.sh"; then
+	fail_msg "publish_github.sh does not require thirp-web-ingress inside the Linux archive"
+fi
+if grep -q 'ASSETS+=("${REL}/${name}")' "${ROOT}/scripts/publish_github.sh"; then
+	fail_msg "publish_github.sh still uploads loose SHA256SUMS files"
+fi
 if ! grep -q 'thirp-runtime-windows-\*\.zip' "${ROOT}/.github/workflows/dataplane-release.yml"; then
 	fail_msg "workflow windows artifact must be the zip only"
 fi

@@ -29,21 +29,17 @@ files. See [DEPENDENCIES.md](DEPENDENCIES.md).
 
 ### Download the Linux release
 
-Download these files from the
-[latest GitHub release](https://github.com/thirp/runtime/releases/latest):
-
-- `thirp-broker`
-- `thirp-agent`
-- `thirp-connect`
-- `SHA256SUMS`
-- `SHA256SUMS.asc` when the release is signed
-
-Place them in one directory, verify the downloaded artifacts, and make the
-binaries executable:
+Download `thirp-runtime-linux-x86_64-0.16.4.tar.gz` from the
+[latest GitHub release](https://github.com/thirp/runtime/releases/latest).
+That archive is the Linux operator bundle. It contains `thirp-broker`,
+`thirp-agent`, `thirp-connect`, `thirp-web-ingress`, `libthirp.so`, and the
+checksums. Extract it, verify, and make the binaries executable:
 
 ```bash
-sha256sum --ignore-missing -c SHA256SUMS
-chmod +x thirp-broker thirp-agent thirp-connect
+tar -xzf thirp-runtime-linux-x86_64-0.16.4.tar.gz
+cd thirp-runtime-linux-x86_64-0.16.4
+sha256sum -c SHA256SUMS
+chmod +x thirp-broker thirp-agent thirp-connect thirp-web-ingress
 ```
 
 When `SHA256SUMS.asc` is present, verify it using the publish-key fingerprint
@@ -61,7 +57,7 @@ and [BUILDING.md](BUILDING.md#verify-a-downloaded-tree).
 
 | Platform | Asset on `v0.16.4` |
 |---|---|
-| Linux operator (this walkthrough) | `thirp-broker`, `thirp-agent`, `thirp-connect`, `thirp-web-ingress` |
+| Linux operator, including Web Ingress | `thirp-runtime-linux-x86_64-0.16.4.tar.gz` |
 | Embed SDK (all four `libthirp` targets) | `thirp-runtime-sdk-0.16.4.tar.gz` |
 | macOS arm64 | `thirp-runtime-macos-arm64-0.16.4.tar.gz` |
 | macOS x86_64 (Intel) | `thirp-runtime-macos-x86_64-0.16.4.tar.gz` |

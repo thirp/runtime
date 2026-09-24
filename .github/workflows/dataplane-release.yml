@@ -209,8 +209,8 @@ jobs:
       - name: Assemble the multi-OS SDK tarball
         run: |
           bash scripts/assemble_sdk.sh dist/ci
-          # The operator Release already attaches Linux libthirp.so. The SDK
-          # tarball has its own copy. A loose .so here would clobber that asset.
+          # The Linux operator release is one archive. A loose libthirp.so
+          # must not be attached beside it.
           find dist/ci -type f -name 'libthirp.so' -delete
       - name: Attach platform archives to the GitHub Release
         env:

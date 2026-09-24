@@ -176,7 +176,7 @@ See [SDK.md](SDK.md) for lifecycle and API guidance.
 
 ## Cross-platform status
 
-- **Linux**: Operator release from `scripts/release.sh` (`thirp-broker`, `thirp-agent`, `thirp-connect`, `thirp-web-ingress`, `libthirp.so`, SDK and Broker tarballs, source, SBOM, provenance). Attached to `v<VERSION>` by `scripts/publish_github.sh --release`.
+- **Linux**: Operator archive from `scripts/release.sh`, `thirp-runtime-linux-<arch>-<VERSION>.tar.gz` (`thirp-broker`, `thirp-agent`, `thirp-connect`, `thirp-web-ingress`, `libthirp.so`, Broker tarball, source, SBOM, provenance, checksums). That archive is the Linux asset attached to `v<VERSION>` by `scripts/publish_github.sh --release`.
 - **macOS**: Data-plane release tree (`thirp-agent`, `thirp-connect`, `libthirp.dylib`) via `scripts/release_macos.sh` on **arm64** (`macos-latest`) and **x86_64 (Intel)** (`macos-15-intel`). The workflow attaches both archives to the same `v<VERSION>` Release.
 - **Windows**: Data-plane release tree (`thirp-agent.exe`, `thirp-connect.exe`, `libthirp.dll`) via `scripts/release_windows.ps1` (AMD64), attached to that same Release.
 
@@ -215,6 +215,7 @@ It contains:
 - `LICENSE`, `NOTICE`, changelog, dependency inventory, and provenance
 - Web Ingress deployment examples
 - `SHA256SUMS` and, when the publish key is available, `SHA256SUMS.asc`
+- `dist/thirp-runtime-linux-<arch>-<VERSION>.tar.gz`, the archive attached to the GitHub Release. It includes `thirp-web-ingress`. The host SDK tarball is left out.
 
 The script also:
 
@@ -306,9 +307,11 @@ checksums are still usable.
    public tree, scans it, and writes `PUBLISH_MANIFEST.txt` plus
    `RELEASE_NOTES.md` under `dist/publish-github/`.
 2. `--push --release` (with `--qualified`) fast-forwards `thirp/runtime` and
-   attaches the Linux operator tree from `dist/thirp-runtime-<VERSION>/`,
-   including `thirp-web-ingress` and the Broker collection. `--release`
-   requires `SHA256SUMS.asc`. It does not attach the embed SDK tarball.
+   attaches `dist/thirp-runtime-linux-<arch>-<VERSION>.tar.gz`. That archive
+   holds the operator tree, including `thirp-web-ingress` and the Broker
+   collection. Loose files from the tree are not release assets. `--release`
+   requires `SHA256SUMS.asc` inside the archive. It does not attach the embed
+   SDK tarball.
 3. The tag push `v<VERSION>` runs `.github/workflows/dataplane-release.yml`.
    The `check`, `linux-lib`, `macos` (arm64 and x86_64), and `windows` jobs
    build on hosted runners. Native jobs upload `libthirp.so`,

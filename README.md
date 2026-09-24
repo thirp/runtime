@@ -48,11 +48,11 @@ Learn about the managed pilot at [thirp.net](https://thirp.net/).
 - SDKs: Odin source packages and one embed SDK tarball whose `c/lib/` holds
   `libthirp.so` (linux-x86_64), `libthirp.dylib` (darwin-arm64 and
   darwin-x86_64), and `libthirp.dll` (windows-amd64).
-- Release artifacts on `v0.16.4`:
+- Release artifacts on `v0.16.4` are archives:
   - Linux operator, attached by `scripts/publish_github.sh --release`:
-    `thirp-broker`, `thirp-agent`, `thirp-connect`, `thirp-web-ingress`,
-    `libthirp.so`, the Broker tarball, source archive, SBOM, checksums, and
-    provenance
+    `thirp-runtime-linux-x86_64-0.16.4.tar.gz` (`thirp-broker`, `thirp-agent`,
+    `thirp-connect`, `thirp-web-ingress`, `libthirp.so`, the Broker tarball,
+    source archive, SBOM, checksums, and provenance)
   - Embed SDK and data-plane archives, attached by the `dataplane-release`
     workflow on that same tag: `thirp-runtime-sdk-0.16.4.tar.gz`,
     `thirp-runtime-macos-arm64-0.16.4.tar.gz`,
@@ -103,12 +103,11 @@ certificate, starts each component, and sends an HTTP request through the relay.
 
 **Start here: [Local TLS quickstart](docs/QUICKSTART.md).**
 
-Download published artifacts from
-[v0.16.4](https://github.com/thirp/runtime/releases/tag/v0.16.4):
-Linux operator binaries (including `thirp-web-ingress`) and the Broker
-collection come from the Linux release tree. The SDK tarball and the macOS and
-Windows data-plane archives are attached by GitHub Actions. Verify with
-`SHA256SUMS`. To
+Download published archives from
+[v0.16.4](https://github.com/thirp/runtime/releases/tag/v0.16.4).
+The Linux operator archive includes `thirp-web-ingress` and the Broker
+collection. The SDK tarball and the macOS and Windows data-plane archives are
+attached by GitHub Actions. Checksums are inside each archive. To
 compile individual components, or to produce a platform release tree, see
 [Building, testing, and packaging](docs/BUILDING.md).
 
