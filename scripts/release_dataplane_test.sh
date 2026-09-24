@@ -163,6 +163,12 @@ fi
 if ! grep -q 'set "LIB=%OPENSSL_LIBPATH%;%LIB%"' "${ROOT}/scripts/build_windows.bat"; then
 	fail_msg "build_windows.bat does not prepend OPENSSL_LIBPATH to LIB"
 fi
+if grep -q 'Compress-Archive' "${ROOT}/scripts/release_windows.ps1"; then
+	fail_msg "release_windows.ps1 Compress-Archive writes backslash zip entries"
+fi
+if ! grep -q 'ZipFileExtensions' "${ROOT}/scripts/release_windows.ps1"; then
+	fail_msg "release_windows.ps1 must write zip entries with ZipFile"
+fi
 if grep -q 'use all or dataplane)' "${ROOT}/scripts/build_windows.bat"; then
 	fail_msg "build_windows.bat unknown-mode echo still has cmd.exe-breaking parentheses"
 fi
@@ -305,10 +311,11 @@ for arch in arm64 x86_64; do
 	tar -C "$tree" -czf "${SDK_FIX}/thirp-runtime-macos-${arch}-test.tar.gz" libthirp.dylib
 	rm -rf "$tree"
 done
+# Backslash entry names match Compress-Archive. assemble_sdk must still find the DLL.
 python3 - "${SDK_FIX}/thirp-runtime-windows-AMD64-test.zip" <<'PY'
 import sys, zipfile
 with zipfile.ZipFile(sys.argv[1], "w") as z:
-    z.writestr("thirp-runtime-windows-test/libthirp.dll", b"dll\n")
+    z.writestr("thirp-runtime-windows-test\\libthirp.dll", b"dll\n")
 PY
 if ! bash "${ROOT}/scripts/assemble_sdk.sh" "$SDK_FIX"; then
 	fail_msg "assemble_sdk.sh rejected a complete four-library fixture"

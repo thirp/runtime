@@ -48,7 +48,26 @@ extract_named() {
 		tar -C "$tmp" -xzf "$archive"
 		;;
 	*.zip)
-		unzip -q "$archive" -d "$tmp"
+		# Compress-Archive stores '\' separators. unzip exits 1 on that warning
+		# and leaves the DLL under a single backslash-named entry.
+		python3 - "$archive" "$tmp" <<'PY'
+import os, sys, zipfile
+archive, dest = sys.argv[1], sys.argv[2]
+with zipfile.ZipFile(archive) as zf:
+    for info in zf.infolist():
+        name = info.filename.replace("\\", "/")
+        if name.endswith("/"):
+            continue
+        parts = [p for p in name.split("/") if p not in ("", ".")]
+        if not parts or any(p == ".." for p in parts):
+            raise SystemExit("assemble_sdk: zip path escapes: " + info.filename)
+        out = os.path.join(dest, *parts)
+        parent = os.path.dirname(out)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with zf.open(info) as src, open(out, "wb") as dst:
+            dst.write(src.read())
+PY
 		;;
 	*)
 		echo "assemble_sdk: unsupported archive ${archive}" >&2

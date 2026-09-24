@@ -208,7 +208,23 @@ function Assert-CliVersion([string]$Bin) {
 Assert-CliVersion (Join-Path $Out "thirp-agent.exe")
 Assert-CliVersion (Join-Path $Out "thirp-connect.exe")
 
+# The Windows archive cmdlet writes '\' entry names. Linux unzip then exits 1,
+# and the publish job cannot find libthirp.dll. Entry names use '/'.
+Add-Type -AssemblyName System.IO.Compression
+Add-Type -AssemblyName System.IO.Compression.FileSystem
 if (Test-Path $Archive) { Remove-Item $Archive -Force }
-Compress-Archive -Path $Out -DestinationPath $Archive
+$zip = [System.IO.Compression.ZipFile]::Open($Archive, [System.IO.Compression.ZipArchiveMode]::Create)
+try {
+	$root = (Resolve-Path $Out).Path.TrimEnd('\')
+	$prefix = Split-Path $root -Leaf
+	Get-ChildItem -Path $root -Recurse -File | ForEach-Object {
+		$rel = $_.FullName.Substring($root.Length).TrimStart('\') -replace '\\', '/'
+		$entry = "$prefix/$rel"
+		[void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+			$zip, $_.FullName, $entry, [System.IO.Compression.CompressionLevel]::Optimal)
+	}
+} finally {
+	$zip.Dispose()
+}
 Write-Host "release_windows: wrote $Out"
 Write-Host "release_windows: wrote $Archive"
