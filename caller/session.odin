@@ -92,12 +92,23 @@ caller_destroy :: proc(c: ^Caller) {
 	sync.atomic_store(&c.stop, true)
 	sync.mutex_lock(&c.mutex)
 	if c.conn != nil {
-		trans.connection_close(c.conn)
+		// Wake the reader without freeing TLS under it. connection_close
+		// here freed conn.tls while the reader sat in SSL_read, and the
+		// reader's mutex_unlock(&conn.tls.mutex) then hit a nil session
+		// (thirp-connect SIGSEGV on exit, e.g. listen port in use). The
+		// reader is joined below; connection_destroy runs after that.
+		trans.connection_shutdown_both(c.conn)
 	}
 	if c.pending != nil {
 		c.pending_err = .Closed
 		c.pending = nil
 	}
+	// End every stream before the join so owners wake at once. Take them
+	// out of the table first (with a reference), as caller_fail_all does:
+	// a finished stream left in the table is freed by its owner's
+	// conn_destroy (conn_close returns early once closed, so it never
+	// removes the entry) and the reader then double-freed it.
+	caller_take_and_finish_all(c)
 	sync.cond_broadcast(&c.cond)
 	sync.mutex_unlock(&c.mutex)
 	if c.reader != nil {
@@ -106,10 +117,7 @@ caller_destroy :: proc(c: ^Caller) {
 		c.reader = nil
 	}
 	sync.mutex_lock(&c.mutex)
-	for _, stream in c.streams {
-		conn_finish(stream, .Closed)
-	}
-	clear(&c.streams)
+	caller_take_and_finish_all(c)
 	sync.mutex_unlock(&c.mutex)
 	delete(c.streams)
 	proto.decoder_destroy(&c.decoder)
@@ -118,6 +126,29 @@ caller_destroy :: proc(c: ^Caller) {
 		c.conn = nil
 	}
 	caller_free_config(c)
+}
+
+// Caller holds c.mutex. Empties the stream table and finishes each stream
+// it held. A finished stream is never left in the table.
+caller_take_and_finish_all :: proc(c: ^Caller) {
+	if len(c.streams) == 0 {
+		return
+	}
+	taken := make([dynamic]^Conn, 0, len(c.streams))
+	defer delete(taken)
+	for _, stream in c.streams {
+		if stream != nil {
+			conn_acquire(stream)
+			append(&taken, stream)
+		}
+	}
+	clear(&c.streams)
+	for stream in taken {
+		// conn.mutex nests inside c.mutex here, the same order as
+		// conn_close (which never holds both).
+		conn_finish(stream, .Closed)
+		conn_release(stream)
+	}
 }
 
 caller_free_config :: proc(c: ^Caller) {
@@ -452,27 +483,63 @@ caller_handle_connect_failed :: proc(c: ^Caller, err: CallerError) {
 	sync.mutex_unlock(&c.mutex)
 }
 
-caller_handle_data :: proc(c: ^Caller, frame: proto.Frame) {
+// Looks a stream up for the session reader and takes a reference, so the
+// owner's conn_destroy cannot free it while the reader is using it.
+caller_acquire_stream :: proc(c: ^Caller, stream_id: proto.StreamId) -> ^Conn {
 	sync.mutex_lock(&c.mutex)
-	stream, found := c.streams[frame.header.stream_id]
-	sync.mutex_unlock(&c.mutex)
+	defer sync.mutex_unlock(&c.mutex)
+	stream, found := c.streams[stream_id]
 	if !found || stream == nil {
+		return nil
+	}
+	conn_acquire(stream)
+	return stream
+}
+
+caller_stream_buffer_cap :: proc(c: ^Caller) -> int {
+	if c.config.max_stream_buffer > 0 {
+		return c.config.max_stream_buffer
+	}
+	return CONN_INBOUND_CAP
+}
+
+caller_handle_data :: proc(c: ^Caller, frame: proto.Frame) {
+	stream := caller_acquire_stream(c, frame.header.stream_id)
+	if stream == nil {
 		// Finished or never bound. Do not RESET StreamNotFound —
 		// the broker answers the same code and the pair hot-loops
 		// for the rest of the caller session (field: ~383k/s idle).
 		return
 	}
-	conn_push_inbound(stream, frame.payload)
+	defer conn_release(stream)
+	if conn_push_inbound(stream, frame.payload, caller_stream_buffer_cap(c)) {
+		return
+	}
+	// The consumer is a full buffer behind. Waiting would hold the one
+	// session reader (no other stream gets DATA, no dial sees CONNECT_OK) and,
+	// through the broker's full queue for this stream, the Agent session that
+	// serves every other caller. Reset only this stream.
+	sync.mutex_lock(&c.mutex)
+	owned := c.streams[frame.header.stream_id] == stream
+	if owned {
+		delete_key(&c.streams, frame.header.stream_id)
+	}
+	sync.mutex_unlock(&c.mutex)
+	if !owned {
+		return
+	}
+	conn_finish(stream, .Reset)
+	caller_log(c, .Warn, "stream_reset", log.LogFields{stream_id = u64(frame.header.stream_id), reason = "stream_buffer_full"})
+	_ = caller_write_failure(c.conn, .Reset, .InternalError, frame.header.stream_id)
 }
 
 caller_handle_half_close :: proc(c: ^Caller, stream_id: proto.StreamId) {
-	sync.mutex_lock(&c.mutex)
-	stream, found := c.streams[stream_id]
-	sync.mutex_unlock(&c.mutex)
-	if !found || stream == nil {
+	stream := caller_acquire_stream(c, stream_id)
+	if stream == nil {
 		return
 	}
 	conn_set_eof(stream)
+	conn_release(stream)
 }
 
 caller_handle_close :: proc(c: ^Caller, stream_id: proto.StreamId, kind: ConnError) {
@@ -480,10 +547,14 @@ caller_handle_close :: proc(c: ^Caller, stream_id: proto.StreamId, kind: ConnErr
 	stream, found := c.streams[stream_id]
 	if found {
 		delete_key(&c.streams, stream_id)
+		if stream != nil {
+			conn_acquire(stream)
+		}
 	}
 	sync.mutex_unlock(&c.mutex)
 	if found && stream != nil {
 		conn_finish(stream, kind)
+		conn_release(stream)
 	}
 	// Incoming RESET/CLOSE for a stream this session already dropped
 	// (conn_close removes the map entry before the broker's reply)
@@ -499,6 +570,7 @@ caller_fail_all :: proc(c: ^Caller, err: CallerError) {
 	}
 	taken := make([dynamic]^Conn)
 	for _, stream in c.streams {
+		conn_acquire(stream)
 		append(&taken, stream)
 	}
 	clear(&c.streams)
@@ -506,6 +578,7 @@ caller_fail_all :: proc(c: ^Caller, err: CallerError) {
 	sync.mutex_unlock(&c.mutex)
 	for stream in taken {
 		conn_finish(stream, err == .Transport ? .Transport : .Closed)
+		conn_release(stream)
 	}
 	delete(taken)
 }

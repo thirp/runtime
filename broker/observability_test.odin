@@ -4,6 +4,7 @@ import auth "../auth"
 import log "../logging"
 import proto "../protocol"
 import trans "../transport"
+import "base:runtime"
 import "core:strings"
 import "core:sync"
 import "core:testing"
@@ -18,8 +19,8 @@ obs_sink :: proc(text: string) {
 
 obs_reset_logs :: proc() {
 	sync.mutex_lock(&obs_logs.mutex)
-	if obs_logs.text == nil {
-		obs_logs.text = make([dynamic]u8)
+	if obs_logs.text.allocator.procedure == nil {
+		obs_logs.text = make([dynamic]u8, runtime.heap_allocator())
 	} else {
 		clear(&obs_logs.text)
 	}
@@ -29,7 +30,11 @@ obs_reset_logs :: proc() {
 obs_free_logs :: proc() {
 	sync.mutex_lock(&obs_logs.mutex)
 	delete(obs_logs.text)
-	obs_logs.text = {}
+	// Brokers from these tests can log a line after the test ends. Keep the
+	// heap allocator on the (empty) buffer so that late append does not take
+	// whichever test's tracking allocator the logging thread has (that showed
+	// up as a capture_sink leak plus an obs_free_logs bad free in a later test).
+	obs_logs.text = make([dynamic]u8, runtime.heap_allocator())
 	sync.mutex_unlock(&obs_logs.mutex)
 	sync.mutex_unlock(&obs_test_mutex)
 }

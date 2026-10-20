@@ -2,6 +2,31 @@
 
 Project version is independent of the wire protocol version. This tree speaks protocol 1.0. See [COMPATIBILITY.md](COMPATIBILITY.md).
 
+## 0.16.5
+
+Caller, Agent and Broker data-path fixes, plus the transport close/IO race fix. Protocol 1.0, the C ABI, and the wire are unchanged. This tag carries the Linux operator archive built locally (no GitHub Actions); the macOS, Windows, and multi-OS SDK archives from 0.16.4 are not rebuilt for it.
+
+- Transport: closing a connection no longer releases a socket another thread is still reading or writing. An in-flight read or write holds a reference, so a closed connection's bytes can no longer land on another connection that reused the descriptor (a race present since 0.8.0; on Windows it could crash the process). The Agent holds a connection reference across register, unregister and stop.
+
+Earlier data-path fixes in this release: Protocol 1.0, the C ABI, and the wire are unchanged. New Odin-only settings (no C field): `CallerConfig.max_stream_buffer` (8 MiB; also `thirp-connect --max-stream-buffer-mib`), `AgentConfig.stream_stall_timeout` (0 = 30 s, negative = never), `AgentConfig.max_stream_buffer` (64 MiB), `AgentConfig.max_buffered_bytes` (256 MiB), `AgentConfig.max_streams` (128) (also `thirp-agent --max-stream-buffer-mib`, `--max-buffered-mib`, `--max-streams`; each flag takes 1..1048576), and Broker `Server.stream_stall_timeout` (30 s). `thirp-connect` gains `--stream-stall-timeout SECONDS` (default 30, 0 = never; bounds writes to a local client) and `--max-stream-buffer-mib N` (1..1048576, default 8).
+
+**Trade-off (protocol 1.0 has no per-stream flow control).** One TCP connection carries every stream of a session, so no hop can slow one stream's sender without stopping all of them. The Agent therefore buffers each stream's DATA to its local service and never makes its shared reader wait:
+- A stream whose backlog would pass `max_stream_buffer` (64 MiB) is **reset at once**. A large upload to a service that reads slower than the sender fails once ~64 MiB is queued (for example a multi-hundred-MB upload to a slow disk). Raise `max_stream_buffer` (`--max-stream-buffer-mib`) for such services, at the cost of memory.
+- When all streams together would pass `max_buffered_bytes` (256 MiB), the stream with the largest backlog is reset (then the new data's stream if needed). The session is never dropped.
+- OPENs past `max_streams` (each stream uses two threads) fail with `QUOTA_EXCEEDED`; open streams are unaffected.
+- The Caller (download direction: SDK, C ABI, Web Ingress and thirp-connect) works the same way. A stream whose unread backlog would pass `CallerConfig.max_stream_buffer` (8 MiB) is **reset at once**; the session reader never waits. A slow download (a client reading slower than the service sends, or a paused client such as a pager) fails once it is ~8 MiB behind, matching the Agent's 64 MiB upload trade-off. Waiting instead would fill the Broker's queue for that stream and make the Broker stop reading the Agent session, freezing every caller of that service (measured: 29 s).
+- Per-stream flow control (a WINDOW message) is on the backlog for a later protocol version.
+
+- `thirp-connect --token-file` no longer frees the token before the broker login (the broker logged `auth_failed reason=caller`).
+- `thirp-connect` binds `--listen` before dialing the broker. A busy port exits 1 with a clear message. `caller_destroy` wakes the session reader with `shutdown` instead of freeing TLS under it (SIGSEGV on exit with TLS).
+- One slow or stalled stream no longer holds up the others on a session. The Agent's relay reader queues DATA per stream (writer thread per stream) instead of writing to the local service inline, with the caps above; the Caller's session reader buffers per stream (8 MiB) and resets at the cap without waiting. Field repro: a 50 MB upload to a server reading ~320 KB/s blocked every other request.
+- Stall limits are no-progress based (default 30 s) for the Agent's and thirp-connect's local writes and the Broker's wait for a full stream queue. Slow but steady readers are not reset below the caps. The old fixed 5 s Caller limit and the Agent's 5 s local write limit are gone.
+- `caller_destroy` takes streams out of the table before finishing them (it left them there, and owners plus the reader then double-freed them).
+- Plain-TCP send and recv retry on `EINTR` instead of ending the stream.
+- The Agent closes its socket to the local service when that service closed first and the caller then finished (it stayed in CLOSE-WAIT).
+- The Caller session reader holds a reference on a stream while it uses it, so the owner's `conn_destroy` cannot free it underneath.
+- `thirp-connect` dials off the accept loop, passes local EOF as `HALF_CLOSE`, closes the local socket when the stream ends, polls local reads so it can stop bridges without relying on `shutdown` waking a blocked `recv` (Windows), caps concurrent connections at 256, and no longer sends a `CLOSE` after both sides half-closed.
+
 ## 0.16.4
 
 One GitHub Release of archives: the Linux operator tarball (including Web Ingress), the multi-OS data-plane archives, and one embed SDK tarball. Protocol 1.0, the C ABI, and the Agent/Caller SDK surface are unchanged. CI pins Odin to `dev-2026-07`.

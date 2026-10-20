@@ -38,3 +38,10 @@ connection_set_recv_lowat_impl :: proc(conn: ^Connection, n: int) -> TransportEr
 	_ = n
 	return .None
 }
+
+// closesocket used to abort a blocking recv/send on another thread. The fd is
+// now released only after that thread leaves, so abort its pending IO
+// explicitly; the handle stays valid until conn_release_fd.
+connection_abort_io_impl :: proc(conn: ^Connection) {
+	_ = win.CancelIoEx(win.HANDLE(uintptr(conn.socket)), nil)
+}

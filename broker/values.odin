@@ -5,6 +5,9 @@ import "core:time"
 MAX_IDENTITY_LEN :: 128
 DEFAULT_MAX_REGISTRATIONS_PER_SESSION :: 32
 DEFAULT_MAX_STREAM_BUFFER :: 256 * 1024
+// A stream whose destination queue is full is reset only after it drained
+// nothing for this long. A slow but steady destination is never reset.
+DEFAULT_STREAM_STALL_TIMEOUT :: 30 * time.Second
 DEFAULT_MAX_CONNECTION_BUFFER :: 8 * 1024 * 1024
 DEFAULT_MAX_STREAMS_PER_SESSION :: 256
 DEFAULT_MAX_PHYSICAL_CONNECTIONS :: 4096
@@ -57,3 +60,4 @@ make_principal :: proc(id: string, organization: string) -> (Principal, Identity
 	}
 	return Principal{id = pid, organization = oid}, .None
 }
+OUTBOX_WAIT_SLICE :: 100 * time.Millisecond

@@ -105,13 +105,21 @@ agent_stop :: proc(agent: ^Agent) {
 	sync.mutex_lock(&agent.mutex)
 	conn := agent.live_conn
 	connected := agent.connected
+	// The session thread clears live_conn under this mutex before it destroys
+	// the connection, so take a reference while we still hold it.
+	if conn != nil && !trans.connection_acquire(conn) {
+		conn = nil
+	}
 	if agent.pending != .None {
 		agent_finish_pending(agent, .Stopped)
 	}
 	sync.cond_broadcast(&agent.cond)
 	sync.mutex_unlock(&agent.mutex)
-	if !connected && conn != nil {
-		trans.connection_close(conn)
+	if conn != nil {
+		if !connected {
+			trans.connection_close(conn)
+		}
+		trans.connection_release(conn)
 	}
 }
 

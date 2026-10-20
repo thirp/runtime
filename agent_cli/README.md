@@ -18,6 +18,7 @@ odin build agent_cli -out:thirp-agent
 thirp-agent [--version] [--config PATH] --broker HOST:PORT (--token TOKEN | --token-file PATH)
              (--map SERVICE_ID=HOST:PORT ... | --service SERVICE_ID --target HOST:PORT)
              [--tls-ca PATH] [--tls-server-name NAME | --insecure]
+             [--max-stream-buffer-mib N] [--max-buffered-mib N] [--max-streams N]
 ```
 
 | Flag | Required | Meaning |
@@ -33,6 +34,9 @@ thirp-agent [--version] [--config PATH] --broker HOST:PORT (--token TOKEN | --to
 | `--tls-ca PATH` | no | PEM CA file. Omit to use the system CA bundle |
 | `--tls-server-name NAME` | no | SNI / hostname verification. Defaults to the host in `--broker` |
 | `--insecure` | no | Plaintext TCP. Rejected if combined with `--tls-ca` or `--tls-server-name` |
+| `--max-stream-buffer-mib N` | no | DATA queued for one stream's local service before that stream is reset (`1`..`1048576`, default 64). No per-stream flow control in protocol 1.0: an upload that runs this far ahead of a slow service fails instead of holding up other streams |
+| `--max-buffered-mib N` | no | DATA queued for all streams together; past it the stream with the largest backlog is reset (`1`..`1048576`, default 256) |
+| `--max-streams N` | no | Open streams (two threads each); further opens fail with `QUOTA_EXCEEDED` (`1`..`1048576`, default 128) |
 | `-h`, `--help` | no | Print usage and exit 0 |
 
 Exactly one of `--token` or `--token-file` is required (from the file, the flags, or both after merge). `--token-file` is the production path: the file is the raw secret (one line, no `TOKEN=PRINCIPAL` grammar). Do not put long-lived secrets on the command line. Group- or world-readable files print a warning.

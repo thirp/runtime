@@ -350,9 +350,14 @@ outbox_wait_stream_space :: proc(
 	if box == nil {
 		return false
 	}
-	deadline := time.now()
+	// No-progress semantics: the clock restarts whenever this stream's
+	// queue shrinks, so a slow but steady destination never trips it; only
+	// a stream that drained nothing for timeout is reset (timeout <= 0:
+	// wait while the destination is open).
+	progress_at := time.now()
 	sync.mutex_lock(&box.mutex)
 	defer sync.mutex_unlock(&box.mutex)
+	last_used := box.stream_bytes[stream_id]
 	for {
 		if box.closed {
 			return false
@@ -365,13 +370,19 @@ outbox_wait_stream_space :: proc(
 		if max_stream <= 0 || used + needed <= max_stream {
 			return true
 		}
-		remaining := timeout - time.since(deadline)
-		if remaining <= 0 {
-			return false
+		if used < last_used {
+			progress_at = time.now()
 		}
-		if !sync.cond_wait_with_timeout(&box.cond, &box.mutex, remaining) {
-			return false
+		last_used = used
+		slice := OUTBOX_WAIT_SLICE
+		if timeout > 0 {
+			remaining := timeout - time.since(progress_at)
+			if remaining <= 0 {
+				return false
+			}
+			slice = min(slice, remaining)
 		}
+		_ = sync.cond_wait_with_timeout(&box.cond, &box.mutex, slice)
 	}
 }
 

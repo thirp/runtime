@@ -207,6 +207,10 @@ connection_tls_accept :: proc(
 	if conn == nil || conn.closed || ctx == nil || ctx.ctx == nil {
 		return .Tls
 	}
+	if !conn_io_enter(conn) {
+		return .Tls
+	}
+	defer conn_io_exit(conn)
 	openssl_ensure_init()
 	ERR_clear_error()
 	ssl := SSL_new(ctx.ctx)
@@ -358,6 +362,9 @@ tls_connection_read :: proc(conn: ^Connection, dst: []u8) -> (n: int, err: Trans
 		}
 		rc := SSL_read(conn.tls.ssl, raw_data(dst), c.int(to_read))
 		ssl_err := SSL_get_error(conn.tls.ssl, rc)
+		if hook := sync.atomic_load(&conn.tls_read_hook); hook != nil {
+			(TlsReadHook)(hook)(conn)
+		}
 		sync.mutex_unlock(&conn.tls.mutex)
 		if rc > 0 {
 			return int(rc), .None
@@ -407,6 +414,8 @@ tls_connection_write :: proc(conn: ^Connection, src: []u8) -> TransportError {
 	return .None
 }
 
+// Only from conn_release_fd (no operation in flight) or before the
+// connection is shared.
 tls_connection_close :: proc(conn: ^Connection) {
 	if conn.tls == nil {
 		return

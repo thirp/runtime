@@ -605,11 +605,18 @@ http_origin_echo_request :: proc(fx: ^HttpOriginFixture, conn: ^trans.Connection
 	if !ok {
 		return
 	}
-	method, target, host, pok := http_origin_parse_request_head(headers)
+	method_raw, target_raw, host_raw, pok := http_origin_parse_request_head(headers)
 	if !pok {
 		return
 	}
 	clen := http_content_length(headers)
+	// These point into buf, which the body loop below may reallocate.
+	method := strings.clone(method_raw)
+	defer delete(method)
+	target := strings.clone(target_raw)
+	defer delete(target)
+	host := strings.clone(host_raw)
+	defer delete(host)
 	for len(buf) - body_off < clen {
 		tmp: [1024]u8
 		n, err := trans.connection_read(conn, tmp[:])
@@ -640,12 +647,22 @@ http_origin_keep_alive :: proc(fx: ^HttpOriginFixture, conn: ^trans.Connection) 
 			delete(buf)
 			return
 		}
-		method, target, host, pok := http_origin_parse_request_head(headers)
+		method_raw, target_raw, host_raw, pok := http_origin_parse_request_head(headers)
 		if !pok {
 			delete(buf)
 			return
 		}
 		clen := http_content_length(headers)
+		close := http_header_has_close(headers)
+		// These point into buf, which the body loop below may reallocate.
+		method := strings.clone(method_raw)
+		target := strings.clone(target_raw)
+		host := strings.clone(host_raw)
+		defer {
+			delete(method)
+			delete(target)
+			delete(host)
+		}
 		for len(buf) - body_off < clen {
 			tmp: [1024]u8
 			n, err := trans.connection_read(conn, tmp[:])
@@ -659,7 +676,6 @@ http_origin_keep_alive :: proc(fx: ^HttpOriginFixture, conn: ^trans.Connection) 
 		}
 		body := buf[body_off:body_off + clen]
 		http_origin_record(fx, method, target, host, body)
-		close := http_header_has_close(headers)
 		_ = http_origin_write_echo(conn, method, target, host, body, !close)
 		delete(buf)
 		if close {

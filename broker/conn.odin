@@ -1116,7 +1116,7 @@ conn_enqueue_stream :: proc(
 			if box == nil {
 				return true
 			}
-			ok := outbox_wait_stream_space(box, stream_id, needed, h.server.session_timeout)
+			ok := outbox_wait_stream_space(box, stream_id, needed, h.server.stream_stall_timeout)
 			outbox_release(box)
 			if ok {
 				_, still := relay_lookup_stream(h.server, stream_id)

@@ -55,6 +55,10 @@ Server :: struct {
 	register_rate:             RateLimitConfig,
 	connect_rate:              RateLimitConfig,
 	stream_idle_timeout:       time.Duration,
+	// No-progress limit while a session reader waits on one stream's full
+	// queue (see outbox_wait_stream_space). <= 0 waits as long as the
+	// destination stays open. Odin-only; no C field.
+	stream_stall_timeout:      time.Duration,
 	rate_limits:               RateLimiters,
 	limits_mutex:              sync.Mutex,
 	ip_conns:                  map[IpKey]int,
@@ -88,6 +92,7 @@ server_init :: proc(
 	_ = policy_init(&server.policy, allocator)
 	server.heartbeat_interval = DEFAULT_HEARTBEAT_INTERVAL
 	server.session_timeout = DEFAULT_SESSION_TIMEOUT
+	server.stream_stall_timeout = DEFAULT_STREAM_STALL_TIMEOUT
 	server.max_stream_buffer = DEFAULT_MAX_STREAM_BUFFER
 	server.max_connection_buffer = DEFAULT_MAX_CONNECTION_BUFFER
 	server.max_streams_per_session = DEFAULT_MAX_STREAMS_PER_SESSION

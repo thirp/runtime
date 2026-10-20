@@ -10,6 +10,7 @@ import ver "../version"
 import "core:fmt"
 import "core:net"
 import "core:os"
+import "core:strconv"
 import "core:strings"
 
 ServiceMapping :: struct {
@@ -21,7 +22,8 @@ usage :: proc() {
 	fmt.eprintf(
 		"usage: thirp-agent [--version] [--config PATH] --broker HOST:PORT (--token TOKEN | --token-file PATH)\n" +
 		"       (--map SERVICE_ID=HOST:PORT ... | --service SERVICE_ID --target HOST:PORT)\n" +
-		"       [--tls-ca PATH] [--tls-server-name NAME | --insecure]\n",
+		"       [--tls-ca PATH] [--tls-server-name NAME | --insecure]\n" +
+		"       [--max-stream-buffer-mib N] [--max-buffered-mib N] [--max-streams N]\n",
 	)
 }
 
@@ -58,6 +60,10 @@ run :: proc() -> int {
 	config_path := ""
 	mappings: [dynamic]ServiceMapping
 	defer delete(mappings)
+	// Agent buffering limits; 0 keeps the library default.
+	max_stream_mib := 0
+	max_buffered_mib := 0
+	max_streams := 0
 
 	args := os.args[1:]
 	for i := 0; i < len(args); i += 1 {
@@ -149,6 +155,27 @@ run :: proc() -> int {
 				return 1
 			}
 			append(&mappings, ServiceMapping{service = sid, target = dest})
+		case "--max-stream-buffer-mib", "--max-buffered-mib", "--max-streams":
+			flag := args[i]
+			if i + 1 >= len(args) {
+				fmt.eprintf("%s requires N\n", flag)
+				usage()
+				return 1
+			}
+			i += 1
+			v, vok := strconv.parse_int(args[i], 10)
+			if !vok || v < 1 || v > 1 << 20 {
+				fmt.eprintf("%s must be an integer in 1..1048576\n", flag)
+				return 1
+			}
+			switch flag {
+			case "--max-stream-buffer-mib":
+				max_stream_mib = v
+			case "--max-buffered-mib":
+				max_buffered_mib = v
+			case:
+				max_streams = v
+			}
 		case "--version":
 			line := ver.version_line("thirp-agent")
 			fmt.printf("%s\n", line)
@@ -323,6 +350,9 @@ run :: proc() -> int {
 			tls_server_name = tls_server_name,
 			implementation  = impl,
 			logger          = &logger,
+			max_stream_buffer  = max_stream_mib * 1024 * 1024,
+			max_buffered_bytes = max_buffered_mib * 1024 * 1024,
+			max_streams        = max_streams,
 		},
 	)
 	if aerr != .None {

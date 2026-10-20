@@ -1,7 +1,10 @@
 package broker
 
 import proto "../protocol"
+import "core:sync"
 import "core:testing"
+import "core:thread"
+import "core:time"
 
 SID_A :: proto.StreamId(1)
 SID_B :: proto.StreamId(2)
@@ -115,4 +118,69 @@ test_outbox_global_limit_rejects_data :: proc(t: ^testing.T) {
 	testing.expect_value(t, outbox_enqueue(box, .Data, SID_A, []u8{1, 2, 3, 4}), OutboxEnqueueError.None)
 	testing.expect_value(t, outbox_enqueue(box, .Data, SID_B, []u8{5}), OutboxEnqueueError.GlobalLimit)
 	testing.expect_value(t, box.total_bytes, 4)
+}
+
+SlowDrain :: struct {
+	box:   ^ConnOutbox,
+	n:     int,
+	every: time.Duration,
+}
+
+slow_drain :: proc(d: ^SlowDrain) {
+	for _ in 0 ..< d.n {
+		time.sleep(d.every)
+		f, ok := outbox_take_next(d.box)
+		if ok {
+			delete(f.payload, d.box.allocator)
+		}
+		sync.mutex_lock(&d.box.mutex)
+		sync.cond_broadcast(&d.box.cond)
+		sync.mutex_unlock(&d.box.mutex)
+	}
+}
+
+// Theo's review: a slow but steady destination must not be reset. The wait
+// for room in a full stream queue is a no-progress limit: it restarts each
+// time the queue drains. Base: one fixed deadline (session_timeout), so a
+// drain slower than that in total reset a healthy stream.
+@(test)
+test_outbox_wait_stream_space_survives_slow_steady_drain :: proc(t: ^testing.T) {
+	server: Server
+	box := make_test_outbox(&server, 4, 64)
+	defer outbox_release(box)
+	for i in 0 ..< 4 {
+		testing.expect_value(t, outbox_enqueue(box, .Data, SID_A, []u8{u8(i)}), OutboxEnqueueError.None)
+	}
+	d := SlowDrain{box = box, n = 4, every = 150 * time.Millisecond}
+	th := thread.create_and_start_with_poly_data(&d, slow_drain, init_context = context)
+	start := time.now()
+	// Needs the whole queue drained (~600 ms); no single gap exceeds 300 ms.
+	ok := outbox_wait_stream_space(box, SID_A, 4, 300 * time.Millisecond)
+	elapsed := time.since(start)
+	thread.join(th)
+	thread.destroy(th)
+	testing.expect(t, ok, "steady drain was treated as a stall")
+	testing.expect(t, elapsed >= 500 * time.Millisecond)
+}
+
+@(test)
+test_outbox_wait_stream_space_gives_up_without_progress :: proc(t: ^testing.T) {
+	server: Server
+	box := make_test_outbox(&server, 4, 64)
+	defer {
+		for {
+			f, ok := outbox_take_next(box)
+			if !ok {
+				break
+			}
+			delete(f.payload)
+		}
+		outbox_release(box)
+	}
+	testing.expect_value(t, outbox_enqueue(box, .Data, SID_A, []u8{1, 2, 3, 4}), OutboxEnqueueError.None)
+	start := time.now()
+	ok := outbox_wait_stream_space(box, SID_A, 1, 300 * time.Millisecond)
+	elapsed := time.since(start)
+	testing.expect(t, !ok)
+	testing.expect(t, elapsed >= 300 * time.Millisecond && elapsed < 2 * time.Second)
 }

@@ -49,8 +49,15 @@ register_service :: proc(agent: ^Agent, service_id: proto.ServiceId, target: Loc
 
 	agent.pending = .Register
 	agent.pending_err = .None
+	// Hold a reference: the session thread may destroy live_conn once we unlock.
 	conn := agent.live_conn
+	if conn != nil && !trans.connection_acquire(conn) {
+		conn = nil
+	}
 	sync.mutex_unlock(&agent.mutex)
+	defer if conn != nil {
+		trans.connection_release(conn)
+	}
 
 	payload, perr := proto.encode_register(proto.Register{service_id = service_id})
 	if perr != .None {
@@ -117,7 +124,13 @@ unregister_service :: proc(agent: ^Agent, service_id: proto.ServiceId) -> AgentE
 	agent.pending = .Unregister
 	agent.pending_err = .None
 	conn := agent.live_conn
+	if conn != nil && !trans.connection_acquire(conn) {
+		conn = nil
+	}
 	sync.mutex_unlock(&agent.mutex)
+	defer if conn != nil {
+		trans.connection_release(conn)
+	}
 	delete(string(key))
 
 	if conn == nil {

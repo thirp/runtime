@@ -44,3 +44,8 @@ connection_set_recv_lowat_impl :: proc(conn: ^Connection, n: int) -> TransportEr
 	}
 	return .None
 }
+
+// shutdown(SHUT_RDWR) already wakes blocked recv/send/poll here.
+connection_abort_io_impl :: proc(conn: ^Connection) {
+	_ = conn
+}

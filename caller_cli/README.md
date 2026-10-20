@@ -19,6 +19,7 @@ odin build caller_cli -out:thirp-connect
 ```text
 thirp-connect [--version] --broker HOST:PORT (--token TOKEN | --token-file PATH) --service SERVICE_ID --listen HOST:PORT
                [--tls-ca PATH] [--tls-server-name NAME | --insecure]
+               [--stream-stall-timeout SECONDS] [--max-stream-buffer-mib N]
 ```
 
 | Flag | Required | Meaning |
@@ -32,6 +33,8 @@ thirp-connect [--version] --broker HOST:PORT (--token TOKEN | --token-file PATH)
 | `--tls-ca PATH` | no | PEM CA file. Omit to use the system CA bundle |
 | `--tls-server-name NAME` | no | SNI / hostname verification. Defaults to the host in `--broker` |
 | `--insecure` | no | Plaintext TCP. Rejected if combined with `--tls-ca` or `--tls-server-name` |
+| `--stream-stall-timeout SECONDS` | no | A write to a local client that takes no bytes this long fails and ends that stream (default `30`, `0` = never). See Behavior |
+| `--max-stream-buffer-mib N` | no | Download data held for one local client that it has not read yet; a stream further behind is reset at once (`1`..`1048576`, default `8`). See Behavior |
 | `-h`, `--help` | no | Print usage and exit 0 |
 
 Exactly one of `--token` or `--token-file` is required. `--token-file` is the production path: the file is the raw secret (one line, no `TOKEN=PRINCIPAL` grammar). Do not put long-lived secrets on the command line. Group- or world-readable files print a warning.
@@ -50,12 +53,22 @@ It must match the id the agent registered. Case matters: `demo/echo` and `Demo/e
 
 ## Behavior
 
-1. Dial the broker once (TLS unless `--insecure`).
-2. `HELLO` as role Caller, then `AUTHENTICATE` with the bearer token.
-3. Listen on `--listen`.
-4. On each accept, `CONNECT` `--service` on the existing broker session and pump 16 KiB chunks between the local TCP socket and the relay stream.
+1. Listen on `--listen`. A busy or unusable address exits 1 with `listen failed on HOST:PORT: <reason>` (for example `address already in use`) before any broker session is opened.
+2. Dial the broker once (TLS unless `--insecure`).
+3. `HELLO` as role Caller, then `AUTHENTICATE` with the bearer token.
+4. On each accept, a per-connection thread sends `CONNECT` for `--service` on the existing broker session and pumps 16 KiB chunks between the local TCP socket and the relay stream. The accept loop never waits on a `CONNECT`.
 
 Accepts are concurrent. Closing one local connection RESET/CLOSE that stream only; others stay up.
+
+Stream ends:
+
+- Local EOF is sent as `HALF_CLOSE`; the response direction stays open until the peer finishes.
+- Peer `HALF_CLOSE` is passed to the client as EOF (`shutdown(SHUT_WR)`).
+- When both directions are done, or on the peer's `CLOSE`/`RESET`, the local socket is closed. After an early `CLOSE`/`RESET` (for example a server that answers 403 and closes while the client is still uploading), the rest of the client's request is drained for up to 2 s so the response is not lost to a TCP reset, then the socket is shut down both ways.
+- A slow client or server only slows its own stream. Each stream has its own buffer: 8 MiB in thirp-connect (download direction) and 64 MiB in the Agent (upload direction, `AgentConfig.max_stream_buffer`; 256 MiB for all streams together).
+- A write to the local client fails only when the client took no bytes for `--stream-stall-timeout` seconds (default 30; `0` = never).
+- The protocol has no per-stream flow control, so no buffer ever makes the session wait. **A slow download past 8 MiB is reset:** a client that reads slower than the service sends (or pauses, like a pager) loses its stream once it is `--max-stream-buffer-mib` behind. Likewise in the Agent, an upload whose backlog would pass 64 MiB is reset. Either way the other streams, and other callers of the same service, are unaffected. See the CHANGELOG trade-off note.
+- At most 256 local connections are open at once; more are closed on accept with a message on stderr.
 
 A failed initial broker dial exits nonzero. After listen starts, a dead broker session closes in-flight local sockets. The caller library reconnects the broker session with the same backoff as the agent (250 ms … 15 s). Later accepts `CONNECT` on the new session. Lost streams are not resumed. `RATE_LIMITED` on authenticate or CONNECT is transient, not a bad token.
 

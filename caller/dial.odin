@@ -15,12 +15,10 @@ dial :: proc(c: ^Caller, service_id: proto.ServiceId) -> (^Conn, CallerError) {
 		return nil, .InvalidServiceId
 	}
 
-	stream, aerr := new(Conn)
-	if aerr != .None {
+	stream := conn_new(c)
+	if stream == nil {
 		return nil, .OutOfMemory
 	}
-	stream.caller = c
-	stream.inbound = make([dynamic]u8)
 
 	start := time.now()
 	timeout := c.config.dial_timeout
@@ -28,8 +26,7 @@ dial :: proc(c: ^Caller, service_id: proto.ServiceId) -> (^Conn, CallerError) {
 	for (c.pending != nil || !c.connected) && !sync.atomic_load(&c.stop) {
 		if dial_deadline_hit(start, timeout) {
 			sync.mutex_unlock(&c.mutex)
-			delete(stream.inbound)
-			free(stream)
+			conn_release(stream)
 			return nil, .Timeout
 		}
 		if timeout > 0 {
@@ -42,8 +39,7 @@ dial :: proc(c: ^Caller, service_id: proto.ServiceId) -> (^Conn, CallerError) {
 	}
 	if sync.atomic_load(&c.stop) {
 		sync.mutex_unlock(&c.mutex)
-		delete(stream.inbound)
-		free(stream)
+		conn_release(stream)
 		return nil, .Closed
 	}
 	c.pending = stream
@@ -59,8 +55,7 @@ dial :: proc(c: ^Caller, service_id: proto.ServiceId) -> (^Conn, CallerError) {
 		}
 		sync.cond_broadcast(&c.cond)
 		sync.mutex_unlock(&c.mutex)
-		delete(stream.inbound)
-		free(stream)
+		conn_release(stream)
 		return nil, .Internal
 	}
 	ok := caller_write(broker, .Connect, payload)
@@ -72,8 +67,7 @@ dial :: proc(c: ^Caller, service_id: proto.ServiceId) -> (^Conn, CallerError) {
 		}
 		sync.cond_broadcast(&c.cond)
 		sync.mutex_unlock(&c.mutex)
-		delete(stream.inbound)
-		free(stream)
+		conn_release(stream)
 		return nil, .Transport
 	}
 
@@ -86,8 +80,7 @@ dial :: proc(c: ^Caller, service_id: proto.ServiceId) -> (^Conn, CallerError) {
 			}
 			sync.cond_broadcast(&c.cond)
 			sync.mutex_unlock(&c.mutex)
-			delete(stream.inbound)
-			free(stream)
+			conn_release(stream)
 			return nil, .Timeout
 		}
 		if timeout > 0 {
@@ -101,8 +94,7 @@ dial :: proc(c: ^Caller, service_id: proto.ServiceId) -> (^Conn, CallerError) {
 	err := c.pending_err
 	sync.mutex_unlock(&c.mutex)
 	if err != .None {
-		delete(stream.inbound)
-		free(stream)
+		conn_release(stream)
 		return nil, err
 	}
 	return stream, .None

@@ -101,9 +101,13 @@ test_agent_reconnect_restores_registration :: proc(t: ^testing.T) {
 sync_close_live :: proc(agent: ^Agent) {
 	sync.mutex_lock(&agent.mutex)
 	conn := agent.live_conn
+	if conn != nil && !trans.connection_acquire(conn) {
+		conn = nil
+	}
 	sync.mutex_unlock(&agent.mutex)
 	if conn != nil {
 		trans.connection_close(conn)
+		trans.connection_release(conn)
 	}
 }
 

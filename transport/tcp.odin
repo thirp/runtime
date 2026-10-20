@@ -83,6 +83,54 @@ connection_alloc :: proc(socket: net.TCP_Socket, allocator := context.allocator)
 	return conn, .None
 }
 
+// Start an operation that touches conn.socket or conn.tls. False once close
+// has started (the fd may be released at any moment) or once the struct is
+// being freed. A true return also holds a reference, so neither the fd nor
+// the Connection itself can go away while the operation runs, even if the
+// owner destroys it from another thread. Pair every true with conn_io_exit.
+@(private)
+conn_io_enter :: proc(conn: ^Connection) -> bool {
+	if !connection_acquire(conn) {
+		return false
+	}
+	sync.atomic_add(&conn.io_inflight, 1)
+	if sync.atomic_load(&conn.close_started) {
+		conn_io_exit(conn)
+		return false
+	}
+	return true
+}
+
+// End an operation. The last one out after close started releases the fd;
+// dropping the operation's reference may then free the Connection.
+@(private)
+conn_io_exit :: proc(conn: ^Connection) {
+	prev := sync.atomic_sub(&conn.io_inflight, 1)
+	if prev == 1 && sync.atomic_load(&conn.close_started) {
+		conn_release_fd(conn)
+	}
+	connection_release(conn)
+}
+
+@(private)
+conn_closing :: proc(conn: ^Connection) -> bool {
+	return sync.atomic_load(&conn.close_started)
+}
+
+// Free TLS and close the fd/handle. Runs once, only when no operation holds
+// io_inflight, so nothing can still be using either.
+@(private)
+conn_release_fd :: proc(conn: ^Connection) {
+	if _, won := sync.atomic_compare_exchange_strong(&conn.fd_released, false, true); !won {
+		return
+	}
+	tls_connection_close(conn)
+	if conn.socket != 0 {
+		net.close(conn.socket)
+		conn.socket = 0
+	}
+}
+
 connection_acquire :: proc(conn: ^Connection) -> bool {
 	if conn == nil {
 		return false
@@ -137,10 +185,21 @@ connection_read :: proc(conn: ^Connection, dst: []u8) -> (n: int, err: Transport
 	if conn == nil || conn.closed {
 		return 0, .Closed
 	}
+	if !conn_io_enter(conn) {
+		return 0, .Closed
+	}
+	defer conn_io_exit(conn)
 	if conn.tls != nil {
 		return tls_connection_read(conn, dst)
 	}
-	bytes_read, recv_err := net.recv_tcp(conn.socket, dst)
+	sock := conn.socket
+	if hook := sync.atomic_load(&conn.read_hook); hook != nil {
+		(IoHook)(hook)(conn)
+	}
+	bytes_read, recv_err := net.recv_tcp(sock, dst)
+	for recv_err == .Interrupted && bytes_read == 0 && !conn_closing(conn) {
+		bytes_read, recv_err = net.recv_tcp(sock, dst)
+	}
 	err = map_recv_error(bytes_read, recv_err)
 	if err == .Closed {
 		conn.closed = true
@@ -159,6 +218,10 @@ connection_peek :: proc(conn: ^Connection, dst: []u8) -> (n: int, err: Transport
 	if len(dst) == 0 {
 		return 0, .None
 	}
+	if !conn_io_enter(conn) {
+		return 0, .Closed
+	}
+	defer conn_io_exit(conn)
 	return connection_peek_impl(conn, dst)
 }
 
@@ -166,6 +229,10 @@ connection_set_recv_lowat :: proc(conn: ^Connection, n: int) -> TransportError {
 	if conn == nil || conn.closed {
 		return .Closed
 	}
+	if !conn_io_enter(conn) {
+		return .Closed
+	}
+	defer conn_io_exit(conn)
 	return connection_set_recv_lowat_impl(conn, n)
 }
 
@@ -173,15 +240,39 @@ connection_write :: proc(conn: ^Connection, src: []u8) -> TransportError {
 	if conn == nil || conn.closed {
 		return .Closed
 	}
+	// Enter before locking so the reference outlives the unlock (defers run
+	// in reverse: unlock, then exit).
+	if !conn_io_enter(conn) {
+		return .Closed
+	}
+	defer conn_io_exit(conn)
 	sync.mutex_lock(&conn.write_mutex)
 	defer sync.mutex_unlock(&conn.write_mutex)
-	if conn.closed {
+	if conn.closed || conn_closing(conn) {
 		return .Closed
 	}
 	if conn.tls != nil {
 		return tls_connection_write(conn, src)
 	}
-	_, send_err := net.send_tcp(conn.socket, src)
+	// A signal (EINTR) must not end the stream: resume after the bytes the
+	// interrupted send already took.
+	sock := conn.socket
+	if hook := sync.atomic_load(&conn.write_hook); hook != nil {
+		(IoHook)(hook)(conn)
+	}
+	off := 0
+	send_err: net.TCP_Send_Error
+	for {
+		sent: int
+		sent, send_err = net.send_tcp(sock, src[off:])
+		off += sent
+		if send_err != .Interrupted || off >= len(src) || conn_closing(conn) {
+			break
+		}
+	}
+	if send_err == .Interrupted {
+		send_err = .None
+	}
 	err := map_send_error(send_err)
 	if err == .Closed {
 		conn.closed = true
@@ -193,6 +284,10 @@ connection_set_recv_timeout :: proc(conn: ^Connection, timeout: time.Duration) -
 	if conn == nil || conn.closed {
 		return .Closed
 	}
+	if !conn_io_enter(conn) {
+		return .Closed
+	}
+	defer conn_io_exit(conn)
 	conn.recv_timeout = timeout
 	opt_err := net.set_option(conn.socket, .Receive_Timeout, timeout)
 	if opt_err != .None {
@@ -209,6 +304,10 @@ connection_set_send_timeout :: proc(conn: ^Connection, timeout: time.Duration) -
 	if conn == nil || conn.closed {
 		return .Closed
 	}
+	if !conn_io_enter(conn) {
+		return .Closed
+	}
+	defer conn_io_exit(conn)
 	conn.send_timeout = timeout
 	opt_err := net.set_option(conn.socket, .Send_Timeout, timeout)
 	if opt_err != .None {
@@ -217,22 +316,40 @@ connection_set_send_timeout :: proc(conn: ^Connection, timeout: time.Duration) -
 	return .None
 }
 
+// Close the connection. Safe against concurrent IO on other threads: marks it
+// closed, shuts the socket down so blocked send/recv/poll return (and aborts
+// pending Winsock IO), and leaves releasing the fd and TLS session to the
+// last operation still inside (or does it here when none is). The fd number
+// therefore cannot be reused while any thread might still send or recv on it.
 connection_close :: proc(conn: ^Connection) {
 	if conn == nil {
 		return
 	}
-	conn.closed = true
-	tls_connection_close(conn)
-	if conn.socket != 0 {
-		net.close(conn.socket)
-		conn.socket = 0
+	sync.atomic_store(&conn.closed, true)
+	if !connection_acquire(conn) {
+		return // already being freed; nothing left to close
 	}
+	sync.atomic_add(&conn.io_inflight, 1) // keep the fd while we shut it down
+	if _, won := sync.atomic_compare_exchange_strong(&conn.close_started, false, true); won {
+		// Only shut down when another thread is inside an operation; with
+		// none, the fd is closed right away exactly as before (same FIN/RST
+		// the peer always saw). Anyone entering from here on backs out.
+		if conn.socket != 0 && sync.atomic_load(&conn.io_inflight) > 1 {
+			_ = net.shutdown(conn.socket, .Both)
+			connection_abort_io_impl(conn)
+		}
+	}
+	conn_io_exit(conn)
 }
 
 connection_shutdown_write :: proc(conn: ^Connection) -> TransportError {
 	if conn == nil || conn.closed {
 		return .Closed
 	}
+	if !conn_io_enter(conn) {
+		return .Closed
+	}
+	defer conn_io_exit(conn)
 	err := net.shutdown(conn.socket, .Send)
 	if err != .None {
 		return .Network
@@ -240,13 +357,31 @@ connection_shutdown_write :: proc(conn: ^Connection) -> TransportError {
 	return .None
 }
 
+// Wait until a read would not block (data, EOF or error) or timeout passes.
+// Lets a reader poll a stop flag instead of relying on shutdown() from
+// another thread to wake a blocking recv, which Windows does not promise.
+connection_wait_readable :: proc(conn: ^Connection, timeout: time.Duration) -> TransportError {
+	if conn == nil || conn.closed {
+		return .Closed
+	}
+	if !conn_io_enter(conn) {
+		return .Closed
+	}
+	defer conn_io_exit(conn)
+	return tls_wait_socket_impl(conn, false, timeout)
+}
+
 // Wake a reader or poller on another thread. Does not free TLS or the fd;
 // the owning thread still runs connection_destroy.
 connection_shutdown_both :: proc(conn: ^Connection) {
-	if conn == nil || conn.socket == 0 {
+	if conn == nil || !conn_io_enter(conn) {
 		return
 	}
-	conn.closed = true
+	defer conn_io_exit(conn)
+	if conn.socket == 0 {
+		return
+	}
+	sync.atomic_store(&conn.closed, true)
 	_ = net.shutdown(conn.socket, .Both)
 }
 
@@ -295,6 +430,17 @@ listener_set_recv_timeout :: proc(l: ^Listener, timeout: time.Duration) -> Trans
 		return .Network
 	}
 	return .None
+}
+
+// Wait until accept would not block, or timeout passes. SO_RCVTIMEO bounds
+// accept() on Linux but not on Windows, so a loop that must notice a stop
+// flag waits here first instead of relying on listener_set_recv_timeout.
+listener_wait_acceptable :: proc(l: ^Listener, timeout: time.Duration) -> TransportError {
+	if l == nil || l.closed {
+		return .Closed
+	}
+	tmp := Connection{socket = l.socket}
+	return tls_wait_socket_impl(&tmp, false, timeout)
 }
 
 listener_accept :: proc(l: ^Listener, allocator := context.allocator) -> (^Connection, TransportError) {
