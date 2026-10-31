@@ -23,7 +23,7 @@ thirp-agent [--version] [--config PATH] --broker HOST:PORT (--token TOKEN | --to
 
 | Flag | Required | Meaning |
 |---|---|---|
-| `--version` | no | Print project version and protocol 1.0, then exit 0 |
+| `--version` | no | Print project version, build commit and protocol 1.0, then exit 0 |
 | `--config PATH` | no | Line-oriented `key = value` file. Flags override. May be set once |
 | `--broker HOST:PORT` | yes | Broker address. IP or DNS name; DNS is resolved at start |
 | `--token TOKEN` | one of | Bearer token (must match a broker credential). Development convenience |

@@ -3,11 +3,14 @@ package connect
 import ag "../../agent"
 import auth "../../auth"
 import brk "../../broker"
+import cl "../../caller"
+import log "../../logging"
 import proto "../../protocol"
 import trans "../../transport"
 import "core:fmt"
 import "core:net"
 import "core:os"
+import "core:strconv"
 import "core:strings"
 import "core:sync"
 import "core:testing"
@@ -18,6 +21,10 @@ T_TOKEN_HOST :: "connect-host-test-token"
 T_TOKEN_CALLER :: "connect-caller-test-token"
 T_SERVICE :: "demo/connect"
 
+// Same SAN as transport/testdata (IP:127.0.0.1). Test only.
+CONNECT_TEST_CERT :: string(#load("../../transport/testdata/test_server.crt"))
+CONNECT_TEST_KEY :: string(#load("../../transport/testdata/test_server.key"))
+
 Fixture :: struct {
 	reg:      brk.Registry,
 	store:    auth.StaticTokenAuth,
@@ -26,6 +33,8 @@ Fixture :: struct {
 	agent:    ag.Agent,
 	agent_th: ^thread.Thread,
 	broker:   string,
+	tls_cert: string,
+	tls_key:  string,
 }
 
 // Upstream modes, picked by the first byte:
@@ -44,9 +53,11 @@ Upstream :: struct {
 	ln:          trans.Listener,
 	th:          ^thread.Thread,
 	live:        int,
+	stopped:     bool, // atomic: accept loop has returned
 	closed_seen: int, // atomic
 	waiting:     int, // atomic
 	release:     bool, // atomic
+	drop:        bool, // atomic: 'X' closes early
 }
 
 // Every bulk test writer fills its buffers with its own byte, so bytes that
@@ -86,6 +97,10 @@ fill_bytes :: proc(buf: []u8, b: u8) {
 }
 
 SLOW_CHUNK :: 16 * 1024
+// Field POST body. Sequential storms of this size are what stuck the caller
+// bridge and the agent origin socket.
+POST_BODY :: 46 * 1024
+POST_STORM_N :: 2000
 X_HOLD :: 12 * time.Second
 SLOW_TICK :: 50 * time.Millisecond
 // Upload size for the slow-sink replay. The default (8 MB, ~25 s) is past
@@ -95,13 +110,27 @@ REPLAY_UPLOAD_MB :: #config(THIRP_REPLAY_UPLOAD_MB, 8)
 
 RESPONSE_403 :: "HTTP/1.1 403 Forbidden\r\nContent-Length: 9\r\nConnection: close\r\n\r\nforbidden"
 
-fixture_start :: proc(t: ^testing.T, fx: ^Fixture, agent_cfg: ag.AgentConfig = {}) -> bool {
+fixture_start :: proc(t: ^testing.T, fx: ^Fixture, agent_cfg: ag.AgentConfig = {}, use_tls := false) -> bool {
 	testing.expect_value(t, brk.registry_init(&fx.reg), brk.RegistryError.None)
 	testing.expect_value(t, auth.auth_init(&fx.store), auth.AuthError.None)
 	testing.expect_value(t, auth.auth_add_token(&fx.store, T_TOKEN_HOST, "host-a"), auth.AuthError.None)
 	testing.expect_value(t, auth.auth_add_token(&fx.store, T_TOKEN_CALLER, "client-a"), auth.AuthError.None)
 	brk.server_init(&fx.server, &fx.reg, auth.static_token_authenticator(&fx.store))
 	brk.server_disable_test_hardening(&fx.server)
+	if use_tls && !fixture_enable_tls(t, fx) {
+		brk.server_destroy(&fx.server)
+		auth.auth_destroy(&fx.store)
+		brk.registry_destroy(&fx.reg)
+		if len(fx.tls_cert) > 0 {
+			_ = os.remove(fx.tls_cert)
+			delete(fx.tls_cert)
+		}
+		if len(fx.tls_key) > 0 {
+			_ = os.remove(fx.tls_key)
+			delete(fx.tls_key)
+		}
+		return false
+	}
 	// Heartbeat well inside the session timeout, as in production (15 s /
 	// 45 s). Equal values let an idle caller session expire before its ping
 	// went out, which the long slow-upload replay hits.
@@ -109,6 +138,17 @@ fixture_start :: proc(t: ^testing.T, fx: ^Fixture, agent_cfg: ag.AgentConfig = {
 	fx.server.session_timeout = 30 * time.Second
 	if brk.server_listen(&fx.server, trans.loopback_endpoint(0)) != .None {
 		testing.expect(t, false, "broker listen")
+		brk.server_destroy(&fx.server)
+		auth.auth_destroy(&fx.store)
+		brk.registry_destroy(&fx.reg)
+		if len(fx.tls_cert) > 0 {
+			_ = os.remove(fx.tls_cert)
+			delete(fx.tls_cert)
+		}
+		if len(fx.tls_key) > 0 {
+			_ = os.remove(fx.tls_key)
+			delete(fx.tls_key)
+		}
 		return false
 	}
 	brk.server_start(&fx.server)
@@ -134,7 +174,7 @@ fixture_start :: proc(t: ^testing.T, fx: ^Fixture, agent_cfg: ag.AgentConfig = {
 	sid, _ := proto.make_service_id(T_SERVICE)
 	testing.expect_value(
 		t,
-		ag.agent_init(&fx.agent, fixture_agent_config(agent_cfg, bep)),
+		ag.agent_init(&fx.agent, fixture_agent_config(agent_cfg, bep, fx.tls_cert)),
 		ag.AgentError.None,
 	)
 	testing.expect_value(t, ag.register_service(&fx.agent, sid, ag.LocalTarget{address = uep}), ag.AgentError.None)
@@ -150,12 +190,52 @@ fixture_start :: proc(t: ^testing.T, fx: ^Fixture, agent_cfg: ag.AgentConfig = {
 	return true
 }
 
-fixture_agent_config :: proc(base: ag.AgentConfig, bep: net.Endpoint) -> ag.AgentConfig {
+fixture_agent_config :: proc(base: ag.AgentConfig, bep: net.Endpoint, tls_ca: string) -> ag.AgentConfig {
 	cfg := base
 	cfg.broker = bep
 	cfg.token = T_TOKEN_HOST
-	cfg.insecure = true
+	if len(tls_ca) == 0 {
+		cfg.insecure = true
+	} else {
+		cfg.insecure = false
+		cfg.tls_ca = tls_ca
+		cfg.tls_server_name = "127.0.0.1"
+	}
 	return cfg
+}
+
+connect_tls_temp_seq: int
+
+connect_write_temp_pem :: proc(label, contents: string) -> (path: string, ok: bool) {
+	n := sync.atomic_add(&connect_tls_temp_seq, 1)
+	// Pid as well as the counter: parallel test processes share /tmp and
+	// would otherwise overwrite cert-1.pem.
+	path = fmt.aprintf("/tmp/thirp-connect-tls-%d-%s-%d.pem", os.get_pid(), label, n)
+	err := os.write_entire_file(path, transmute([]u8)contents)
+	if err != nil {
+		delete(path)
+		return "", false
+	}
+	return path, true
+}
+
+fixture_enable_tls :: proc(t: ^testing.T, fx: ^Fixture) -> bool {
+	cert_ok: bool
+	fx.tls_cert, cert_ok = connect_write_temp_pem("cert", CONNECT_TEST_CERT)
+	testing.expect(t, cert_ok, "tls cert")
+	key_ok: bool
+	fx.tls_key, key_ok = connect_write_temp_pem("key", CONNECT_TEST_KEY)
+	testing.expect(t, key_ok, "tls key")
+	if !cert_ok || !key_ok {
+		return false
+	}
+	ctx, cerr := trans.tls_server_context_init(fx.tls_cert, fx.tls_key)
+	testing.expect_value(t, cerr, trans.TransportError.None)
+	if cerr != .None || ctx == nil {
+		return false
+	}
+	fx.server.tls_ctx = ctx
+	return true
 }
 
 agent_run :: proc(a: ^ag.Agent) {
@@ -183,6 +263,16 @@ fixture_stop :: proc(fx: ^Fixture) {
 	auth.auth_destroy(&fx.store)
 	brk.registry_destroy(&fx.reg)
 	delete(fx.broker)
+	if len(fx.tls_cert) > 0 {
+		_ = os.remove(fx.tls_cert)
+		delete(fx.tls_cert)
+		fx.tls_cert = ""
+	}
+	if len(fx.tls_key) > 0 {
+		_ = os.remove(fx.tls_key)
+		delete(fx.tls_key)
+		fx.tls_key = ""
+	}
 }
 
 UpConnArg :: struct {
@@ -191,6 +281,7 @@ UpConnArg :: struct {
 }
 
 upstream_accept :: proc(up: ^Upstream) {
+	defer sync.atomic_store(&up.stopped, true)
 	for {
 		conn, err := trans.listener_accept(&up.ln)
 		if err == .Timeout {
@@ -298,8 +389,11 @@ upstream_conn :: proc(arg: ^UpConnArg) {
 			time.sleep(20 * time.Millisecond)
 		}
 	case 'X':
-		// Never reads; holds the socket X_HOLD, then closes.
-		time.sleep(X_HOLD)
+		// Never reads; holds the socket X_HOLD, or until drop is set.
+		hold := time.now()
+		for !sync.atomic_load(&up.drop) && time.since(hold) < X_HOLD {
+			time.sleep(10 * time.Millisecond)
+		}
 	case 'W':
 		for {
 			_, rerr := trans.connection_read(conn, buf[:])
@@ -323,6 +417,19 @@ upstream_conn :: proc(arg: ^UpConnArg) {
 		}
 		reply := fmt.tprintf("got %d", total)
 		_ = trans.connection_write(conn, transmute([]u8)reply)
+	case 'Q':
+		// Field POST: read a fixed body, answer, close. The caller then
+		// half-closes or resets. Both orders have to drop the origin fd
+		// and the caller bridge.
+		total := 0
+		for total < POST_BODY {
+			m, rerr := trans.connection_read(conn, buf[:min(len(buf), POST_BODY - total)])
+			if rerr != .None {
+				return
+			}
+			total += m
+		}
+		_ = trans.connection_write(conn, transmute([]u8)string("OK"))
 	}
 }
 
@@ -370,10 +477,12 @@ read_all :: proc(conn: ^trans.Connection, out: ^[dynamic]u8) -> trans.TransportE
 	buf: [4096]u8
 	for {
 		n, err := trans.connection_read(conn, buf[:])
+		if n > 0 {
+			append(out, ..buf[:n])
+		}
 		if err != .None {
 			return err
 		}
-		append(out, ..buf[:n])
 	}
 }
 
@@ -489,9 +598,9 @@ test_connect_listen_port_in_use_fails_cleanly :: proc(t: ^testing.T) {
 
 // Bug 3a: the client half-closes after its request. Base turned local EOF
 // into a full CLOSE right away. Now EOF goes out as HALF_CLOSE, the bridge
-// waits for the peer's side, then ends and closes the local socket. (The
-// reply itself can still be lost today: the broker drops queued DATA when the
-// second HALF_CLOSE makes the stream terminal. Broker follow-up, not here.)
+// waits for the peer's side, then ends and closes the local socket. The
+// broker keeps frames already accepted across that second HALF_CLOSE, so
+// the reply is not dropped.
 @(test)
 test_connect_client_half_close_tears_down :: proc(t: ^testing.T) {
 	fx: Fixture
@@ -523,9 +632,7 @@ test_connect_client_half_close_tears_down :: proc(t: ^testing.T) {
 		got := make([dynamic]u8)
 		rerr := read_all(conn, &got)
 		testing.expect(t, rerr != .Timeout, "half-closed client never got EOF")
-		if len(got) > 0 {
-			testing.expect_value(t, string(got[:]), "got 99999")
-		}
+		testing.expect_value(t, string(got[:]), "got 99999")
 		delete(got)
 		trans.connection_destroy(conn)
 		testing.expect(t, wait_bridges_zero(&ctl, 3 * time.Second), "bridge left open after half-close")
@@ -1300,4 +1407,954 @@ test_connect_stop_with_reply_pending_returns :: proc(t: ^testing.T) {
 	thread.destroy(sth)
 	testing.expectf(t, stopped, "stop_connect still waiting after %v with a reply pending", elapsed)
 	fmt.printf("stop-with-reply-pending: stop_connect returned in %v (stopped=%v)\n", elapsed, stopped)
+}
+
+DialLogs :: struct {
+	mu:   sync.Mutex,
+	text: [dynamic]u8,
+}
+
+dial_logs: DialLogs
+
+dial_log_sink :: proc(text: string) {
+	sync.mutex_lock(&dial_logs.mu)
+	defer sync.mutex_unlock(&dial_logs.mu)
+	append(&dial_logs.text, ..transmute([]u8)text)
+}
+
+dial_log_text :: proc() -> string {
+	sync.mutex_lock(&dial_logs.mu)
+	defer sync.mutex_unlock(&dial_logs.mu)
+	return strings.clone(string(dial_logs.text[:]))
+}
+
+// Sockets this process holds whose local or remote TCP port is `port`.
+// CLOSE-WAIT still has an fd; TIME_WAIT does not. -1 off Linux.
+tcp_port_socket_count :: proc(port: int) -> int {
+	when ODIN_OS != .Linux {
+		return -1
+	}
+	inodes := self_socket_inodes()
+	defer delete(inodes)
+	return tcp_table_port_count("/proc/net/tcp", port, &inodes) + tcp_table_port_count("/proc/net/tcp6", port, &inodes)
+}
+
+self_socket_inodes :: proc() -> map[int]struct{} {
+	inodes := make(map[int]struct{})
+	when ODIN_OS != .Linux {
+		return inodes
+	}
+	dir, err := os.open("/proc/self/fd")
+	if err != nil {
+		return inodes
+	}
+	defer os.close(dir)
+	infos, rerr := os.read_directory(dir, -1, context.allocator)
+	if rerr != nil {
+		return inodes
+	}
+	defer os.file_info_slice_delete(infos, context.allocator)
+	for info in infos {
+		path := fmt.tprintf("/proc/self/fd/%s", info.name)
+		link, lerr := os.read_link(path, context.temp_allocator)
+		if lerr != nil {
+			continue
+		}
+		prefix := "socket:["
+		if !strings.has_prefix(link, prefix) || !strings.has_suffix(link, "]") {
+			continue
+		}
+		num := link[len(prefix) : len(link) - 1]
+		inode, ok := strconv.parse_int(num)
+		if ok && inode > 0 {
+			inodes[inode] = {}
+		}
+	}
+	return inodes
+}
+
+tcp_table_port_count :: proc(path: string, port: int, inodes: ^map[int]struct{}) -> int {
+	data, err := os.read_entire_file(path, context.allocator)
+	if err != nil {
+		return 0
+	}
+	defer delete(data)
+	n := 0
+	rest := string(data)
+	header := true
+	for len(rest) > 0 {
+		line := rest
+		if i := strings.index(rest, "\n"); i >= 0 {
+			line = rest[:i]
+			rest = rest[i + 1 :]
+		} else {
+			rest = ""
+		}
+		if header {
+			header = false
+			continue
+		}
+		fields: [12]string
+		nf := 0
+		i := 0
+		for i < len(line) && nf < len(fields) {
+			for i < len(line) && (line[i] == ' ' || line[i] == '\t') {
+				i += 1
+			}
+			if i >= len(line) {
+				break
+			}
+			start := i
+			for i < len(line) && line[i] != ' ' && line[i] != '\t' {
+				i += 1
+			}
+			fields[nf] = line[start:i]
+			nf += 1
+		}
+		if nf < 10 {
+			continue
+		}
+		inode, iok := strconv.parse_int(fields[9])
+		if !iok {
+			continue
+		}
+		if _, ours := inodes[inode]; !ours {
+			continue
+		}
+		if hex_port(fields[1]) == port || hex_port(fields[2]) == port {
+			n += 1
+		}
+	}
+	return n
+}
+
+hex_port :: proc(addr: string) -> int {
+	colon := strings.last_index(addr, ":")
+	if colon < 0 || colon + 1 >= len(addr) {
+		return -1
+	}
+	v, ok := strconv.parse_uint(addr[colon + 1 :], 16)
+	if !ok {
+		return -1
+	}
+	return int(v)
+}
+
+storm_read_ok :: proc(t: ^testing.T, conn: ^trans.Connection, loc := #caller_location) -> bool {
+	got := make([dynamic]u8, 0, 8)
+	defer delete(got)
+	buf: [64]u8
+	for !strings.contains(string(got[:]), "OK") {
+		n, rerr := trans.connection_read(conn, buf[:])
+		if n > 0 {
+			append(&got, ..buf[:n])
+		}
+		if rerr != .None {
+			if strings.contains(string(got[:]), "OK") {
+				return true
+			}
+			testing.expectf(t, false, "POST response missing (%v, got %s)", rerr, string(got[:]), loc = loc)
+			return false
+		}
+		if len(got) > 64 {
+			testing.expect(t, false, "POST response too long", loc = loc)
+			return false
+		}
+	}
+	return true
+}
+
+// Sequential ~46 KB POSTs through thirp-connect, plus resets and a
+// client-half-close-first pass. Afterwards the agent stream table, the
+// caller stream table, bridge count, and the sockets on the origin and
+// listen ports are back to the baseline, and another dial works. A refused
+// origin dial logs one line and the local client sees the socket close
+// instead of sitting open with no error.
+@(test)
+test_post_storm_fds_and_streams_return_to_baseline :: proc(t: ^testing.T) {
+	clear(&dial_logs.text)
+	dial_logs.text = make([dynamic]u8)
+	defer delete(dial_logs.text)
+
+	logger: log.Logger
+	log.logger_init(&logger, .Warn, dial_log_sink)
+
+	fx: Fixture
+	if !fixture_start(t, &fx, ag.AgentConfig{max_streams = -1, logger = &logger}) {
+		return
+	}
+	defer fixture_stop(&fx)
+	// The storm is one active session the whole time. Production's 45s
+	// session timeout is shorter than this test; the heartbeat still runs.
+	fx.server.session_timeout = 180 * time.Second
+
+	up_ep, uerr := trans.listener_endpoint(fx.up.ln)
+	testing.expect_value(t, uerr, trans.TransportError.None)
+	up_port := up_ep.port
+
+	ctl: RunControl
+	args := []string{"--broker", fx.broker, "--insecure", "--token", T_TOKEN_CALLER, "--service", T_SERVICE, "--listen", "127.0.0.1:0"}
+	r := RunArg{args = args, ctl = &ctl}
+	th := start_connect(t, &r)
+	defer stop_connect(&r, th)
+	if !sync.atomic_load(&ctl.ready) {
+		testing.expect(t, false, "not ready")
+		return
+	}
+	listen_port := ctl.bound.port
+	base_up := tcp_port_socket_count(up_port)
+	base_listen := tcp_port_socket_count(listen_port)
+	base_resets := brk.metrics_snapshot(&fx.server).resets[.StreamNotFound]
+
+	body := make([]u8, 1 + POST_BODY)
+	defer delete(body)
+	body[0] = 'Q'
+	for i in 1 ..< len(body) {
+		body[i] = 0x51
+	}
+
+	for i in 0 ..< POST_STORM_N {
+		conn := storm_dial(t, &ctl)
+		if conn == nil {
+			return
+		}
+		kind := i % 7
+		if kind == 0 {
+			// Reset while the body is still going out.
+			testing.expect_value(t, trans.connection_write(conn, body[:1024]), trans.TransportError.None)
+			trans.connection_destroy(conn)
+			continue
+		}
+		testing.expect_value(t, trans.connection_write(conn, body), trans.TransportError.None)
+		if kind == 1 {
+			// Client finishes the upload before the response. This is the
+			// order that used to drop the queued reply and the peer EOF.
+			testing.expect_value(t, trans.connection_shutdown_write(conn), trans.TransportError.None)
+		}
+		if !storm_read_ok(t, conn) {
+			trans.connection_destroy(conn)
+			return
+		}
+		trans.connection_destroy(conn)
+	}
+
+	streams, pumps, caller_streams, bridges, up_live, up_fds, listen_fds: int
+	start := time.now()
+	for {
+		streams, pumps, caller_streams, bridges, up_live, up_fds, listen_fds = storm_load(&fx, &ctl, up_port, listen_port)
+		// Off Linux the fd helper returns -1 on both sides, so the compare holds.
+		quiet := streams == 0 && pumps == 0 && caller_streams == 0 && bridges == 0 && up_live == 0 && up_fds == base_up && listen_fds == base_listen
+		if quiet || time.since(start) >= 3 * time.Second {
+			break
+		}
+		time.sleep(1 * time.Millisecond)
+	}
+	testing.expectf(
+		t,
+		streams == 0 && pumps == 0 && caller_streams == 0 && bridges == 0 && up_live == 0,
+		"after %d POSTs: agent streams %d pumps %d caller streams %d bridges %d upstream conns %d",
+		POST_STORM_N,
+		streams,
+		pumps,
+		caller_streams,
+		bridges,
+		up_live,
+	)
+	when ODIN_OS == .Linux {
+		testing.expectf(
+			t,
+			up_fds == base_up && listen_fds == base_listen,
+			"fds not back to baseline: origin %d (base %d) listen %d (base %d)",
+			up_fds,
+			base_up,
+			listen_fds,
+			base_listen,
+		)
+	}
+	got_resets := brk.metrics_snapshot(&fx.server).resets[.StreamNotFound]
+	testing.expectf(t, got_resets == base_resets, "stream_not_found %d -> %d", base_resets, got_resets)
+
+	// A dial after the storm still completes. This is the hang that showed
+	// up as a client timeout with no error frame.
+	again := storm_dial(t, &ctl)
+	if again == nil {
+		return
+	}
+	testing.expect_value(t, trans.connection_write(again, body), trans.TransportError.None)
+	ok := storm_read_ok(t, again)
+	trans.connection_destroy(again)
+	testing.expect(t, ok, "dial after the storm did not complete")
+
+	// Origin is gone. The next dial must fail in the agent, log the target
+	// and the error class, and close the local socket. A stuck bridge would
+	// leave this read on its timeout. Wait until the accept thread has
+	// left, so a connection cannot still land in its in-flight accept.
+	trans.listener_close(&fx.up.ln)
+	stopped_at := time.now()
+	for !sync.atomic_load(&fx.up.stopped) {
+		if time.since(stopped_at) > 2 * time.Second {
+			testing.expect(t, false, "upstream accept did not stop")
+			return
+		}
+		time.sleep(1 * time.Millisecond)
+	}
+	target := net.endpoint_to_string(up_ep, context.temp_allocator)
+	refused := storm_dial(t, &ctl)
+	if refused == nil {
+		return
+	}
+	_ = trans.connection_set_recv_timeout(refused, 2 * time.Second)
+	_ = trans.connection_write(refused, body[:1])
+	buf: [32]u8
+	_, rerr := trans.connection_read(refused, buf[:])
+	trans.connection_destroy(refused)
+	testing.expectf(t, rerr != .Timeout, "refused origin left the local client open (%v)", rerr)
+
+	logged := dial_log_text()
+	defer delete(logged)
+	want_event := fmt.tprintf("\"event\":\"%s\"", ag.LOG_EVENT_LOCAL_DIAL_FAILED)
+	want_class := fmt.tprintf("\"error_code\":\"%s\"", ag.ERROR_CLASS_NETWORK)
+	testing.expect(t, strings.contains(logged, want_event), "no local_dial_failed log")
+	testing.expect(t, strings.contains(logged, want_class), "dial log missing error class")
+	testing.expect(t, strings.contains(logged, target), "dial log missing target")
+	testing.expect(t, strings.contains(logged, "\"stream_id\":"), "dial log missing stream id")
+	fmt.printf(
+		"post-storm: baseline origin fds %d listen fds %d; after %d POSTs agent streams %d pumps %d caller streams %d bridges %d upstream %d origin fds %d listen fds %d; stream_not_found %d -> %d\n",
+		base_up,
+		base_listen,
+		POST_STORM_N,
+		streams,
+		pumps,
+		caller_streams,
+		bridges,
+		up_live,
+		up_fds,
+		listen_fds,
+		base_resets,
+		got_resets,
+	)
+}
+
+// F1: the agent session dies (or a stream is reset and then the session
+// dies) while thirp-connect has a live stream. New local clients must get
+// a CONNECT once the agent is back, or a clean socket close while it is
+// down. They must not sit accepted and unread (CLOSE-WAIT, Recv-Q holding
+// the ClientHello) and the bridges must finish.
+@(test)
+test_connect_dials_after_agent_session_dies :: proc(t: ^testing.T) {
+	connect_agent_death_case(t, false, false)
+}
+
+@(test)
+test_connect_dials_after_stream_reset_then_agent_session_dies :: proc(t: ^testing.T) {
+	connect_agent_death_case(t, true, false)
+}
+
+// Same recovery on TLS. The socket is the broker session; a fresh handshake
+// does not by itself unblock a CONNECT queued behind a stuck DATA write.
+@(test)
+test_connect_dials_after_agent_session_dies_tls :: proc(t: ^testing.T) {
+	connect_agent_death_case(t, false, true)
+}
+
+@(test)
+test_connect_dials_after_stream_reset_then_agent_session_dies_tls :: proc(t: ^testing.T) {
+	connect_agent_death_case(t, true, true)
+}
+
+// Writes 'X' plus a body the origin will not read, so the upload stalls in
+// the broker once the agent window is full.
+Upload :: struct {
+	conn: ^trans.Connection,
+	done: bool, // atomic
+	sent: int, // atomic
+	err:   trans.TransportError,
+	limit: int,
+}
+
+upload_body :: proc(u: ^Upload) {
+	// 16 KiB frames, not one multi-megabyte allocation (that failed under
+	// parallel load and the upload looked finished before the agent was cut).
+	chunk := make([]u8, 16 * 1024)
+	defer delete(chunk)
+	chunk[0] = 'X'
+	limit := u.limit
+	if limit <= 0 {
+		limit = upload_block_cap()
+	}
+	for sync.atomic_load(&u.sent) < limit {
+		u.err = trans.connection_write(u.conn, chunk)
+		if u.err != .None {
+			break
+		}
+		sync.atomic_add(&u.sent, len(chunk))
+	}
+	sync.atomic_store(&u.done, true)
+}
+
+// tcp_rmem / tcp_wmem autotune ceilings. A blocked upload has to be larger
+// than both socket buffers or the write finishes into the kernel and the
+// test never reaches the agent cut.
+proc_mem_max :: proc(path: string) -> int {
+	data, rerr := os.read_entire_file(path, context.temp_allocator)
+	if rerr != nil || len(data) == 0 {
+		return 0
+	}
+	s := string(data)
+	end := len(s)
+	for end > 0 && (s[end - 1] == '\n' || s[end - 1] == '\r' || s[end - 1] == ' ' || s[end - 1] == '\t') {
+		end -= 1
+	}
+	start := end
+	for start > 0 && s[start - 1] >= '0' && s[start - 1] <= '9' {
+		start -= 1
+	}
+	if start == end {
+		return 0
+	}
+	n, pok := strconv.parse_int(s[start:end])
+	if !pok || n <= 0 {
+		return 0
+	}
+	return n
+}
+
+// Two socket pairs (local client to the bridge, caller to the broker), each
+// able to hold tcp_wmem max + tcp_rmem max, plus the broker's userspace cap.
+upload_block_cap :: proc() -> int {
+	r := proc_mem_max("/proc/sys/net/ipv4/tcp_rmem")
+	w := proc_mem_max("/proc/sys/net/ipv4/tcp_wmem")
+	if r <= 0 {
+		r = 16 * 1024 * 1024
+	}
+	if w <= 0 {
+		w = 16 * 1024 * 1024
+	}
+	return 2 * (r + w) + 1024 * 1024
+}
+
+connect_agent_death_case :: proc(t: ^testing.T, reset_first: bool, use_tls: bool) {
+	fx: Fixture
+	// A 16 KiB DATA frame is over this cap, so the first frame the agent
+	// actually receives resets the stream instead of being absorbed.
+	agent_buf := 0
+	if reset_first {
+		agent_buf = 4 * 1024
+	}
+	if !fixture_start(t, &fx, ag.AgentConfig{max_stream_buffer = agent_buf}, use_tls) {
+		return
+	}
+	defer fixture_stop(&fx)
+	// Above one LOCAL_READ_BUF frame (a larger frame resets at once) and
+	// small enough that the broker stops reading once the outbox writer
+	// is held. Stopping the agent relay does not: the broker keeps
+	// filling the agent's TCP window, and a few megabytes fit there.
+	fx.server.max_stream_buffer = 32 * 1024
+
+	ctl: RunControl
+	args: []string
+	if use_tls {
+		args = []string{
+			"--broker", fx.broker,
+			"--tls-ca", fx.tls_cert,
+			"--tls-server-name", "127.0.0.1",
+			"--token", T_TOKEN_CALLER,
+			"--service", T_SERVICE,
+			"--listen", "127.0.0.1:0",
+		}
+	} else {
+		args = []string{"--broker", fx.broker, "--insecure", "--token", T_TOKEN_CALLER, "--service", T_SERVICE, "--listen", "127.0.0.1:0"}
+	}
+	r := RunArg{args = args, ctl = &ctl}
+	th := start_connect(t, &r)
+	defer stop_connect(&r, th)
+	if !sync.atomic_load(&ctl.ready) {
+		testing.expect(t, false, "not ready")
+		return
+	}
+	base_listen := wait_port_fds_at_least(ctl.bound.port, 1, 500 * time.Millisecond)
+
+	box := connect_agent_outbox(&fx.server)
+	testing.expect(t, box != nil, "agent outbox")
+	if box == nil {
+		return
+	}
+	defer brk.outbox_release(box)
+
+	held := local_dial(t, &ctl)
+	if held == nil {
+		return
+	}
+	held_open := true
+	defer if held_open {
+		trans.connection_destroy(held)
+	}
+	stream_up := false
+	up_start := time.now()
+	for time.since(up_start) < 2 * time.Second {
+		if ctl.caller != nil && cl.caller_stream_load(ctl.caller) >= 1 {
+			stream_up = true
+			break
+		}
+		time.sleep(5 * time.Millisecond)
+	}
+	testing.expect(t, stream_up, "stream was not up before the upload")
+	if !stream_up {
+		return
+	}
+
+	// Hold only after CONNECT_OK. Holding earlier queues OPEN behind the
+	// writer and the dial itself never returns.
+	brk.outbox_set_writer_hold(box, true)
+	if ctl.caller != nil && ctl.caller.conn != nil {
+		_ = net.set_option(ctl.caller.conn.socket, .Send_Buffer_Size, 16 * 1024)
+	}
+	_ = net.set_option(held.socket, .Send_Buffer_Size, 16 * 1024)
+	// Backstop so a wedge fails the assertion instead of hanging the
+	// process. The pass condition is the write finishing after the agent
+	// session dies, not this timeout.
+	_ = trans.connection_set_send_timeout(held, 20 * time.Second)
+	up := Upload {
+		conn  = held,
+		limit = upload_block_cap(),
+	}
+	uth := thread.create_and_start_with_poly_data(&up, upload_body)
+	testing.expect(t, uth != nil, "upload thread")
+	if uth == nil {
+		brk.outbox_set_writer_hold(box, false)
+		return
+	}
+	defer {
+		thread.join(uth)
+		thread.destroy(uth)
+	}
+	defer brk.outbox_set_writer_hold(box, false)
+	blocked := wait_upload_stalled(&up, 2 * time.Second)
+	testing.expectf(
+		t,
+		blocked,
+		"upload finished before the agent was cut (err=%v sent=%d)",
+		up.err,
+		sync.atomic_load(&up.sent),
+	)
+	if !blocked {
+		sync.atomic_store(&fx.up.drop, true)
+		return
+	}
+
+	if reset_first {
+		// The queued frames are larger than the agent cap, so the agent
+		// resets this stream once the writer is allowed to run. Then the
+		// session dies.
+		brk.outbox_set_writer_hold(box, false)
+		reset := false
+		reset_start := time.now()
+		for time.since(reset_start) < 2 * time.Second {
+			streams := 1
+			if ctl.caller != nil {
+				streams = cl.caller_stream_load(ctl.caller)
+			}
+			if streams == 0 || (sync.atomic_load(&up.done) && up.err != .None) {
+				reset = true
+				break
+			}
+			time.sleep(5 * time.Millisecond)
+		}
+		testing.expect(t, reset, "stream was not reset before the agent was cut")
+		if !reset {
+			sync.atomic_store(&fx.up.drop, true)
+			return
+		}
+	}
+
+	ag.agent_cut_broker(&fx.agent)
+	sync.atomic_store(&fx.up.drop, true)
+
+	testing.expect(t, wait_agent_down(&fx, 3 * time.Second), "agent session did not drop")
+	testing.expect(t, wait_upload_finished(&up, 1 * time.Second), "caller DATA write still blocked after agent session died")
+	// While the agent is down, a new client must not hang. Reconnect is
+	// fast on loopback, so either a clean close or a completed echo is
+	// acceptable; a read/write timeout is the field wedge.
+	testing.expect(t, connect_probe(&ctl, 2 * time.Second, false), "probe hung while agent session was down")
+	testing.expect(t, wait_agent_connected(&fx, 5 * time.Second), "agent did not re-register")
+	testing.expect(t, connect_probe(&ctl, 2 * time.Second, true), "probe did not complete after agent re-registered")
+
+	if held_open {
+		trans.connection_destroy(held)
+		held_open = false
+	}
+	testing.expect(t, wait_bridges_zero(&ctl, 3 * time.Second), "bridge left open after agent restart")
+	streams, pumps := ag.agent_stream_load(&fx.agent)
+	caller_streams := -1
+	if ctl.caller != nil {
+		caller_streams = cl.caller_stream_load(ctl.caller)
+	}
+	testing.expect_value(t, streams, 0)
+	testing.expect_value(t, pumps, 0)
+	testing.expect_value(t, caller_streams, 0)
+	listen_fds := wait_port_fds(ctl.bound.port, base_listen, 1 * time.Second)
+	testing.expectf(
+		t,
+		listen_fds == base_listen,
+		"listen fds %d, baseline %d (accepted sockets still open)",
+		listen_fds,
+		base_listen,
+	)
+}
+
+// DATA holds the session writer. CONNECT is the next frame after the one
+// already on the socket, and the dial bound abandons that CONNECT without
+// shutting the session down. The accepted local socket is closed when the
+// dial returns; a later client gets a CONNECT.
+@(test)
+test_connect_blocked_upload_does_not_hold_connect :: proc(t: ^testing.T) {
+	fx: Fixture
+	if !fixture_start(t, &fx) {
+		return
+	}
+	defer fixture_stop(&fx)
+	fx.server.max_stream_buffer = 32 * 1024
+
+	ctl: RunControl
+	ctl.dial_timeout = 500 * time.Millisecond
+	r := RunArg {
+		args = []string{"--broker", fx.broker, "--insecure", "--token", T_TOKEN_CALLER, "--service", T_SERVICE, "--listen", "127.0.0.1:0"},
+		ctl  = &ctl,
+	}
+	th := start_connect(t, &r)
+	defer stop_connect(&r, th)
+	if !sync.atomic_load(&ctl.ready) {
+		testing.expect(t, false, "not ready")
+		return
+	}
+
+	held := local_dial(t, &ctl)
+	if held == nil {
+		return
+	}
+	held_open := true
+	defer if held_open {
+		trans.connection_destroy(held)
+	}
+	_ = trans.connection_set_recv_timeout(held, 5 * time.Second)
+	ping := transmute([]u8)string("Eping")
+	testing.expect_value(t, trans.connection_write(held, ping), trans.TransportError.None)
+	echo: [4]u8
+	got := 0
+	for got < 4 {
+		n, rerr := trans.connection_read(held, echo[got:])
+		got += n
+		if rerr != .None {
+			testing.expectf(t, false, "setup echo failed %v", rerr)
+			return
+		}
+	}
+	testing.expect(t, string(echo[:]) == "ping", "setup echo")
+
+	// Hold the agent's outbox writer so the broker stops reading the caller
+	// once the stream cap is full. A relay sleep does not fill a loopback
+	// window before a few hundred KiB have already been accepted.
+	box := connect_agent_outbox(&fx.server)
+	testing.expect(t, box != nil, "agent outbox")
+	if box == nil {
+		return
+	}
+	defer brk.outbox_release(box)
+	brk.outbox_set_writer_hold(box, true)
+	if ctl.caller != nil && ctl.caller.conn != nil {
+		_ = net.set_option(ctl.caller.conn.socket, .Send_Buffer_Size, 16 * 1024)
+	}
+	_ = net.set_option(held.socket, .Send_Buffer_Size, 16 * 1024)
+	_ = trans.connection_set_send_timeout(held, 8 * time.Second)
+
+	up := Upload {
+		conn  = held,
+		limit = upload_block_cap(),
+	}
+	uth := thread.create_and_start_with_poly_data(&up, upload_body)
+	testing.expect(t, uth != nil, "upload thread")
+	if uth == nil {
+		return
+	}
+	defer {
+		brk.outbox_set_writer_hold(box, false)
+		thread.join(uth)
+		thread.destroy(uth)
+	}
+	blocked := wait_upload_stalled(&up, 2 * time.Second)
+	testing.expectf(
+		t,
+		blocked,
+		"upload did not block (done=%v sent=%d err=%v)",
+		sync.atomic_load(&up.done),
+		sync.atomic_load(&up.sent),
+		up.err,
+	)
+	if !blocked {
+		return
+	}
+
+	// Old dial blocks in the CONNECT write until the DATA send returns.
+	// The dial bound returns while that DATA write is still outstanding.
+	testing.expect(t, connect_probe(&ctl, 2 * time.Second, false), "probe hung behind the blocked upload")
+
+	brk.outbox_set_writer_hold(box, false)
+	if ctl.caller != nil {
+		ctl.caller.config.dial_timeout = 3 * time.Second
+	}
+	ag.agent_cut_broker(&fx.agent)
+	testing.expect(t, wait_agent_down(&fx, 3 * time.Second), "agent session did not drop")
+	testing.expect(t, wait_agent_connected(&fx, 5 * time.Second), "agent did not re-register")
+	testing.expect(t, connect_probe(&ctl, 3 * time.Second, true), "no CONNECT after caller re-authenticated")
+}
+
+connect_agent_outbox :: proc(server: ^brk.Server) -> ^brk.ConnOutbox {
+	if server == nil {
+		return nil
+	}
+	sync.mutex_lock(&server.routing_mutex)
+	conn: ^trans.Connection
+	for _, c in server.agent_conns {
+		conn = c
+		break
+	}
+	sync.mutex_unlock(&server.routing_mutex)
+	if conn == nil {
+		return nil
+	}
+	return brk.server_lookup_outbox(server, conn)
+}
+
+wait_upload_blocked :: proc(u: ^Upload, limit: time.Duration) -> bool {
+	start := time.now()
+	for !sync.atomic_load(&u.done) {
+		if time.since(start) > limit {
+			return true
+		}
+		time.sleep(5 * time.Millisecond)
+	}
+	return false
+}
+
+// True when the upload is still in progress and its byte count has stopped
+// moving. A finished upload is not "blocked".
+wait_upload_stalled :: proc(u: ^Upload, limit: time.Duration) -> bool {
+	start := time.now()
+	last := -1
+	changed := time.now()
+	for time.since(start) < limit {
+		if sync.atomic_load(&u.done) {
+			return false
+		}
+		sent := sync.atomic_load(&u.sent)
+		if sent != last {
+			last = sent
+			changed = time.now()
+		} else if time.since(changed) >= 200 * time.Millisecond {
+			return true
+		}
+		time.sleep(10 * time.Millisecond)
+	}
+	return !sync.atomic_load(&u.done)
+}
+
+// tcp_port_socket_count reads /proc once. A parallel test or a close that
+// has not shown up yet makes a single sample lie (listen fds 1, baseline 0).
+wait_port_fds_at_least :: proc(port: int, n: int, limit: time.Duration) -> int {
+	start := time.now()
+	last := tcp_port_socket_count(port)
+	for last < n && time.since(start) < limit {
+		time.sleep(5 * time.Millisecond)
+		last = tcp_port_socket_count(port)
+	}
+	return last
+}
+
+wait_port_fds :: proc(port: int, want: int, limit: time.Duration) -> int {
+	start := time.now()
+	last := tcp_port_socket_count(port)
+	for last != want && time.since(start) < limit {
+		time.sleep(10 * time.Millisecond)
+		last = tcp_port_socket_count(port)
+	}
+	return last
+}
+
+wait_upload_finished :: proc(u: ^Upload, limit: time.Duration) -> bool {
+	start := time.now()
+	for !sync.atomic_load(&u.done) {
+		if time.since(start) > limit {
+			return false
+		}
+		time.sleep(5 * time.Millisecond)
+	}
+	return true
+}
+
+wait_agent_down :: proc(fx: ^Fixture, limit: time.Duration) -> bool {
+	start := time.now()
+	for ag.agent_is_connected(&fx.agent) {
+		if time.since(start) > limit {
+			return false
+		}
+		time.sleep(5 * time.Millisecond)
+	}
+	return true
+}
+
+wait_agent_connected :: proc(fx: ^Fixture, limit: time.Duration) -> bool {
+	start := time.now()
+	for !ag.agent_is_connected(&fx.agent) {
+		if time.since(start) > limit {
+			return false
+		}
+		time.sleep(5 * time.Millisecond)
+	}
+	return true
+}
+
+wait_upstream_live :: proc(fx: ^Fixture, n: int, limit: time.Duration) -> bool {
+	start := time.now()
+	for sync.atomic_load(&fx.up.live) < n {
+		if time.since(start) > limit {
+			return false
+		}
+		time.sleep(5 * time.Millisecond)
+	}
+	return true
+}
+
+// One local client. While the agent is down, a clean socket close counts:
+// the bridge accepted the client and finished the dial with a failure.
+// After the agent is back, the echo itself has to arrive. A read or write
+// timeout means the bridge accepted the socket and never finished the dial.
+connect_probe :: proc(ctl: ^RunControl, limit: time.Duration, need_echo: bool) -> bool {
+	conn, err := trans.connection_dial(ctl.bound)
+	if err != .None || conn == nil {
+		return false
+	}
+	defer trans.connection_destroy(conn)
+	_ = trans.connection_set_send_timeout(conn, limit)
+	_ = trans.connection_set_recv_timeout(conn, limit)
+	payload := transmute([]u8)string("Eping")
+	werr := trans.connection_write(conn, payload)
+	if werr == .Timeout {
+		return false
+	}
+	if werr != .None {
+		return !need_echo
+	}
+	buf: [16]u8
+	got := 0
+	for got < 4 {
+		n, rerr := trans.connection_read(conn, buf[got:])
+		got += n
+		if rerr == .Timeout {
+			return false
+		}
+		if rerr != .None {
+			return !need_echo
+		}
+	}
+	return string(buf[:4]) == "ping"
+}
+
+storm_dial :: proc(t: ^testing.T, ctl: ^RunControl, loc := #caller_location) -> ^trans.Connection {
+	conn, err := trans.connection_dial(ctl.bound)
+	testing.expect_value(t, err, trans.TransportError.None, loc)
+	if conn != nil {
+		_ = trans.connection_set_recv_timeout(conn, 2 * time.Second)
+	}
+	return conn
+}
+
+storm_load :: proc(
+	fx: ^Fixture,
+	ctl: ^RunControl,
+	up_port, listen_port: int,
+) -> (
+	streams, pumps, caller_streams, bridges, up_live, up_fds, listen_fds: int,
+) {
+	streams, pumps = ag.agent_stream_load(&fx.agent)
+	if ctl.caller != nil {
+		caller_streams = cl.caller_stream_load(ctl.caller)
+	} else {
+		caller_streams = -1
+	}
+	bridges = sync.atomic_load(&ctl.live_bridges)
+	up_live = sync.atomic_load(&fx.up.live)
+	up_fds = tcp_port_socket_count(up_port)
+	listen_fds = tcp_port_socket_count(listen_port)
+	return
+}
+
+// Cut the caller's broker-side TCP socket, leaving the agent and listener
+// running. A new accepted socket must wait for the replacement session.
+@(test)
+test_connect_new_local_socket_after_broker_session_loss :: proc(t: ^testing.T) {
+	connect_broker_session_loss_case(t, false)
+}
+
+@(test)
+test_connect_new_local_socket_after_broker_session_loss_tls :: proc(t: ^testing.T) {
+	connect_broker_session_loss_case(t, true)
+}
+
+connect_broker_session_loss_case :: proc(t: ^testing.T, use_tls: bool) {
+	fx: Fixture
+	if !fixture_start(t, &fx, {}, use_tls) {
+		return
+	}
+	defer fixture_stop(&fx)
+	ctl: RunControl
+	r := RunArg {
+		args = []string{"--broker", fx.broker, "--insecure", "--token", T_TOKEN_CALLER, "--service", T_SERVICE, "--listen", "127.0.0.1:0"},
+		ctl = &ctl,
+	}
+	if use_tls {
+		r.args = []string{"--broker", fx.broker, "--tls-ca", fx.tls_cert, "--tls-server-name", "127.0.0.1", "--token", T_TOKEN_CALLER, "--service", T_SERVICE, "--listen", "127.0.0.1:0"}
+	}
+	th := start_connect(t, &r)
+	defer stop_connect(&r, th)
+	if !sync.atomic_load(&ctl.ready) {
+		testing.expect(t, false, "not ready")
+		return
+	}
+	testing.expect(t, connect_probe(&ctl, 3 * time.Second, true), "initial echo failed")
+	sync.mutex_lock(&ctl.caller.mutex)
+	gen := ctl.caller.conn_gen
+	sync.mutex_unlock(&ctl.caller.mutex)
+	cut := false
+	sync.mutex_lock(&fx.server.handlers_mutex)
+	for h in fx.server.handlers {
+		if h.role == .Caller {
+			trans.connection_shutdown_both(h.conn)
+			cut = true
+		}
+	}
+	sync.mutex_unlock(&fx.server.handlers_mutex)
+	testing.expect(t, cut, "no broker-side caller socket")
+	if !cut {
+		return
+	}
+	// Observe the loss before probing, so the new socket is accepted
+	// during reconnect rather than on the old session before its FIN.
+	lost := false
+	start := time.now()
+	for time.since(start) < 3 * time.Second {
+		sync.mutex_lock(&ctl.caller.mutex)
+		lost = !ctl.caller.connected
+		sync.mutex_unlock(&ctl.caller.mutex)
+		if lost {
+			break
+		}
+		time.sleep(time.Millisecond)
+	}
+	testing.expect(t, lost, "caller did not observe session loss")
+	testing.expect(t, connect_probe(&ctl, 3 * time.Second, true), "new socket failed during reconnect")
+	sync.mutex_lock(&ctl.caller.mutex)
+	replaced := ctl.caller.connected && ctl.caller.conn_gen != gen
+	sync.mutex_unlock(&ctl.caller.mutex)
+	testing.expect(t, replaced, "caller did not install a live replacement")
+	testing.expect(t, connect_probe(&ctl, 3 * time.Second, true), "new socket failed after reconnect")
 }

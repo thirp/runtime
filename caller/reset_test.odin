@@ -26,9 +26,9 @@ test_caller_unknown_data_does_not_reset :: proc(t: ^testing.T) {
 	defer delete(c.streams)
 
 	sid := proto.make_stream_id(99)
-	caller_handle_data(&c, make_stream_frame(.Data, sid, []u8{'x'}))
-	caller_handle_half_close(&c, sid)
-	caller_handle_close(&c, sid, .Reset)
+	caller_handle_data(&c, &c.streams, c.conn, make_stream_frame(.Data, sid, []u8{'x'}))
+	caller_handle_half_close(&c, &c.streams, sid)
+	caller_handle_close(&c, &c.streams, sid, .Reset)
 	expect_no_peer_frame(t, pipe.peer)
 }
 
@@ -59,9 +59,9 @@ test_caller_finished_stream_reset_does_not_echo :: proc(t: ^testing.T) {
 	testing.expect(t, !found)
 
 	drain_peer_control(t, pipe.peer)
-	caller_handle_data(&c, make_stream_frame(.Data, sid, []u8{'y'}))
-	caller_handle_half_close(&c, sid)
-	caller_handle_close(&c, sid, .Reset)
+	caller_handle_data(&c, &c.streams, c.conn, make_stream_frame(.Data, sid, []u8{'y'}))
+	caller_handle_half_close(&c, &c.streams, sid)
+	caller_handle_close(&c, &c.streams, sid, .Reset)
 	expect_no_peer_frame(t, pipe.peer)
 }
 

@@ -3,6 +3,7 @@ package agent
 import proto "../protocol"
 import trans "../transport"
 import log "../logging"
+import "core:net"
 import "core:sync"
 import "core:thread"
 import "core:time"
@@ -100,21 +101,51 @@ agent_destroy_local :: proc(local: ^trans.Connection) {
 	trans.connection_destroy(local)
 }
 
-agent_clear_all :: proc(relay: ^AgentRelay) {
-	taken := make([dynamic]AgentLocalStream)
+// Take every stream currently published. reset sends RESET before the
+// local socket is shut down; a session that is already gone just drops.
+agent_drop_published :: proc(relay: ^AgentRelay, reset: bool) -> int {
+	ids: [dynamic]proto.StreamId
+	taken: [dynamic]AgentLocalStream
+	defer delete(ids)
 	defer delete(taken)
 	sync.mutex_lock(&relay.mutex)
-	for _, stream in relay.streams {
+	for id, stream in relay.streams {
+		append(&ids, id)
 		append(&taken, stream)
 	}
 	clear(&relay.streams)
 	sync.mutex_unlock(&relay.mutex)
-	for stream in taken {
-		agent_drop_stream(stream)
+	for i in 0 ..< len(ids) {
+		if reset {
+			_ = agent_write_failure(relay.broker, .Reset, .InternalError, ids[i])
+		}
+		agent_drop_stream(taken[i])
 	}
-	for sync.atomic_load(&relay.live_pumps) != 0 {
-		time.sleep(1 * time.Millisecond)
+	return len(ids)
+}
+
+// An OPEN worker can publish after a snapshot. Drop that stream too, and
+// keep waiting while a dial is in flight: the pump it starts is counted in
+// live_pumps, and a one-shot snapshot waits forever for a thread it never
+// shut down.
+agent_wait_streams_done :: proc(relay: ^AgentRelay, reset: bool) {
+	for sync.atomic_load(&relay.live_pumps) != 0 || sync.atomic_load(&relay.opening) != 0 {
+		n := agent_drop_published(relay, reset)
+		if sync.atomic_load(&relay.live_pumps) == 0 && sync.atomic_load(&relay.opening) == 0 {
+			break
+		}
+		if n == 0 {
+			when ODIN_TEST {
+				agent_test_note_stream_wait(relay.agent)
+			}
+			time.sleep(1 * time.Millisecond)
+		}
 	}
+}
+
+agent_clear_all :: proc(relay: ^AgentRelay) {
+	_ = agent_drop_published(relay, false)
+	agent_wait_streams_done(relay, false)
 }
 
 agent_lookup_local :: proc(relay: ^AgentRelay, stream_id: proto.StreamId) -> (^trans.Connection, bool) {
@@ -254,8 +285,69 @@ agent_handle_open :: proc(relay: ^AgentRelay, frame: proto.Frame) {
 	thread.run_with_poly_data(arg, agent_open_worker)
 }
 
+transport_error_class :: proc(err: trans.TransportError) -> string {
+	switch err {
+	case .None:
+		return ERROR_CLASS_NONE
+	case .Closed:
+		return ERROR_CLASS_CLOSED
+	case .Timeout:
+		return ERROR_CLASS_TIMEOUT
+	case .WouldBlock:
+		return ERROR_CLASS_WOULD_BLOCK
+	case .InvalidEndpoint:
+		return ERROR_CLASS_INVALID_ENDPOINT
+	case .OutOfMemory:
+		return ERROR_CLASS_OUT_OF_MEMORY
+	case .Network:
+		return ERROR_CLASS_NETWORK
+	case .Tls:
+		return ERROR_CLASS_TLS
+	}
+	return ERROR_CLASS_NETWORK
+}
+
+// One line: target, error class, stream id. The endpoint string is the
+// address we dialed, not a request, argument, or token.
+agent_log_local_dial_failed :: proc(
+	relay: ^AgentRelay,
+	stream_id: proto.StreamId,
+	target: net.Endpoint,
+	err: trans.TransportError,
+) {
+	if relay == nil || relay.agent == nil {
+		return
+	}
+	text := net.endpoint_to_string(target, context.allocator)
+	defer delete(text)
+	agent_log(
+		relay.agent,
+		.Warn,
+		LOG_EVENT_LOCAL_DIAL_FAILED,
+		log.LogFields {
+			stream_id      = u64(stream_id),
+			remote_address = text,
+			error_code     = transport_error_class(err),
+		},
+	)
+}
+
 // An OPEN that did not become a stream. opening drops before live_pumps:
 // the relay may be gone once live_pumps reaches zero.
+agent_local_dial_timeout :: proc(relay: ^AgentRelay) -> time.Duration {
+	if relay == nil || relay.agent == nil {
+		return DEFAULT_LOCAL_DIAL_TIMEOUT
+	}
+	v := relay.agent.config.local_dial_timeout
+	if v < 0 {
+		return 0
+	}
+	if v == 0 {
+		return DEFAULT_LOCAL_DIAL_TIMEOUT
+	}
+	return v
+}
+
 agent_open_failed_done :: proc(relay: ^AgentRelay) {
 	sync.atomic_sub(&relay.opening, 1)
 	sync.atomic_sub(&relay.live_pumps, 1)
@@ -280,8 +372,9 @@ agent_open_worker :: proc(arg: ^AgentOpenArg) {
 		return
 	}
 
-	local, derr := trans.connection_dial(target.address)
+	local, derr := trans.connection_dial_timeout(target.address, agent_local_dial_timeout(relay))
 	if derr != .None {
+		agent_log_local_dial_failed(relay, stream_id, target.address, derr)
 		_ = agent_write_failure(
 			relay.broker,
 			.OpenFailed,
@@ -343,6 +436,11 @@ agent_open_worker :: proc(arg: ^AgentOpenArg) {
 		return
 	}
 
+	// After the dial, before the stream is published. Shutdown that
+	// already snapshotted the table must still drop this stream.
+	when ODIN_TEST {
+		agent_test_wait_before_publish(relay.agent)
+	}
 	sync.mutex_lock(&relay.mutex)
 	_, exists := relay.streams[stream_id]
 	if exists {
@@ -373,12 +471,25 @@ agent_open_worker :: proc(arg: ^AgentOpenArg) {
 	sync.atomic_add(&relay.live_pumps, 1)
 	sync.atomic_sub(&relay.opening, 1) // now counted in streams
 	sync.mutex_unlock(&relay.mutex)
-	thread.run_with_poly_data(pump, agent_pump_local)
-	thread.run_with_poly_data(writer, agent_tx_writer)
-
+	// OPEN_OK before the pump. The pump writes DATA as soon as the local
+	// service does. DATA that passes OPEN_OK is illegal while the broker
+	// still has the stream in Opening, and the broker RESETs it. The
+	// caller is still waiting on CONNECT and never sees CONNECT_OK.
 	if !agent_write(relay.broker, .OpenOk, nil, stream_id) {
 		agent_finish_stream(relay, stream_id)
+		// The pump and the writer were not started. Drop the two live_pumps
+		// counts and the references those threads would have released.
+		trans.connection_release(pump.local)
+		free(pump)
+		trans.connection_release(writer.local)
+		agent_tx_release(writer.tx)
+		free(writer)
+		sync.atomic_sub(&relay.live_pumps, 1)
+		sync.atomic_sub(&relay.live_pumps, 1)
+		return
 	}
+	thread.run_with_poly_data(pump, agent_pump_local)
+	thread.run_with_poly_data(writer, agent_tx_writer)
 }
 
 // Undo the writer setup for an OPEN that failed before the stream existed.
@@ -546,6 +657,15 @@ agent_relay_loop :: proc(relay: ^AgentRelay, decoder: ^proto.FrameDecoder) {
 			agent_shutdown_session(relay, decoder)
 			return
 		}
+		when ODIN_TEST {
+			if agent_test_relay_held(relay.agent) {
+				time.sleep(5 * time.Millisecond)
+				continue
+			}
+			if pace := agent_test_relay_pace_of(relay.agent); pace > 0 {
+				time.sleep(pace)
+			}
+		}
 		_ = trans.connection_set_recv_timeout(relay.broker, 50 * time.Millisecond)
 		// Force DATA writes to block on peer window instead of inheriting the
 		// 50ms read-poll timeout (which turned backpressure into RESET storms).
@@ -613,22 +733,6 @@ agent_shutdown_session :: proc(relay: ^AgentRelay, decoder: ^proto.FrameDecoder)
 }
 
 agent_reset_all_streams :: proc(relay: ^AgentRelay) {
-	ids: [dynamic]proto.StreamId
-	taken: [dynamic]AgentLocalStream
-	defer delete(ids)
-	defer delete(taken)
-	sync.mutex_lock(&relay.mutex)
-	for id, stream in relay.streams {
-		append(&ids, id)
-		append(&taken, stream)
-	}
-	clear(&relay.streams)
-	sync.mutex_unlock(&relay.mutex)
-	for i in 0 ..< len(ids) {
-		_ = agent_write_failure(relay.broker, .Reset, .InternalError, ids[i])
-		agent_drop_stream(taken[i])
-	}
-	for sync.atomic_load(&relay.live_pumps) != 0 {
-		time.sleep(1 * time.Millisecond)
-	}
+	_ = agent_drop_published(relay, true)
+	agent_wait_streams_done(relay, true)
 }

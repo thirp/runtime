@@ -118,6 +118,9 @@ echo_mirror_one :: proc(arg: ^EchoMirrorArg) {
 	conn := arg.conn
 	live := arg.live
 	free(arg)
+	// accept() inherits the listener's 50ms SO_RCVTIMEO. A timeout is not
+	// EOF; the mirror has to stay up for a stream that goes quiet.
+	_ = trans.connection_set_recv_timeout(conn, 0)
 	if live != nil {
 		sync.atomic_add(live, 1)
 	}

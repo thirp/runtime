@@ -21,7 +21,7 @@ connection_peek_impl :: proc(conn: ^Connection, dst: []u8) -> (n: int, err: Tran
 		return 0, .Network
 	}
 	if got == 0 {
-		conn.closed = true
+		// Peer FIN. Leave the socket writable; the response may still be owed.
 		return 0, .Closed
 	}
 	return int(got), .None

@@ -27,8 +27,35 @@ tls_wait_socket_impl :: proc(conn: ^Connection, want_write: bool, timeout: time.
 		return .None
 	}
 	if .HUP in pfd.revents || .ERR in pfd.revents {
-		conn.closed = true
+		// HUP is the peer's FIN with nothing left to read. ERR is a dead socket.
+		// ETIMEDOUT is TCP_USER_TIMEOUT, not a peer FIN.
+		if .ERR in pfd.revents {
+			if connection_so_error_timed_out(conn) {
+				conn.user_timed_out = true
+			}
+			conn.closed = true
+		}
 		return .Closed
 	}
 	return .None
+}
+
+connection_syscall_timed_out :: proc() -> bool {
+	return posix.get_errno() == .ETIMEDOUT
+}
+
+connection_so_error_timed_out :: proc(conn: ^Connection) -> bool {
+	soerr: c.int
+	olen := posix.socklen_t(size_of(soerr))
+	rc := posix.getsockopt(
+		posix.FD(connection_socket_fd(conn)),
+		posix.SOL_SOCKET,
+		.ERROR,
+		&soerr,
+		&olen,
+	)
+	if rc != .OK {
+		return false
+	}
+	return posix.Errno(soerr) == .ETIMEDOUT
 }

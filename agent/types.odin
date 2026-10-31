@@ -76,6 +76,9 @@ AgentConfig :: struct {
 	max_stream_buffer:  int,
 	max_buffered_bytes: int,
 	max_streams:        int,
+	// 0 = DEFAULT_LOCAL_DIAL_TIMEOUT. Negative = block until the OS gives
+	// up. Odin-only: no agent CLI flag and no C field.
+	local_dial_timeout: time.Duration,
 }
 
 LocalTarget :: struct {
@@ -147,4 +150,7 @@ Agent :: struct {
 	// Observability (atomic): agent-wide queued DATA now and its peak.
 	buffered_bytes: int,
 	buffered_peak:  int,
+	// The relay of the connected session, if any. Tests read the stream table
+	// through this. The session loop clears it before the relay goes away.
+	live_relay: ^AgentRelay,
 }

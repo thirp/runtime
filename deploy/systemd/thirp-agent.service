@@ -11,6 +11,7 @@ Group=thirp
 ExecStart=/usr/local/bin/thirp-agent --config /etc/thirp/agent.conf
 Restart=on-failure
 RestartSec=2
+TimeoutStopSec=20
 LimitNOFILE=8256
 NoNewPrivileges=yes
 PrivateTmp=yes

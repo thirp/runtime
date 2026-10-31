@@ -3,21 +3,35 @@ package main
 import broker "../broker"
 import trans "../transport"
 import posix "core:sys/posix"
+import "core:sync"
 import "core:thread"
 
+// Process lifetime. A stack SignalWaiter is dead when broker_setup_interrupt
+// returns, so the signal thread's sigwait never sees SIGTERM.
 SignalWaiter :: struct {
-	server: ^broker.Server,
-	set:    posix.sigset_t,
+	server:  ^broker.Server,
+	set:     posix.sigset_t,
+	tid:     posix.pthread_t,
+	ready:   bool,
+	handled: bool,
 }
 
+g_broker_waiter: SignalWaiter
+g_broker_signal_thread: ^thread.Thread
+
 signal_wait_proc :: proc(w: ^SignalWaiter) {
+	w.tid = posix.pthread_self()
+	sync.atomic_store(&w.ready, true)
 	sig: posix.Signal
 	_ = posix.sigwait(&w.set, &sig)
-	w.server.stop = true
-	if w.server.listening {
-		trans.listener_close(&w.server.listener)
-		w.server.listening = false
+	if w.server != nil {
+		w.server.stop = true
+		if w.server.listening {
+			trans.listener_close(&w.server.listener)
+			w.server.listening = false
+		}
 	}
+	sync.atomic_store(&w.handled, true)
 }
 
 broker_setup_interrupt :: proc(server: ^broker.Server) {
@@ -26,10 +40,9 @@ broker_setup_interrupt :: proc(server: ^broker.Server) {
 	posix.sigaddset(&set, .SIGINT)
 	posix.sigaddset(&set, .SIGTERM)
 	posix.pthread_sigmask(.BLOCK, &set, nil)
-	waiter := SignalWaiter {
+	g_broker_waiter = SignalWaiter {
 		server = server,
 		set    = set,
 	}
-	th := thread.create_and_start_with_poly_data(&waiter, signal_wait_proc)
-	_ = th
+	g_broker_signal_thread = thread.create_and_start_with_poly_data(&g_broker_waiter, signal_wait_proc)
 }

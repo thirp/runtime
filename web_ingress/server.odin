@@ -88,6 +88,9 @@ ingress_server_init :: proc(
 		server.retry_thread = thread.create_and_start_with_poly_data(server, ingress_caller_retry_proc)
 	}
 
+	if connect_broker {
+		cl.caller_warn_short_dial_timeout(server.logger, server.config.limits.broker_dial_timeout)
+	}
 	ingress_log(server, .Info, "ingress_started")
 	if ingress_caller_usable(server) && server.listening && !ingress_is_draining(server) {
 		ingress_log(server, .Info, "ingress_ready")

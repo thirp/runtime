@@ -1,6 +1,7 @@
 package transport
 
 import proto "../protocol"
+import "core:mem"
 import "core:net"
 import "core:sync"
 import "core:testing"
@@ -163,4 +164,75 @@ test_connection_refcount_acquire_keeps_alive_until_release :: proc(t: ^testing.T
 	testing.expect_value(t, sync.atomic_load(&client.refs), 1)
 	testing.expect(t, client.closed)
 	connection_release(client)
+}
+
+// A peer FIN must stop a reader in one poll/read and must not mark the
+// socket closed, so the reply can still be written. The same shape is what
+// broker conn_run, agent_relay_loop, caller_read_session, and
+// bridge_read_local do: Timeout is polled, any other error ends the loop,
+// and connection_destroy frees the socket.
+@(test)
+test_peer_fin_on_idle_connection_does_not_spin_and_is_freed :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	alloc := mem.tracking_allocator(&track)
+
+	ln, lerr := listener_listen(loopback_endpoint(0))
+	testing.expect_value(t, lerr, TransportError.None)
+	defer listener_close(&ln)
+
+	ep, eerr := listener_endpoint(ln)
+	testing.expect_value(t, eerr, TransportError.None)
+
+	client, derr := connection_dial(ep, alloc)
+	testing.expect_value(t, derr, TransportError.None)
+	server, aerr := listener_accept(&ln, alloc)
+	testing.expect_value(t, aerr, TransportError.None)
+	freed := false
+	defer if !freed {
+		connection_destroy(server)
+		connection_destroy(client)
+	}
+
+	testing.expect_value(t, connection_shutdown_write(client), TransportError.None)
+
+	buf: [8]u8
+	polls := 0
+	reads := 0
+	stopped := false
+	for {
+		polls += 1
+		if polls > 3 {
+			break
+		}
+		werr := connection_wait_readable(server, 20 * time.Millisecond)
+		if werr == .Timeout {
+			continue
+		}
+		if werr == .None {
+			reads += 1
+			_, rerr := connection_read(server, buf[:])
+			if rerr == .None {
+				continue
+			}
+			testing.expect_value(t, rerr, TransportError.Closed)
+			stopped = true
+			break
+		}
+		testing.expect_value(t, werr, TransportError.Closed)
+		stopped = true
+		break
+	}
+	testing.expect(t, stopped, "idle FIN reader did not stop")
+	testing.expect(t, polls == 1, "idle FIN poll spun")
+	testing.expect(t, reads <= 1, "idle FIN read spun")
+	testing.expect(t, !server.closed)
+	testing.expect_value(t, connection_write(server, []u8{1}), TransportError.None)
+
+	connection_destroy(server)
+	connection_destroy(client)
+	freed = true
+	testing.expect_value(t, len(track.allocation_map), 0)
+	testing.expect_value(t, len(track.bad_free_array), 0)
 }

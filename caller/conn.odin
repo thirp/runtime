@@ -1,5 +1,7 @@
 package caller
 
+import proto "../protocol"
+import trans "../transport"
 import "core:sync"
 
 conn_read :: proc(conn: ^Conn, buf: []u8) -> (n: int, err: ConnError) {
@@ -30,17 +32,22 @@ conn_write :: proc(conn: ^Conn, buf: []u8) -> (n: int, err: ConnError) {
 		return 0, .Closed
 	}
 	sync.mutex_lock(&conn.mutex)
-	closed := conn.closed || conn.reset || conn.write_closed
+	if conn.closed || conn.reset || conn.write_closed {
+		sync.mutex_unlock(&conn.mutex)
+		return 0, .Closed
+	}
 	stream_id := conn.stream_id
 	caller := conn.caller
 	sync.mutex_unlock(&conn.mutex)
-	if closed {
+	// Snapshot the session under the caller lock and hold a reference.
+	// Reading caller.conn again at the write would send this DATA on a
+	// session installed after fail_all, ahead of any CONNECT.
+	sess := caller_acquire_owned_session(caller, conn, stream_id)
+	if sess == nil {
 		return 0, .Closed
 	}
-	if caller == nil || caller.conn == nil {
-		return 0, .Transport
-	}
-	if !caller_write(caller.conn, .Data, buf, stream_id) {
+	defer trans.connection_release(sess)
+	if !caller_write(sess, .Data, buf, stream_id) {
 		return 0, .Transport
 	}
 	return len(buf), .None
@@ -55,13 +62,24 @@ conn_half_close :: proc(conn: ^Conn) {
 		sync.mutex_unlock(&conn.mutex)
 		return
 	}
-	conn.write_closed = true
 	stream_id := conn.stream_id
 	caller := conn.caller
+	sync.mutex_unlock(&conn.mutex)
+	sess := caller_acquire_owned_session(caller, conn, stream_id)
+	sync.mutex_lock(&conn.mutex)
+	if conn.closed || conn.reset || conn.write_closed {
+		sync.mutex_unlock(&conn.mutex)
+		if sess != nil {
+			trans.connection_release(sess)
+		}
+		return
+	}
+	conn.write_closed = true
 	sync.cond_broadcast(&conn.cond)
 	sync.mutex_unlock(&conn.mutex)
-	if caller != nil && caller.conn != nil {
-		_ = caller_write(caller.conn, .HalfClose, nil, stream_id)
+	if sess != nil {
+		_ = caller_write(sess, .HalfClose, nil, stream_id)
+		trans.connection_release(sess)
 	}
 }
 
@@ -75,23 +93,115 @@ conn_close :: proc(conn: ^Conn) {
 		return
 	}
 	already_half := conn.write_closed
-	conn.write_closed = true
-	conn.closed = true
+	// Peer already half-closed. The broker ends the stream on the second
+	// HALF_CLOSE, so a CLOSE from here is a frame for a stream it has
+	// dropped (STREAM_NOT_FOUND) and the other side may already be gone.
+	peer_half := conn.eof
 	stream_id := conn.stream_id
 	caller := conn.caller
+	sync.mutex_unlock(&conn.mutex)
+	sess := caller_acquire_owned_session(caller, conn, stream_id)
+	sync.mutex_lock(&conn.mutex)
+	if conn.closed {
+		sync.mutex_unlock(&conn.mutex)
+		if sess != nil {
+			trans.connection_release(sess)
+		}
+		return
+	}
+	conn.write_closed = true
+	conn.closed = true
 	sync.cond_broadcast(&conn.cond)
 	sync.mutex_unlock(&conn.mutex)
-	if caller != nil && caller.conn != nil {
+	if sess != nil {
 		if !already_half {
-			_ = caller_write(caller.conn, .HalfClose, nil, stream_id)
+			_ = caller_write(sess, .HalfClose, nil, stream_id)
 		}
-		_ = caller_write(caller.conn, .Close, nil, stream_id)
+		if !peer_half {
+			_ = caller_write(sess, .Close, nil, stream_id)
+		}
+		trans.connection_release(sess)
 	}
-	if caller != nil {
-		sync.mutex_lock(&caller.mutex)
-		delete_key(&caller.streams, stream_id)
-		sync.mutex_unlock(&caller.mutex)
+	caller_forget_stream(caller, conn, stream_id)
+}
+
+// The session socket this stream may still write, with a reference held.
+// Nil when the stream was dropped or the session was swapped: the caller
+// must not follow caller.conn onto the replacement.
+caller_acquire_owned_session :: proc(c: ^Caller, conn: ^Conn, sid: proto.StreamId) -> ^trans.Connection {
+	if c == nil || conn == nil {
+		return nil
 	}
+	sync.mutex_lock(&c.mutex)
+	defer sync.mutex_unlock(&c.mutex)
+	sess := caller_socket_for_stream(c, conn, sid)
+	if sess == nil || !trans.connection_acquire(sess) {
+		return nil
+	}
+	return sess
+}
+
+// Holds c.mutex. The live session, or a drain that still owns this stream.
+caller_socket_for_stream :: proc(c: ^Caller, conn: ^Conn, sid: proto.StreamId) -> ^trans.Connection {
+	if c.streams[sid] == conn && c.conn != nil {
+		return c.conn
+	}
+	for d in c.drains {
+		if d != nil && !d.closed && d.streams[sid] == conn && d.conn != nil {
+			return d.conn
+		}
+	}
+	return nil
+}
+
+// Holds c.mutex. True for the current broker socket or a drain not yet closed.
+caller_socket_live :: proc(c: ^Caller, conn: ^trans.Connection) -> bool {
+	if conn == nil {
+		return false
+	}
+	if c.conn == conn {
+		return true
+	}
+	for d in c.drains {
+		if d != nil && !d.closed && d.conn == conn {
+			return true
+		}
+	}
+	return false
+}
+
+// Holds c.mutex. The generation this socket has now, if it is still the
+// live session or an open drain. A Connection allocated later at the same
+// address has a different generation.
+caller_generation_of :: proc(c: ^Caller, conn: ^trans.Connection) -> (gen: int, ok: bool) {
+	if c == nil || conn == nil {
+		return 0, false
+	}
+	if c.conn == conn {
+		return c.conn_gen, true
+	}
+	for d in c.drains {
+		if d != nil && !d.closed && d.conn == conn {
+			return d.gen, true
+		}
+	}
+	return 0, false
+}
+
+caller_forget_stream :: proc(c: ^Caller, conn: ^Conn, sid: proto.StreamId) {
+	if c == nil || conn == nil {
+		return
+	}
+	sync.mutex_lock(&c.mutex)
+	if c.streams[sid] == conn {
+		delete_key(&c.streams, sid)
+	}
+	for d in c.drains {
+		if d != nil && d.streams[sid] == conn {
+			delete_key(&d.streams, sid)
+		}
+	}
+	sync.mutex_unlock(&c.mutex)
 }
 
 // Ends the stream on this side only, sending nothing. For a stream both
@@ -111,13 +221,7 @@ conn_end_local :: proc(conn: ^Conn) {
 	caller := conn.caller
 	sync.cond_broadcast(&conn.cond)
 	sync.mutex_unlock(&conn.mutex)
-	if caller != nil {
-		sync.mutex_lock(&caller.mutex)
-		if caller.streams[stream_id] == conn {
-			delete_key(&caller.streams, stream_id)
-		}
-		sync.mutex_unlock(&caller.mutex)
-	}
+	caller_forget_stream(caller, conn, stream_id)
 }
 
 conn_new :: proc(c: ^Caller) -> ^Conn {

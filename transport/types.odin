@@ -32,6 +32,9 @@ Connection :: struct {
 	// production.
 	write_hook:    rawptr,
 	read_hook:     rawptr,
+	// Set when the kernel aborts the socket with ETIMEDOUT (TCP_USER_TIMEOUT).
+	// A read-idle poll timeout does not set this.
+	user_timed_out: bool,
 }
 
 TlsReadHook :: proc(conn: ^Connection)

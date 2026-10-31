@@ -105,7 +105,7 @@ reconnect_class_reason :: proc(class: ReconnectClass) -> string {
 	case .Disconnected:
 		return "disconnected"
 	case .RateLimited:
-		return "rate_limited"
+		return LOG_EVENT_RATE_LIMITED
 	}
 	return ""
 }

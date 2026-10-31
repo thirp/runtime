@@ -160,3 +160,71 @@ test_agent_local_dial_failure_keeps_session_and_sibling :: proc(t: ^testing.T) {
 	testing.expect(t, agent_is_connected(&agent))
 	echo_via_service(t, &fx, TEST_SERVICE, []u8{'s', 'i'})
 }
+
+// The open worker publishes the stream after shutdown has already copied
+// the table. stop has to drop that stream and return, not wait on its pump.
+@(test)
+test_open_published_after_reset_snapshot_does_not_hang_stop :: proc(t: ^testing.T) {
+	fx: TestBroker
+	start_test_broker(t, &fx)
+	defer stop_test_broker(&fx)
+
+	echo: EchoFixture
+	echo_ep := start_echo(t, &echo)
+	defer stop_echo(&echo)
+
+	agent: Agent
+	testing.expect_value(
+		t,
+		agent_init(
+			&agent,
+			AgentConfig{broker = broker_endpoint(t, &fx), token = TEST_TOKEN_HOST, insecure = true},
+		),
+		AgentError.None,
+	)
+	defer agent_test_pause_before_publish(&agent, false)
+	defer agent_test_clear_stream_wait(&agent)
+	defer agent_destroy(&agent)
+	sid := must_service(t, TEST_SERVICE)
+	testing.expect_value(t, register_service(&agent, sid, LocalTarget{address = echo_ep}), AgentError.None)
+
+	run: AgentRunArg
+	run.agent = &agent
+	th := thread.create_and_start_with_poly_data(&run, agent_run_proc)
+	defer {
+		agent_test_pause_before_publish(&agent, false)
+		if th != nil {
+			agent_stop(&agent)
+			thread.join(th)
+			thread.destroy(th)
+		}
+	}
+	wait_agent_connected(t, &agent)
+
+	agent_test_pause_before_publish(&agent, true)
+	peer := dial_broker(t, &fx)
+	if peer == nil {
+		return
+	}
+	defer trans.connection_destroy(peer)
+	decoder: proto.FrameDecoder
+	handshake_caller(t, peer, &decoder)
+	defer proto.decoder_destroy(&decoder)
+	id := must_service(t, TEST_SERVICE)
+	payload, err := proto.encode_connect(proto.Connect{service_id = id})
+	testing.expect_value(t, err, proto.ProtocolError.None)
+	if err != .None {
+		return
+	}
+	defer delete(payload)
+	must_write(t, peer, .Connect, payload)
+
+	agent_test_wait_until_open_paused(&agent)
+	agent_stop(&agent)
+	agent_test_wait_until_stream_wait(&agent)
+	agent_test_pause_before_publish(&agent, false)
+	thread.join(th)
+	thread.destroy(th)
+	th = nil
+	testing.expect(t, !agent_is_connected(&agent), "stop returned with the session still up")
+}

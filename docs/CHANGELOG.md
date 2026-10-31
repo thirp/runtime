@@ -2,6 +2,12 @@
 
 Project version is independent of the wire protocol version. This tree speaks protocol 1.0. See [COMPATIBILITY.md](COMPATIBILITY.md).
 
+## 0.16.6
+
+- Bump the runtime/release version so builds from current master are distinguishable from the shipped 0.16.5 (`8992319`). Protocol 1.0 is unchanged.
+- Check all shipped CLIs for the VERSION.txt value and build commit in `--version` output.
+- Clarify the reconnect investigation and the expected release blackhole failure in the reproduction script.
+
 ## 0.16.5
 
 Caller, Agent and Broker data-path fixes, plus the transport close/IO race fix. Protocol 1.0, the C ABI, and the wire are unchanged. This tag carries the Linux operator archive built locally (no GitHub Actions); the macOS, Windows, and multi-OS SDK archives from 0.16.4 are not rebuilt for it.
@@ -26,6 +32,7 @@ Earlier data-path fixes in this release: Protocol 1.0, the C ABI, and the wire a
 - The Agent closes its socket to the local service when that service closed first and the caller then finished (it stayed in CLOSE-WAIT).
 - The Caller session reader holds a reference on a stream while it uses it, so the owner's `conn_destroy` cannot free it underneath.
 - `thirp-connect` dials off the accept loop, passes local EOF as `HALF_CLOSE`, closes the local socket when the stream ends, polls local reads so it can stop bridges without relying on `shutdown` waking a blocked `recv` (Windows), caps concurrent connections at 256, and no longer sends a `CLOSE` after both sides half-closed.
+- thirp-agent logs AUTHENTICATE `RATE_LIMITED` as `rate_limited` (was `auth_failed` with error_code=RATE_LIMITED); bad tokens still log `auth_failed`.
 
 ## 0.16.4
 

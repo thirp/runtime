@@ -44,6 +44,12 @@ RunControl :: struct {
 	stream_stall_timeout: time.Duration,
 	// Overrides --max-stream-buffer-mib when non-zero (bytes).
 	max_stream_buffer:    int,
+	// Set while the session exists. Tests read the caller stream table
+	// through it. Nil in production (ctl is nil) and cleared before the
+	// session is destroyed.
+	caller:               ^cl.Caller,
+	// Overrides the 10s CONNECT write bound when non-zero.
+	dial_timeout:         time.Duration,
 }
 
 usage :: proc() {
@@ -268,6 +274,11 @@ connect_main :: proc(args: []string, ctl: ^RunControl = nil) -> int {
 	if ctl != nil && ctl.max_stream_buffer != 0 {
 		stream_buffer = ctl.max_stream_buffer
 	}
+	dial_timeout := cl.DEFAULT_DIAL_TIMEOUT
+	if ctl != nil && ctl.dial_timeout > 0 {
+		dial_timeout = ctl.dial_timeout
+	}
+	cl.caller_warn_short_dial_timeout(&logger, dial_timeout)
 	cerr := cl.caller_init(
 		&run.c,
 		cl.CallerConfig {
@@ -279,6 +290,7 @@ connect_main :: proc(args: []string, ctl: ^RunControl = nil) -> int {
 			implementation       = impl,
 			logger               = &logger,
 			max_stream_buffer    = stream_buffer,
+			dial_timeout         = dial_timeout,
 		},
 	)
 	if cerr != .None {
@@ -286,6 +298,12 @@ connect_main :: proc(args: []string, ctl: ^RunControl = nil) -> int {
 		return 1
 	}
 	defer cl.caller_destroy(&run.c)
+	if ctl != nil {
+		ctl.caller = &run.c
+	}
+	defer if ctl != nil {
+		ctl.caller = nil
+	}
 
 	bound, _ := trans.listener_endpoint(ln)
 	fmt.printf("thirp-connect listening on %s for %s\n", net.endpoint_to_string(bound), service)

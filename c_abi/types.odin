@@ -115,6 +115,10 @@ agent_config_from_c :: proc(cfg: ^ThirpAgentConfig) -> (ag.AgentConfig, c.int) {
 		0
 }
 
+// dial_timeout is left 0. ThirpCallerConfig has no dial field, and a hidden
+// DEFAULT_DIAL_TIMEOUT would fail dials an embedder expects to block until
+// the broker answers. send_stall_timeout is also left 0, which means the
+// default no-progress limit: a stuck socket still drops the session.
 caller_config_from_c :: proc(cfg: ^ThirpCallerConfig) -> (cl.CallerConfig, c.int) {
 	if cfg == nil {
 		return {}, ERR_INVALID_ARGUMENT

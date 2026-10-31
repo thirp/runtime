@@ -266,3 +266,77 @@ wait_caller_disconnected :: proc(t: ^testing.T, c: ^Caller, loc := #caller_locat
 	}
 	testing.expect(t, false, loc = loc)
 }
+
+when ODIN_TEST {
+// Keep this case compatible with the 0.16.5 caller API so it can also be
+// run against the tagged source, with the ByteProxy test helper copied over.
+// FIN/RST alone do not reproduce this: the old socket must stay open and silent.
+@(test)
+test_reconnect_after_silent_peer :: proc(t: ^testing.T) {
+	fx: TestBroker
+	start_test_broker(t, &fx)
+	defer stop_test_broker(&fx)
+	fx.server.session_timeout = 3 * time.Minute
+
+	echo: EchoFixture
+	ep := start_echo(t, &echo)
+	defer stop_echo(&echo)
+	agent: ag.Agent
+	run: AgentRunArg
+	ath := start_registered_agent(t, &fx, ep, &agent, &run)
+	defer stop_agent(&agent, ath)
+
+	proxy: ByteProxy
+	byte_proxy_start(t, &proxy, broker_endpoint(t, &fx))
+	defer byte_proxy_stop(&proxy)
+	c: Caller
+	err := caller_init(&c, CallerConfig {
+		broker = proxy.ep,
+		token = TEST_TOKEN_CALLER,
+		insecure = true,
+		dial_timeout = 5 * time.Second,
+	})
+	testing.expect_value(t, err, CallerError.None)
+	if err != .None {
+		return
+	}
+	defer caller_destroy(&c)
+	sid := must_service(t, TEST_SERVICE)
+	first, ferr := dial(&c, sid)
+	testing.expect_value(t, ferr, CallerError.None)
+	if first == nil {
+		return
+	}
+	testing.expect(t, echo_one(first, 's'), "initial echo failed")
+	conn_destroy(first)
+
+	// Hold a reference so an allocator cannot reuse the old socket address.
+	sync.mutex_lock(&c.mutex)
+	old := c.conn
+	trans.connection_acquire(old)
+	sync.mutex_unlock(&c.mutex)
+	defer trans.connection_release(old)
+	byte_proxy_blackhole(&proxy)
+	start := time.now()
+	replaced := false
+	for time.since(start) < 55 * time.Second {
+		sync.mutex_lock(&c.mutex)
+		replaced = c.connected && c.conn != nil && c.conn != old
+		sync.mutex_unlock(&c.mutex)
+		if replaced {
+			break
+		}
+		time.sleep(20 * time.Millisecond)
+	}
+	testing.expect(t, replaced, "silent peer never reconnected")
+	if !replaced {
+		return
+	}
+	again, aerr := dial(&c, sid)
+	testing.expect_value(t, aerr, CallerError.None)
+	if again != nil {
+		defer conn_destroy(again)
+		testing.expect(t, echo_one(again, 'r'), "new stream after silent peer did not echo")
+	}
+}
+}

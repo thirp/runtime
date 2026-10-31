@@ -1056,14 +1056,22 @@ conn_handle_stream_frame :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 
 	dest := stream_peer_opposite(from)
 	peer, _, ok := relay_acquire_peer(h.server, stream.id, dest)
-	// Terminal CLOSE/RESET/second HALF_CLOSE must reach the peer. PR #3
-	// called drop_stream_queues after enqueue, which deleted the frame
-	// that tells the agent to finish_stream — origin fds stayed open
-	// (N=256 → ~258 stuck agent fds) and late DATA hit a caller that
-	// had already dropped the stream. Drop leftover DATA first, then
-	// enqueue this terminal frame, then remove the table entry.
+	// Terminal CLOSE/RESET must reach the peer. PR #3 called
+	// drop_stream_queues after enqueue, which deleted the frame that tells
+	// the agent to finish_stream — origin fds stayed open (N=256 → ~258
+	// stuck agent fds). Drop leftover DATA first on CLOSE/RESET, then
+	// enqueue this frame, then remove the table entry.
+	//
+	// A second HALF_CLOSE also ends the stream, but frames already accepted
+	// (the response, the other side's HALF_CLOSE) are still in order ahead
+	// of this one. Dropping them threw away that EOF. The side waiting on
+	// it never finished: thirp-connect left the bridge thread and the local
+	// socket up, and the agent left the origin socket in CLOSE-WAIT. The
+	// broker still logged connect_ok for the next stream, then
+	// STREAM_NOT_FOUND for whatever frame followed the drop. Leave those
+	// frames queued and append this HALF_CLOSE after them.
 	terminal := stream_state_is_terminal(stream.state)
-	if terminal {
+	if terminal && event != .HalfClose {
 		server_drop_stream_queues(h.server, stream)
 	}
 	if ok {

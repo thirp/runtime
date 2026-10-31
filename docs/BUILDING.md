@@ -154,6 +154,13 @@ On Windows, ensure OpenSSL 3 DLLs are in PATH.
 A test run is not successful if it logs `+++ leak`, even when the process exits
 with status 0.
 
+On Linux, check the built CLIs against `VERSION.txt` and the current git commit
+using the release build flags:
+
+```bash
+bash scripts/cli_version_test.sh
+```
+
 ## Build SDK examples
 
 The examples use the same `thirp:` collection paths supported by packaged SDKs.

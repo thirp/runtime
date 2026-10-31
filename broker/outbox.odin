@@ -28,6 +28,10 @@ ConnOutbox :: struct {
 	closed:       bool,
 	refs:         int,
 	writer:       ^thread.Thread,
+	// Test only. While set, the writer leaves queued frames in place so a
+	// test can observe what a terminal HALF_CLOSE does to them. Production
+	// leaves it false. Shutdown (closed) still drains.
+	writer_hold:  bool,
 }
 
 outbox_counts_as_data :: proc(opcode: proto.Opcode) -> bool {
@@ -390,7 +394,7 @@ outbox_writer_proc :: proc(box: ^ConnOutbox) {
 	allocator := box.allocator
 	for {
 		sync.mutex_lock(&box.mutex)
-		for !box.closed && !outbox_has_frame_locked(box) {
+		for !box.closed && (!outbox_has_frame_locked(box) || box.writer_hold) {
 			sync.cond_wait(&box.cond, &box.mutex)
 		}
 		if box.closed && !outbox_has_frame_locked(box) {
@@ -472,6 +476,31 @@ server_enqueue_failure :: proc(
 	}
 	defer outbox_release(box)
 	return outbox_enqueue_failure(box, opcode, code, stream_id)
+}
+
+// Holds the outbox writer so queued frames stay observable. Same package
+// tests use this; production never sets it.
+outbox_set_writer_hold :: proc(box: ^ConnOutbox, hold: bool) {
+	if box == nil {
+		return
+	}
+	sync.mutex_lock(&box.mutex)
+	box.writer_hold = hold
+	sync.cond_broadcast(&box.cond)
+	sync.mutex_unlock(&box.mutex)
+}
+
+outbox_queued :: proc(box: ^ConnOutbox, stream_id: proto.StreamId) -> int {
+	if box == nil {
+		return 0
+	}
+	sync.mutex_lock(&box.mutex)
+	defer sync.mutex_unlock(&box.mutex)
+	q, found := box.queues[stream_id]
+	if !found {
+		return 0
+	}
+	return len(q)
 }
 
 server_drop_stream_queues :: proc(server: ^Server, stream: RelayStream) {

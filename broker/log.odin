@@ -96,43 +96,5 @@ peer_role_reason :: proc(role: proto.PeerRole) -> string {
 }
 
 wire_error_name :: proc(err: proto.WireError) -> string {
-	switch err {
-	case .None:
-		return "OK"
-	case .ProtocolError:
-		return "PROTOCOL_ERROR"
-	case .UnsupportedVersion:
-		return "UNSUPPORTED_VERSION"
-	case .AuthenticationFailed:
-		return "AUTHENTICATION_FAILED"
-	case .Unauthorized:
-		return "UNAUTHORIZED"
-	case .InvalidServiceId:
-		return "INVALID_SERVICE_ID"
-	case .ServiceNotFound:
-		return "SERVICE_NOT_FOUND"
-	case .ServiceAlreadyRegistered:
-		return "SERVICE_ALREADY_REGISTERED"
-	case .AgentUnavailable:
-		return "AGENT_UNAVAILABLE"
-	case .LocalServiceUnavailable:
-		return "LOCAL_SERVICE_UNAVAILABLE"
-	case .QuotaExceeded:
-		return "QUOTA_EXCEEDED"
-	case .RateLimited:
-		return "RATE_LIMITED"
-	case .StreamNotFound:
-		return "STREAM_NOT_FOUND"
-	case .StreamAlreadyExists:
-		return "STREAM_ALREADY_EXISTS"
-	case .FrameTooLarge:
-		return "FRAME_TOO_LARGE"
-	case .Timeout:
-		return "TIMEOUT"
-	case .BrokerDraining:
-		return "BROKER_DRAINING"
-	case .InternalError:
-		return "INTERNAL_ERROR"
-	}
-	return "INTERNAL_ERROR"
+	return proto.wire_error_name(err)
 }

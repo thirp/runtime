@@ -3,6 +3,8 @@ package broker
 import auth "../auth"
 import proto "../protocol"
 import trans "../transport"
+import "core:net"
+import "core:sync"
 import "core:testing"
 import "core:thread"
 import "core:time"
@@ -314,6 +316,154 @@ test_relay_agent_disconnect_resets_stream_and_drops_registration :: proc(t: ^tes
 		time.sleep(5 * time.Millisecond)
 	}
 	testing.expect_value(t, service_count(&reg), 0)
+}
+
+// Caller DATA is stuck because the agent outbox is not draining, so the
+// broker caller thread sits in outbox_wait and stops reading. Killing the
+// agent session must unblock that write and deliver RESET. A write that
+// is still stuck after the session is gone is the caller wedge: this
+// broker never came back to read, so a later CONNECT stays in the kernel.
+BLOCKED_CHUNK :: 4 * 1024
+BLOCKED_TOTAL :: 1024 * 1024
+
+BlockedWrite :: struct {
+	conn:      ^trans.Connection,
+	stream_id: proto.StreamId,
+	done:      bool, // atomic
+	sent:      int, // atomic
+	terr:      trans.TransportError,
+	perr:      proto.ProtocolError,
+}
+
+blocked_write_proc :: proc(w: ^BlockedWrite) {
+	chunk := make([]u8, BLOCKED_CHUNK)
+	defer delete(chunk)
+	sent := 0
+	for sent < BLOCKED_TOTAL {
+		w.terr, w.perr = trans.write_frame(w.conn, .Data, chunk, w.stream_id)
+		if w.terr != .None || w.perr != .None {
+			break
+		}
+		sent += BLOCKED_CHUNK
+		sync.atomic_store(&w.sent, sent)
+	}
+	sync.atomic_store(&w.done, true)
+}
+
+@(test)
+test_blocked_caller_write_unblocks_when_agent_session_dies :: proc(t: ^testing.T) {
+	reg: Registry
+	store: auth.StaticTokenAuth
+	server: Server
+	quiet_test_server(t, &server, &reg, &store)
+	defer stop_test_server(&server, &store, &reg)
+	// One chunk fills the stream. The next DATA frame is read and then the
+	// caller thread waits; further frames sit in the kernel until it reads.
+	server.max_stream_buffer = BLOCKED_CHUNK
+
+	agent, agent_dec := register_test_agent(t, &server)
+	agent_open := true
+	defer if agent_open {
+		trans.connection_destroy(agent)
+	}
+	defer proto.decoder_destroy(&agent_dec)
+
+	caller := dial_server(t, &server)
+	defer trans.connection_destroy(caller)
+	caller_dec: proto.FrameDecoder
+	handshake_caller(t, caller, &caller_dec)
+	defer proto.decoder_destroy(&caller_dec)
+
+	sid := open_test_stream(t, agent, &agent_dec, caller, &caller_dec)
+	stream, found := relay_lookup_stream(&server, sid)
+	testing.expect(t, found, "stream")
+	if !found {
+		return
+	}
+	box := server_lookup_outbox(&server, stream.agent_conn)
+	testing.expect(t, box != nil, "agent outbox")
+	if box == nil {
+		return
+	}
+	defer outbox_release(box)
+	outbox_set_writer_hold(box, true)
+	defer outbox_set_writer_hold(box, false)
+
+	w := BlockedWrite {
+		conn = caller,
+		stream_id = sid,
+	}
+	// Loopback send buffers are megabytes. Shrink this one so the write
+	// stops in the kernel once the broker stops reading, which is the same
+	// state a full production buffer reaches.
+	testing.expect_value(t, net.set_option(caller.socket, .Send_Buffer_Size, 16 * 1024), net.Socket_Option_Error.None)
+	// Backstop so a real wedge fails the assertion instead of hanging the
+	// process. The pass condition is the write finishing within 1s of the
+	// agent session dying, not this timeout.
+	_ = trans.connection_set_send_timeout(caller, 8 * time.Second)
+	th := thread.create_and_start_with_poly_data(&w, blocked_write_proc)
+	testing.expect(t, th != nil, "writer thread")
+	if th == nil {
+		return
+	}
+	defer {
+		thread.join(th)
+		thread.destroy(th)
+	}
+	start := time.now()
+	blocked := false
+	for time.since(start) < 2 * time.Second {
+		if sync.atomic_load(&w.done) {
+			break
+		}
+		if outbox_queued(box, sid) >= 1 {
+			time.sleep(50 * time.Millisecond)
+			blocked = !sync.atomic_load(&w.done)
+			break
+		}
+		time.sleep(5 * time.Millisecond)
+	}
+	testing.expectf(
+		t,
+		blocked,
+		"DATA write did not block (done=%v sent=%d terr=%v perr=%v queued=%d)",
+		sync.atomic_load(&w.done),
+		sync.atomic_load(&w.sent),
+		w.terr,
+		w.perr,
+		outbox_queued(box, sid),
+	)
+	if !blocked {
+		return
+	}
+
+	trans.connection_destroy(agent)
+	agent_open = false
+
+	deadline := time.now()
+	for !sync.atomic_load(&w.done) {
+		if time.since(deadline) > 1 * time.Second {
+			break
+		}
+		time.sleep(5 * time.Millisecond)
+	}
+	testing.expect(t, sync.atomic_load(&w.done), "caller DATA write still blocked after agent session died")
+	testing.expect_value(t, w.terr, trans.TransportError.None)
+	testing.expect_value(t, w.perr, proto.ProtocolError.None)
+
+	// Closing the agent outbox fails the caller thread's outbox_wait, which
+	// resets InternalError, unless cleanup already sent AgentUnavailable.
+	// Either code means the DATA write finished and the broker read again.
+	_ = trans.connection_set_recv_timeout(caller, 1 * time.Second)
+	reset := must_read_opcode(t, caller, &caller_dec, .Reset)
+	code := read_wire_failure(t, reset)
+	proto.frame_destroy(&reset)
+	testing.expectf(
+		t,
+		code == .InternalError || code == .AgentUnavailable,
+		"blocked write reset %v",
+		code,
+	)
 }
 
 @(test)

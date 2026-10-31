@@ -61,7 +61,7 @@ log_event :: proc(logger: ^Logger, level: LogLevel, event: string, fields: LogFi
 		append_string(&buf, ",\"session_id\":")
 		append_u64(&buf, fields.session_id)
 	}
-	if fields.stream_id != 0 {
+	if fields.stream_id != 0 || fields.stream_id_set {
 		append_string(&buf, ",\"stream_id\":")
 		append_u64(&buf, fields.stream_id)
 	}
@@ -74,6 +74,18 @@ log_event :: proc(logger: ^Logger, level: LogLevel, event: string, fields: LogFi
 	append_opt_string(&buf, "remote_address", fields.remote_address)
 	append_opt_string(&buf, "error_code", fields.error_code)
 	append_opt_string(&buf, "reason", fields.reason)
+	if fields.streams_set {
+		append_string(&buf, ",\"streams\":")
+		append_u64(&buf, u64(fields.streams))
+	}
+	if fields.dial_timeout_ms != 0 {
+		append_string(&buf, ",\"dial_timeout_ms\":")
+		append_u64(&buf, u64(fields.dial_timeout_ms))
+	}
+	if fields.cap_floor_ms != 0 {
+		append_string(&buf, ",\"cap_floor_ms\":")
+		append_u64(&buf, u64(fields.cap_floor_ms))
+	}
 	append_string(&buf, "}\n")
 	logger.sink(string(buf[:]))
 }

@@ -62,6 +62,7 @@ caller_init :: proc(c: ^Caller, config: CallerConfig) -> CallerError {
 	if derr != .None {
 		caller_free_config(c)
 		delete(c.streams)
+		c.streams = nil
 		return .Transport
 	}
 	c.conn = conn
@@ -70,18 +71,48 @@ caller_init :: proc(c: ^Caller, config: CallerConfig) -> CallerError {
 		c.conn = nil
 		caller_free_config(c)
 		delete(c.streams)
+		c.streams = nil
 		return .Internal
 	}
+	// Handshake writes Hello and Authenticate through the session queue.
+	caller_bind_session(c, conn)
 	if hs := caller_handshake(c); hs != .None {
+		caller_unbind_session(conn)
+		caller_delete_queues(c)
 		proto.decoder_destroy(&c.decoder)
 		trans.connection_destroy(conn)
 		c.conn = nil
 		caller_free_config(c)
 		delete(c.streams)
+		c.streams = nil
 		return hs
 	}
+	if !caller_start_stall(c) {
+		caller_unbind_session(conn)
+		caller_delete_queues(c)
+		proto.decoder_destroy(&c.decoder)
+		trans.connection_destroy(conn)
+		c.conn = nil
+		caller_free_config(c)
+		delete(c.streams)
+		c.streams = nil
+		return .Internal
+	}
+	c.last_recv = time.now()
 	c.connected = true
 	c.reader = thread.create_and_start_with_poly_data(c, caller_reader_proc)
+	if c.reader == nil {
+		caller_stop_stall(c)
+		caller_unbind_session(conn)
+		caller_delete_queues(c)
+		proto.decoder_destroy(&c.decoder)
+		trans.connection_destroy(conn)
+		c.conn = nil
+		caller_free_config(c)
+		delete(c.streams)
+		c.streams = nil
+		return .Internal
+	}
 	return .None
 }
 
@@ -99,10 +130,13 @@ caller_destroy :: proc(c: ^Caller) {
 		// reader is joined below; connection_destroy runs after that.
 		trans.connection_shutdown_both(c.conn)
 	}
+	caller_signal_drains(c)
 	if c.pending != nil {
 		c.pending_err = .Closed
 		c.pending = nil
 	}
+	c.pending_tombstone = false
+	c.tombstone_capped = false
 	// End every stream before the join so owners wake at once. Take them
 	// out of the table first (with a reference), as caller_fail_all does:
 	// a finished stream left in the table is freed by its owner's
@@ -117,14 +151,33 @@ caller_destroy :: proc(c: ^Caller) {
 		c.reader = nil
 	}
 	sync.mutex_lock(&c.mutex)
+	for sync.atomic_load(&c.drain_live) != 0 {
+		sync.cond_wait(&c.cond, &c.mutex)
+	}
+	delete(c.drains)
+	c.drains = nil
+	sync.mutex_unlock(&c.mutex)
+	caller_stop_stall(c)
+	// Reconnect may have installed a socket after the shutdown above.
+	sync.mutex_lock(&c.mutex)
+	if c.conn != nil {
+		trans.connection_shutdown_both(c.conn)
+	}
 	caller_take_and_finish_all(c)
 	sync.mutex_unlock(&c.mutex)
-	delete(c.streams)
-	proto.decoder_destroy(&c.decoder)
-	if c.conn != nil {
-		trans.connection_destroy(c.conn)
-		c.conn = nil
+	caller_close_writes(c)
+	sync.mutex_lock(&c.mutex)
+	prev := c.conn
+	c.conn = nil
+	sync.mutex_unlock(&c.mutex)
+	if prev != nil {
+		caller_unbind_session(prev)
+		trans.connection_destroy(prev)
 	}
+	caller_delete_queues(c)
+	delete(c.streams)
+	c.streams = nil
+	proto.decoder_destroy(&c.decoder)
 	caller_free_config(c)
 }
 
@@ -163,17 +216,24 @@ caller_free_config :: proc(c: ^Caller) {
 }
 
 caller_dial_broker :: proc(c: ^Caller) -> (^trans.Connection, trans.TransportError) {
+	conn: ^trans.Connection
+	derr: trans.TransportError
 	if c.config.insecure {
-		return trans.connection_dial(c.config.broker)
+		conn, derr = trans.connection_dial(c.config.broker)
+	} else {
+		name := c.config.tls_server_name
+		if len(name) == 0 {
+			name = net.address_to_string(c.config.broker.address)
+		}
+		conn, derr = trans.connection_dial_tls(
+			c.config.broker,
+			trans.TlsClientConfig{ca_path = c.config.tls_ca, server_name = name},
+		)
 	}
-	name := c.config.tls_server_name
-	if len(name) == 0 {
-		name = net.address_to_string(c.config.broker.address)
+	if derr == .None {
+		caller_set_user_timeout(conn)
 	}
-	return trans.connection_dial_tls(
-		c.config.broker,
-		trans.TlsClientConfig{ca_path = c.config.tls_ca, server_name = name},
-	)
+	return conn, derr
 }
 
 caller_handshake :: proc(c: ^Caller) -> CallerError {
@@ -241,19 +301,6 @@ caller_handshake :: proc(c: ^Caller) -> CallerError {
 	return .None
 }
 
-caller_write :: proc(
-	conn: ^trans.Connection,
-	opcode: proto.Opcode,
-	payload: []u8,
-	stream_id: proto.StreamId = proto.CONNECTION_STREAM_ID,
-) -> bool {
-	if conn == nil {
-		return false
-	}
-	terr, perr := trans.write_frame(conn, opcode, payload, stream_id)
-	return terr == .None && perr == .None
-}
-
 caller_read :: proc(
 	conn: ^trans.Connection,
 	decoder: ^proto.FrameDecoder,
@@ -287,71 +334,81 @@ caller_write_failure :: proc(
 caller_reader_proc :: proc(c: ^Caller) {
 	attempt := 0
 	for !sync.atomic_load(&c.stop) {
-		if caller_read_session(c) {
+		end := caller_read_session(c)
+		if end == .Stopped || sync.atomic_load(&c.stop) {
 			return
 		}
-		if sync.atomic_load(&c.stop) {
-			return
+		// Retire the socket before the log consumes disconnect_reason.
+		// A dial failing in between must see conn_gen move. It does not
+		// hold a reference on the old connection, so it cannot look at it.
+		// A retire has already parked that socket; this only bumps gen.
+		caller_drop_conn(c)
+		if end == .Dropped {
+			reason := caller_take_disconnect_reason(c)
+			when ODIN_TEST {
+				sync.mutex_lock(&c.mutex)
+				c.last_disconnect_reason = reason
+				sync.mutex_unlock(&c.mutex)
+			}
+			caller_log(
+				c,
+				.Info,
+				LOG_EVENT_DISCONNECTED,
+				log.LogFields {
+					streams     = c.dropped_streams,
+					streams_set = true,
+					reason      = reason,
+				},
+			)
 		}
-		caller_log(c, .Info, "disconnected")
 		if !caller_reconnect(c, &attempt) {
 			return
 		}
 	}
 }
 
-caller_read_session :: proc(c: ^Caller) -> (stopped: bool) {
+caller_read_session :: proc(c: ^Caller) -> SessionRead {
 	for !sync.atomic_load(&c.stop) {
+		if caller_read_idle(c) {
+			return .Dropped
+		}
+		switch caller_expire_tombstone(c) {
+		case .Dropped:
+			return .Dropped
+		case .Retired:
+			return .Retired
+		case .Continue, .Stopped:
+		}
+		caller_maybe_ping(c, c.conn, c.last_recv, &c.last_ping)
 		_ = trans.connection_set_recv_timeout(c.conn, CALLER_POLL_INTERVAL)
 		frame, terr, perr := trans.read_frame(c.conn, &c.decoder)
 		if terr == .Timeout {
 			continue
 		}
 		if terr != .None || perr != .None {
-			caller_fail_all(c, .Transport)
-			return false
-		}
-		switch frame.header.opcode {
-		case .ConnectOk:
-			caller_handle_connect_ok(c, frame.header.stream_id)
-		case .ConnectFailed:
-			fail, _ := proto.decode_wire_failure(frame.payload)
-			code, _ := proto.wire_error_from_u16(fail.code)
-			delete(fail.diagnostic)
-			caller_handle_connect_failed(c, wire_to_caller_error(code))
-		case .Data:
-			caller_handle_data(c, frame)
-		case .HalfClose:
-			caller_handle_half_close(c, frame.header.stream_id)
-		case .Close, .Reset:
-			kind: ConnError = frame.header.opcode == .Reset ? .Reset : .Closed
-			caller_handle_close(c, frame.header.stream_id, kind)
-		case .Ping:
-			msg, merr := proto.decode_ping(frame.payload)
-			if merr == .None {
-				pong, _ := proto.encode_pong(proto.Pong{nonce = msg.nonce})
-				_ = caller_write(c.conn, .Pong, pong)
-				delete(pong)
+			// TCP_USER_TIMEOUT aborts an unacked Ping before the idle
+			// watchdog. A clean FIN leaves the flag clear (recv 0 does
+			// not update errno), so that stays peer_close.
+			if trans.connection_user_timed_out(c.conn) {
+				caller_note_disconnect(c, LOG_REASON_DEAD_PEER)
 			}
-		case .Pong:
-		case .Error:
-			proto.frame_destroy(&frame)
+			caller_finish_disconnect_reason(c, terr, perr)
 			caller_fail_all(c, .Transport)
-			return false
-		case .Hello, .HelloAck, .Authenticate, .AuthenticateOk, .AuthenticateFailed,
-		     .Register, .RegisterOk, .RegisterFailed, .Unregister, .UnregisterOk,
-		     .UnregisterFailed, .Connect, .Open, .OpenOk, .OpenFailed:
-			proto.frame_destroy(&frame)
-			caller_fail_all(c, .Transport)
-			return false
+			return .Dropped
 		}
+		caller_note_recv(c)
+		end := caller_handle_frame(c, &c.streams, c.conn, c.conn_gen, nil, frame)
 		proto.frame_destroy(&frame)
+		if end != .Continue {
+			return end
+		}
 	}
-	return true
+	return .Stopped
 }
 
 caller_reconnect :: proc(c: ^Caller, attempt: ^int) -> bool {
-	caller_drop_conn(c)
+	// The reader already dropped the dead socket, before it cleared
+	// disconnect_reason. Dropping again would only bump conn_gen.
 	proto.decoder_destroy(&c.decoder)
 	if proto.decoder_init(&c.decoder) != .None {
 		return false
@@ -383,6 +440,8 @@ caller_reconnect :: proc(c: ^Caller, attempt: ^int) -> bool {
 		hs := caller_handshake(c)
 		if hs == .None {
 			sync.mutex_lock(&c.mutex)
+			c.last_recv = time.now()
+			c.last_ping = {}
 			c.connected = true
 			sync.cond_broadcast(&c.cond)
 			sync.mutex_unlock(&c.mutex)
@@ -414,9 +473,19 @@ caller_set_conn :: proc(c: ^Caller, conn: ^trans.Connection) {
 	sync.mutex_lock(&c.mutex)
 	prev := c.conn
 	c.conn = conn
+	c.conn_gen += 1
 	sync.mutex_unlock(&c.mutex)
 	if prev != nil && prev != conn {
+		// A DATA send may still be inside write_frame on this socket.
+		// Unbind so new frames miss it, shut it down so that send returns,
+		// then wait until the drainer has left before freeing it.
+		caller_unbind_session(prev)
+		trans.connection_shutdown_both(prev)
+		caller_wait_writes(c)
 		trans.connection_destroy(prev)
+	}
+	if conn != nil {
+		caller_bind_session(c, conn)
 	}
 }
 
@@ -446,6 +515,188 @@ caller_log :: proc(c: ^Caller, level: log.LogLevel, event: string, fields: log.L
 	log.log_event(c.config.logger, level, event, fields)
 }
 
+// One warning. Ingress and thirp-connect call this at startup. A dial
+// timeout under DIAL_TIMEOUT_WARN_BELOW still waits out TOMBSTONE_CAP_FLOOR
+// before a retire. The floor does not stop the agent's serial local dial
+// (default 5s) from holding the head of the line: at 2s or below, a
+// healthy service stays blocked until that local dial fails. Do not set
+// --broker-dial-timeout below 6s. The default is 10s.
+caller_warn_short_dial_timeout :: proc(logger: ^log.Logger, dial_timeout: time.Duration) {
+	if dial_timeout <= 0 || dial_timeout >= DIAL_TIMEOUT_WARN_BELOW {
+		return
+	}
+	log.log_event(
+		logger,
+		.Warn,
+		LOG_EVENT_DIAL_TIMEOUT_SHORT,
+		log.LogFields {
+			reason          = LOG_REASON_DIAL_TIMEOUT,
+			dial_timeout_ms = int(dial_timeout / time.Millisecond),
+			cap_floor_ms    = int(TOMBSTONE_CAP_FLOOR / time.Millisecond),
+		},
+	)
+}
+
+caller_read_idle_limit :: proc(c: ^Caller) -> time.Duration {
+	when ODIN_TEST {
+		if c != nil && c.config.read_idle_timeout > 0 {
+			return c.config.read_idle_timeout
+		}
+	}
+	return READ_IDLE_TIMEOUT
+}
+
+caller_ping_interval :: proc(c: ^Caller) -> time.Duration {
+	when ODIN_TEST {
+		if c != nil && c.config.ping_interval > 0 {
+			return c.config.ping_interval
+		}
+	}
+	return CALLER_PING_INTERVAL
+}
+
+// Send Ping when the broker has been quiet for a ping interval. Does not
+// move last_recv: only the Pong, or any other frame, does. A failed write
+// leaves last_ping alone so the next poll tries again.
+caller_maybe_ping :: proc(c: ^Caller, conn: ^trans.Connection, last_recv: time.Time, last_ping: ^time.Time) {
+	if c == nil || conn == nil || last_ping == nil {
+		return
+	}
+	interval := caller_ping_interval(c)
+	if interval <= 0 {
+		return
+	}
+	if time.since(last_recv) < interval || time.since(last_ping^) < interval {
+		return
+	}
+	payload, err := proto.encode_ping(proto.Ping{nonce = jitter_u64()})
+	if err != .None {
+		return
+	}
+	defer delete(payload)
+	if caller_write(conn, .Ping, payload) {
+		last_ping^ = time.now()
+	}
+}
+
+// One dispatcher for the live session and a retired drain. drain == nil is
+// the live session. The caller destroys the frame.
+caller_handle_frame :: proc(
+	c: ^Caller,
+	streams: ^map[proto.StreamId]^Conn,
+	conn: ^trans.Connection,
+	gen: int,
+	drain: ^CallerDrain,
+	frame: proto.Frame,
+) -> SessionRead {
+	switch frame.header.opcode {
+	case .ConnectOk:
+		if drain != nil {
+			sync.mutex_lock(&c.mutex)
+			held := false
+			dconn := drain.conn
+			if drain.tombstone && dconn != nil && !drain.closed && drain.gen == gen {
+				drain.tombstone = false
+				held = trans.connection_acquire(dconn)
+			}
+			sync.mutex_unlock(&c.mutex)
+			if held {
+				caller_reset_enqueue(c, dconn, gen, frame.header.stream_id)
+			}
+			return .Continue
+		}
+		caller_handle_connect_ok(c, frame.header.stream_id)
+	case .ConnectFailed:
+		if drain != nil {
+			sync.mutex_lock(&c.mutex)
+			drain.tombstone = false
+			sync.mutex_unlock(&c.mutex)
+			return .Continue
+		}
+		fail, _ := proto.decode_wire_failure(frame.payload)
+		code, _ := proto.wire_error_from_u16(fail.code)
+		delete(fail.diagnostic)
+		caller_handle_connect_failed(c, wire_to_caller_error(code))
+	case .Data:
+		caller_handle_data(c, streams, conn, frame)
+	case .HalfClose:
+		caller_handle_half_close(c, streams, frame.header.stream_id)
+	case .Close, .Reset:
+		kind: ConnError = frame.header.opcode == .Reset ? .Reset : .Closed
+		caller_handle_close(c, streams, frame.header.stream_id, kind, frame.payload)
+	case .Ping:
+		msg, merr := proto.decode_ping(frame.payload)
+		if merr == .None {
+			pong, _ := proto.encode_pong(proto.Pong{nonce = msg.nonce})
+			_ = caller_write(conn, .Pong, pong)
+			delete(pong)
+		}
+	case .Pong:
+	case .Error, .Hello, .HelloAck, .Authenticate, .AuthenticateOk, .AuthenticateFailed,
+	     .Register, .RegisterOk, .RegisterFailed, .Unregister, .UnregisterOk,
+	     .UnregisterFailed, .Connect, .Open, .OpenOk, .OpenFailed:
+		if drain != nil {
+			sync.mutex_lock(&c.mutex)
+			drain.stop = true
+			sync.mutex_unlock(&c.mutex)
+			return .Continue
+		}
+		caller_note_disconnect(c, LOG_REASON_ERROR)
+		caller_fail_all(c, .Transport)
+		return .Dropped
+	}
+	return .Continue
+}
+
+// First cause wins. The stall timer sets this before it shuts the socket;
+// a later read error must not relabel that as a peer close.
+caller_note_disconnect :: proc(c: ^Caller, reason: string) {
+	if c == nil || len(reason) == 0 {
+		return
+	}
+	sync.mutex_lock(&c.mutex)
+	if len(c.disconnect_reason) == 0 {
+		c.disconnect_reason = reason
+	}
+	sync.mutex_unlock(&c.mutex)
+}
+
+// Fill the reason from the read that ended the session, if nothing earlier
+// (the stall timer) already named the cause.
+caller_finish_disconnect_reason :: proc(c: ^Caller, terr: trans.TransportError, perr: proto.ProtocolError) {
+	sync.mutex_lock(&c.mutex)
+	if len(c.disconnect_reason) == 0 {
+		if terr == .Closed && perr == .None {
+			c.disconnect_reason = LOG_REASON_PEER_CLOSE
+		} else {
+			c.disconnect_reason = LOG_REASON_ERROR
+		}
+	}
+	sync.mutex_unlock(&c.mutex)
+}
+
+when ODIN_TEST {
+	caller_last_disconnect_reason :: proc(c: ^Caller) -> string {
+		if c == nil {
+			return ""
+		}
+		sync.mutex_lock(&c.mutex)
+		defer sync.mutex_unlock(&c.mutex)
+		return c.last_disconnect_reason
+	}
+}
+
+caller_take_disconnect_reason :: proc(c: ^Caller) -> string {
+	sync.mutex_lock(&c.mutex)
+	reason := c.disconnect_reason
+	c.disconnect_reason = ""
+	sync.mutex_unlock(&c.mutex)
+	if len(reason) == 0 {
+		return LOG_REASON_ERROR
+	}
+	return reason
+}
+
 tls_ca_readable :: proc(path: string) -> bool {
 	if len(path) == 0 {
 		return true
@@ -460,40 +711,200 @@ tls_ca_readable :: proc(path: string) -> bool {
 
 caller_handle_connect_ok :: proc(c: ^Caller, stream_id: proto.StreamId) {
 	sync.mutex_lock(&c.mutex)
+	conn := c.conn
+	gen := c.conn_gen
+	held := conn != nil && trans.connection_acquire(conn)
+	// The dial that sent this CONNECT already gave up. RESET the stream.
+	// Do not bind it to whoever is waiting for the slot next.
+	if c.pending_tombstone {
+		c.pending_tombstone = false
+		c.tombstone_capped = false
+		sync.cond_broadcast(&c.cond)
+		sync.mutex_unlock(&c.mutex)
+		if held {
+			caller_reset_enqueue(c, conn, gen, stream_id)
+		}
+		return
+	}
 	pending := c.pending
 	c.pending = nil
 	if pending != nil {
 		pending.stream_id = stream_id
+		pending.accepted = true
 		c.streams[stream_id] = pending
 		c.pending_err = .None
 		sync.cond_broadcast(&c.cond)
 		sync.mutex_unlock(&c.mutex)
+		if held {
+			trans.connection_release(conn)
+		}
 		return
 	}
 	sync.cond_broadcast(&c.cond)
 	sync.mutex_unlock(&c.mutex)
-	_ = caller_write_failure(c.conn, .Reset, .Timeout, stream_id)
+	if held {
+		caller_reset_enqueue(c, conn, gen, stream_id)
+	}
 }
 
 caller_handle_connect_failed :: proc(c: ^Caller, err: CallerError) {
 	sync.mutex_lock(&c.mutex)
+	if c.pending_tombstone {
+		c.pending_tombstone = false
+		c.tombstone_capped = false
+		sync.cond_broadcast(&c.cond)
+		sync.mutex_unlock(&c.mutex)
+		return
+	}
 	c.pending = nil
 	c.pending_err = err
 	sync.cond_broadcast(&c.cond)
 	sync.mutex_unlock(&c.mutex)
 }
 
+// Takes ownership of the reference on conn. Posts a control RESET on the
+// session writer and returns. The writer sends it only if this socket is
+// still that generation (the live session or the drain parked from it),
+// then releases the reference. The reader does not wait.
+caller_reset_enqueue :: proc(c: ^Caller, conn: ^trans.Connection, gen: int, stream_id: proto.StreamId) {
+	if c == nil || conn == nil {
+		if conn != nil {
+			trans.connection_release(conn)
+		}
+		return
+	}
+	payload, err := proto.encode_wire_failure(
+		proto.WireFailure{code = proto.wire_error_to_u16(.Timeout), diagnostic = ""},
+	)
+	if err != .None {
+		trans.connection_release(conn)
+		return
+	}
+	defer delete(payload)
+	job := caller_enqueue(c, conn, .Reset, payload, stream_id, gen, false, true)
+	if job == nil {
+		trans.connection_release(conn)
+	}
+}
+
+// Holds c.mutex. The socket the CONNECT_OK arrived on, not whichever
+// session is current after a retire or a reconnect.
+caller_reset_targets :: proc(c: ^Caller, conn: ^trans.Connection, gen: int) -> bool {
+	if conn == nil {
+		return false
+	}
+	if c.conn == conn && c.conn_gen == gen {
+		return true
+	}
+	for d in c.drains {
+		if d != nil && !d.closed && d.conn == conn && d.gen == gen {
+			return true
+		}
+	}
+	return false
+}
+
+// The tombstone has waited TOMBSTONE_DIAL_TIMEOUTS past the dial timeout.
+// With no live streams, drop the session. With live streams, park this
+// socket and let the reader open another for new dials. A second caller
+// session from the same identity is accepted by the broker, so the parked
+// one is not kicked.
+caller_expire_tombstone :: proc(c: ^Caller) -> SessionRead {
+	sync.mutex_lock(&c.mutex)
+	if !c.pending_tombstone || !c.tombstone_capped || time.diff(time.now(), c.tombstone_deadline) > 0 {
+		sync.mutex_unlock(&c.mutex)
+		return .Continue
+	}
+	if len(c.streams) > 0 && c.conn != nil {
+		nstreams := len(c.streams)
+		d := caller_park_drain(c)
+		sync.mutex_unlock(&c.mutex)
+		if d == nil {
+			caller_fail_all(c, .Transport)
+			return .Dropped
+		}
+		caller_log(
+			c,
+			.Info,
+			LOG_EVENT_SESSION_RETIRED,
+			log.LogFields {
+				streams     = nstreams,
+				streams_set = true,
+				reason      = LOG_REASON_TOMBSTONE,
+			},
+		)
+		sync.atomic_add(&c.drain_live, 1)
+		thread.run_with_poly_data(d, caller_drain_proc)
+		return .Retired
+	}
+	if len(c.disconnect_reason) == 0 {
+		c.disconnect_reason = LOG_REASON_TOMBSTONE
+	}
+	conn := c.conn
+	held := conn != nil && trans.connection_acquire(conn)
+	sync.mutex_unlock(&c.mutex)
+	if held {
+		trans.connection_shutdown_both(conn)
+		trans.connection_release(conn)
+	}
+	caller_fail_all(c, .Transport)
+	return .Dropped
+}
+
+caller_note_recv :: proc(c: ^Caller) {
+	sync.mutex_lock(&c.mutex)
+	c.last_recv = time.now()
+	c.recv_gen += 1
+	sync.mutex_unlock(&c.mutex)
+}
+
+// No frame from the broker for the read-idle limit. Shut the socket down
+// so the reader reconnects. Poll timeouts and our own Ping do not count.
+caller_read_idle :: proc(c: ^Caller) -> bool {
+	sync.mutex_lock(&c.mutex)
+	if c.conn == nil || time.since(c.last_recv) < caller_read_idle_limit(c) {
+		sync.mutex_unlock(&c.mutex)
+		return false
+	}
+	if len(c.disconnect_reason) == 0 {
+		c.disconnect_reason = LOG_REASON_IDLE
+	}
+	conn := c.conn
+	held := trans.connection_acquire(conn)
+	sync.mutex_unlock(&c.mutex)
+	if held {
+		trans.connection_shutdown_both(conn)
+		trans.connection_release(conn)
+	}
+	caller_fail_all(c, .Transport)
+	return true
+}
+
 // Looks a stream up for the session reader and takes a reference, so the
 // owner's conn_destroy cannot free it while the reader is using it.
-caller_acquire_stream :: proc(c: ^Caller, stream_id: proto.StreamId) -> ^Conn {
+caller_acquire_stream :: proc(c: ^Caller, streams: ^map[proto.StreamId]^Conn, stream_id: proto.StreamId) -> ^Conn {
 	sync.mutex_lock(&c.mutex)
 	defer sync.mutex_unlock(&c.mutex)
-	stream, found := c.streams[stream_id]
+	if streams == nil {
+		return nil
+	}
+	stream, found := streams[stream_id]
 	if !found || stream == nil {
 		return nil
 	}
 	conn_acquire(stream)
 	return stream
+}
+
+// Streams still in the table. Tests use this to see a leak; the session
+// reader and the owners are the only other users, and they take c.mutex.
+caller_stream_load :: proc(c: ^Caller) -> int {
+	if c == nil {
+		return -1
+	}
+	sync.mutex_lock(&c.mutex)
+	defer sync.mutex_unlock(&c.mutex)
+	return len(c.streams)
 }
 
 caller_stream_buffer_cap :: proc(c: ^Caller) -> int {
@@ -503,8 +914,13 @@ caller_stream_buffer_cap :: proc(c: ^Caller) -> int {
 	return CONN_INBOUND_CAP
 }
 
-caller_handle_data :: proc(c: ^Caller, frame: proto.Frame) {
-	stream := caller_acquire_stream(c, frame.header.stream_id)
+caller_handle_data :: proc(
+	c: ^Caller,
+	streams: ^map[proto.StreamId]^Conn,
+	sock: ^trans.Connection,
+	frame: proto.Frame,
+) {
+	stream := caller_acquire_stream(c, streams, frame.header.stream_id)
 	if stream == nil {
 		// Finished or never bound. Do not RESET StreamNotFound —
 		// the broker answers the same code and the pair hot-loops
@@ -520,21 +936,28 @@ caller_handle_data :: proc(c: ^Caller, frame: proto.Frame) {
 	// through the broker's full queue for this stream, the Agent session that
 	// serves every other caller. Reset only this stream.
 	sync.mutex_lock(&c.mutex)
-	owned := c.streams[frame.header.stream_id] == stream
+	owned := streams != nil && streams[frame.header.stream_id] == stream
 	if owned {
-		delete_key(&c.streams, frame.header.stream_id)
+		delete_key(streams, frame.header.stream_id)
 	}
 	sync.mutex_unlock(&c.mutex)
 	if !owned {
 		return
 	}
 	conn_finish(stream, .Reset)
-	caller_log(c, .Warn, "stream_reset", log.LogFields{stream_id = u64(frame.header.stream_id), reason = "stream_buffer_full"})
-	_ = caller_write_failure(c.conn, .Reset, .InternalError, frame.header.stream_id)
+	caller_log(
+		c,
+		.Warn,
+		LOG_EVENT_STREAM_RESET,
+		log.LogFields{stream_id = u64(frame.header.stream_id), reason = LOG_REASON_STREAM_BUFFER_FULL},
+	)
+	if sock != nil {
+		_ = caller_write_failure(sock, .Reset, .InternalError, frame.header.stream_id)
+	}
 }
 
-caller_handle_half_close :: proc(c: ^Caller, stream_id: proto.StreamId) {
-	stream := caller_acquire_stream(c, stream_id)
+caller_handle_half_close :: proc(c: ^Caller, streams: ^map[proto.StreamId]^Conn, stream_id: proto.StreamId) {
+	stream := caller_acquire_stream(c, streams, stream_id)
 	if stream == nil {
 		return
 	}
@@ -542,32 +965,71 @@ caller_handle_half_close :: proc(c: ^Caller, stream_id: proto.StreamId) {
 	conn_release(stream)
 }
 
-caller_handle_close :: proc(c: ^Caller, stream_id: proto.StreamId, kind: ConnError) {
+caller_handle_close :: proc(
+	c: ^Caller,
+	streams: ^map[proto.StreamId]^Conn,
+	stream_id: proto.StreamId,
+	kind: ConnError,
+	payload: []u8 = nil,
+) {
 	sync.mutex_lock(&c.mutex)
-	stream, found := c.streams[stream_id]
-	if found {
-		delete_key(&c.streams, stream_id)
-		if stream != nil {
-			conn_acquire(stream)
+	stream: ^Conn
+	found := false
+	if streams != nil {
+		stream, found = streams[stream_id]
+		if found {
+			delete_key(streams, stream_id)
+			if stream != nil {
+				conn_acquire(stream)
+			}
 		}
 	}
 	sync.mutex_unlock(&c.mutex)
 	if found && stream != nil {
+		// Only a stream this session still owned. A RESET for one we
+		// already dropped must not be logged or echoed: that pair is
+		// the stream_not_found hot loop.
+		if kind == .Reset {
+			caller_log_peer_reset(c, stream_id, payload)
+		}
 		conn_finish(stream, kind)
 		conn_release(stream)
 	}
-	// Incoming RESET/CLOSE for a stream this session already dropped
-	// (conn_close removes the map entry before the broker's reply)
-	// must not echo StreamNotFound.
+}
+
+// Peer RESET for a live stream. error_code is the wire name; the
+// diagnostic text is dropped so a payload or token cannot land in the log.
+caller_log_peer_reset :: proc(c: ^Caller, stream_id: proto.StreamId, payload: []u8) {
+	error_code := ""
+	fail, derr := proto.decode_wire_failure(payload)
+	if derr == .None {
+		if wire, ok := proto.wire_error_from_u16(fail.code); ok {
+			error_code = proto.wire_error_name(wire)
+		}
+		delete(fail.diagnostic)
+	}
+	caller_log(
+		c,
+		.Warn,
+		LOG_EVENT_STREAM_RESET,
+		log.LogFields {
+			stream_id  = u64(stream_id),
+			error_code = error_code,
+			reason     = LOG_REASON_PEER,
+		},
+	)
 }
 
 caller_fail_all :: proc(c: ^Caller, err: CallerError) {
 	sync.mutex_lock(&c.mutex)
 	c.connected = false
+	c.dropped_streams = len(c.streams)
 	if c.pending != nil {
 		c.pending_err = err
 		c.pending = nil
 	}
+	c.pending_tombstone = false
+	c.tombstone_capped = false
 	taken := make([dynamic]^Conn)
 	for _, stream in c.streams {
 		conn_acquire(stream)

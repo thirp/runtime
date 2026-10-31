@@ -71,10 +71,10 @@ map_send_error :: proc(err: net.TCP_Send_Error) -> TransportError {
 	return .Network
 }
 
+// Does not close socket. The caller closes it when this returns an error.
 connection_alloc :: proc(socket: net.TCP_Socket, allocator := context.allocator) -> (^Connection, TransportError) {
 	conn, aerr := new(Connection, allocator)
 	if aerr != .None {
-		net.close(socket)
 		return nil, .OutOfMemory
 	}
 	conn.socket = socket
@@ -175,6 +175,7 @@ connection_dial :: proc(endpoint: net.Endpoint, allocator := context.allocator) 
 	}
 	conn, aerr := connection_alloc(sock, allocator)
 	if aerr != .None {
+		net.close(sock)
 		return nil, aerr
 	}
 	conn.remote = endpoint
@@ -200,8 +201,21 @@ connection_read :: proc(conn: ^Connection, dst: []u8) -> (n: int, err: Transport
 	for recv_err == .Interrupted && bytes_read == 0 && !conn_closing(conn) {
 		bytes_read, recv_err = net.recv_tcp(sock, dst)
 	}
+	when ODIN_OS == .Linux {
+		// SO_RCVTIMEO is EAGAIN (.Would_Block) and stays a poll timeout.
+		// .Timeout here is ETIMEDOUT: TCP_USER_TIMEOUT aborted an unacked
+		// transmit. Returning .Timeout would let the reader spin and then
+		// see the dead socket as a clean FIN.
+		if recv_err == .Timeout {
+			conn.user_timed_out = true
+			conn.closed = true
+			return 0, .Network
+		}
+	}
 	err = map_recv_error(bytes_read, recv_err)
-	if err == .Closed {
+	// Clean EOF is the peer's FIN: this side can still write the response.
+	// A reset or a socket error is the whole connection.
+	if err == .Closed && recv_err != .None {
 		conn.closed = true
 	}
 	return bytes_read, err
@@ -460,10 +474,15 @@ listener_accept :: proc(l: ^Listener, allocator := context.allocator) -> (^Conne
 	}
 	conn, aerr := connection_alloc(sock, allocator)
 	if aerr != .None {
+		net.close(sock)
 		return nil, aerr
 	}
 	conn.remote = source
 	return conn, .None
+}
+
+connection_user_timed_out :: proc(conn: ^Connection) -> bool {
+	return conn != nil && conn.user_timed_out
 }
 
 listener_close :: proc(l: ^Listener) {

@@ -337,9 +337,14 @@ tls_map_ssl_error :: proc(conn: ^Connection, rc: c.int, ssl_err: c.int) -> Trans
 	case SSL_ERROR_WANT_READ, SSL_ERROR_WANT_WRITE:
 		return .WouldBlock
 	case SSL_ERROR_ZERO_RETURN:
-		conn.closed = true
+		// Peer close_notify. Same as a TCP FIN: the reply can still be written.
 		return .Closed
 	case SSL_ERROR_SYSCALL:
+		when ODIN_OS == .Linux {
+			if connection_syscall_timed_out() {
+				conn.user_timed_out = true
+			}
+		}
 		conn.closed = true
 		return .Closed
 	}

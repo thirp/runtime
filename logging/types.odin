@@ -21,6 +21,15 @@ LogFields :: struct {
 	remote_address:    string,
 	error_code:        string,
 	reason:            string,
+	// stream_id is omitted when zero unless stream_id_set. streams is omitted
+	// unless streams_set, so a session drop can report that it killed none.
+	stream_id_set:     bool,
+	streams:           int,
+	streams_set:       bool,
+	// Milliseconds. Omitted from the JSON when zero, so existing events
+	// stay the same shape. The short dial-timeout warning sets both.
+	dial_timeout_ms:   int,
+	cap_floor_ms:      int,
 }
 
 LogSink :: proc(text: string)

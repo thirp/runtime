@@ -26,7 +26,10 @@ tls_wait_socket_impl :: proc(conn: ^Connection, want_write: bool, timeout: time.
 		return .None
 	}
 	if pfd.revents & i16(win.POLLHUP) != 0 || pfd.revents & i16(win.POLLERR) != 0 {
-		conn.closed = true
+		// HUP is the peer's FIN with nothing left to read. ERR is a dead socket.
+		if pfd.revents & i16(win.POLLERR) != 0 {
+			conn.closed = true
+		}
 		return .Closed
 	}
 	return .None

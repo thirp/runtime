@@ -243,7 +243,9 @@ ingress_handle_connection :: proc(
 	// readable so the origin can finish a response);
 	// conn_read error (peer HalfClose or Close both surface as ConnError.Closed;
 	// Reset is distinct) -> connection_shutdown_write(browser);
-	// after both directions finish -> conn_close (wire Close).
+	// after both directions finish -> conn_destroy. That sends CLOSE only
+	// when the peer has not already half-closed; the broker ends the stream
+	// on the second HALF_CLOSE.
 	// TLS shutdown_write is TCP SHUT_WR (close_notify would end the TLS session
 	// and block a remaining response). Peer SSL_read maps SYSCALL to Closed
 	// and may surface SSL_ERROR_SSL as Tls.

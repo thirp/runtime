@@ -123,6 +123,34 @@ agent_stop :: proc(agent: ^Agent) {
 	}
 }
 
+agent_set_live_relay :: proc(agent: ^Agent, relay: ^AgentRelay) {
+	if agent == nil {
+		return
+	}
+	sync.mutex_lock(&agent.mutex)
+	agent.live_relay = relay
+	sync.mutex_unlock(&agent.mutex)
+}
+
+// Stream-table length and pump threads for the connected session.
+// (-1, -1) when no session relay is published.
+agent_stream_load :: proc(agent: ^Agent) -> (streams: int, pumps: int) {
+	if agent == nil {
+		return -1, -1
+	}
+	sync.mutex_lock(&agent.mutex)
+	relay := agent.live_relay
+	sync.mutex_unlock(&agent.mutex)
+	if relay == nil {
+		return -1, -1
+	}
+	sync.mutex_lock(&relay.mutex)
+	streams = len(relay.streams)
+	sync.mutex_unlock(&relay.mutex)
+	pumps = sync.atomic_load(&relay.live_pumps)
+	return
+}
+
 agent_is_connected :: proc(agent: ^Agent) -> bool {
 	if agent == nil {
 		return false
@@ -165,7 +193,7 @@ agent_run :: proc(agent: ^Agent) -> AgentError {
 			if hs == .AuthFailed {
 				agent_log(agent, .Warn, "auth_failed", log.LogFields{error_code = "AUTHENTICATION_FAILED"})
 			} else if hs == .RateLimited {
-				agent_log(agent, .Warn, "auth_failed", log.LogFields{error_code = "RATE_LIMITED"})
+				agent_log(agent, .Warn, LOG_EVENT_RATE_LIMITED, log.LogFields{error_code = proto.wire_error_name(.RateLimited)})
 			}
 			proto.decoder_destroy(&decoder)
 			agent_set_live_conn(agent, nil)
@@ -193,8 +221,10 @@ agent_run :: proc(agent: ^Agent) -> AgentError {
 		relay.agent = agent
 		relay.broker = conn
 		relay.streams = make(map[proto.StreamId]AgentLocalStream)
+		agent_set_live_relay(agent, &relay)
 		agent_relay_loop(&relay, &decoder)
 		agent_clear_all(&relay)
+		agent_set_live_relay(agent, nil)
 		delete(relay.streams)
 		agent_set_connected(agent, false)
 		agent_clear_live(agent)
@@ -294,18 +324,38 @@ agent_handshake :: proc(
 	}
 	delete(ok_msg.principal_id)
 
+	// The broker drops this session's services when the connection closes.
+	// A handshake that stopped halfway must not keep those live flags.
+	agent_clear_live(agent)
+	rl_attempt := 0
 	for !sync.atomic_load(&agent.stop) {
 		items := agent_snapshot_unregistered(agent)
 		if len(items) == 0 {
 			free_snapshots(items)
 			break
 		}
-		for item in items {
+		i := 0
+		for i < len(items) && !sync.atomic_load(&agent.stop) {
+			item := items[i]
 			reg := agent_register_one(conn, decoder, item.id)
+			if reg == .RateLimited {
+				// RegisterFailed RATE_LIMITED leaves the session up. Keep what
+				// is already registered and retry this service.
+				delay := reconnect_delay(rl_attempt + REGISTER_RATE_BACKOFF_ATTEMPT, jitter_u64())
+				agent_log(agent, .Warn, LOG_EVENT_RATE_LIMITED, log.LogFields{service_id = string(item.id)})
+				when ODIN_TEST {
+					agent_test_note_register_backoff(agent, delay)
+				}
+				agent_sleep(agent, delay)
+				rl_attempt += 1
+				continue
+			}
 			if reg != .Ok {
 				free_snapshots(items)
 				return reg
 			}
+			rl_attempt = 0
+			i += 1
 			if !agent_has_service(agent, item.id) {
 				unreg := agent_unregister_one(conn, decoder, item.id)
 				if unreg != .Ok {
@@ -355,7 +405,7 @@ agent_register_one :: proc(
 		return .Transport
 	}
 
-	reg_frame, reg_ok := agent_read(conn, decoder)
+	reg_frame, reg_ok := agent_read_control(conn, decoder, .RegisterOk, .RegisterFailed)
 	if !reg_ok {
 		return .Transport
 	}
@@ -388,7 +438,7 @@ agent_unregister_one :: proc(
 		return .Transport
 	}
 
-	frame, ok := agent_read(conn, decoder)
+	frame, ok := agent_read_control(conn, decoder, .UnregisterOk, .UnregisterFailed)
 	if !ok {
 		return .Transport
 	}
@@ -472,6 +522,56 @@ agent_read :: proc(
 	return got, true
 }
 
+// Handshake request/reply read. A RATE_LIMITED wait leaves this session up
+// with some services already registered, so the broker can send OPEN and
+// stream frames before the next REGISTER reply. Those do not end the handshake.
+// reply and failed are the opcodes this call is waiting for.
+agent_read_control :: proc(
+	conn: ^trans.Connection,
+	decoder: ^proto.FrameDecoder,
+	reply, failed: proto.Opcode,
+) -> (
+	frame: proto.Frame,
+	ok: bool,
+) {
+	for {
+		got, got_ok := agent_read(conn, decoder)
+		if !got_ok {
+			return {}, false
+		}
+		op := got.header.opcode
+		switch op {
+		case .Ping:
+			msg, merr := proto.decode_ping(got.payload)
+			if merr == .None {
+				payload, perr := proto.encode_pong(proto.Pong{nonce = msg.nonce})
+				if perr == .None {
+					_ = agent_write(conn, .Pong, payload)
+					delete(payload)
+				}
+			}
+		case .Open:
+			// Not in the relay yet. Refuse this stream and keep registering.
+			_ = agent_write_failure(conn, .OpenFailed, .LocalServiceUnavailable, got.header.stream_id)
+		case .Pong, .Data, .HalfClose, .Close, .Reset:
+			// No stream is open on this handshake. Drop and keep reading.
+		case .Error:
+			// Broker connection-level failure. The read itself failed.
+			proto.frame_destroy(&got)
+			return {}, false
+		case .RegisterOk, .RegisterFailed, .UnregisterOk, .UnregisterFailed:
+			if op == reply || op == failed {
+				return got, true
+			}
+		case .Hello, .HelloAck, .Authenticate, .AuthenticateOk, .AuthenticateFailed,
+		     .Register, .Unregister, .Connect, .ConnectOk, .ConnectFailed,
+		     .OpenOk, .OpenFailed:
+			// Not the reply in flight, and not a broken socket.
+		}
+		proto.frame_destroy(&got)
+	}
+}
+
 agent_log :: proc(agent: ^Agent, level: log.LogLevel, event: string, fields: log.LogFields = {}) {
 	log.log_event(agent.config.logger, level, event, fields)
 }
@@ -479,8 +579,11 @@ agent_log :: proc(agent: ^Agent, level: log.LogLevel, event: string, fields: log
 agent_log_registered :: proc(agent: ^Agent) {
 	sync.mutex_lock(&agent.mutex)
 	defer sync.mutex_unlock(&agent.mutex)
-	for id in agent.services {
-		agent_log(agent, .Info, "registered", log.LogFields{service_id = string(id)})
+	for id, svc in agent.services {
+		if !svc.live {
+			continue
+		}
+		agent_log(agent, .Info, LOG_EVENT_REGISTERED, log.LogFields{service_id = string(id)})
 	}
 }
 

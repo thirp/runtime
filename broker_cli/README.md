@@ -38,7 +38,7 @@ CLI flags override file values. Required fields may come from either source. Aft
 
 Secrets stay in `token_file`, not in the main file. Example: [examples/production/broker.conf](../examples/production/broker.conf). Operator walkthrough: [OPERATIONS.md](../docs/OPERATIONS.md). Process restart is required to change configuration (no SIGHUP).
 
-`--version` prints the project version and protocol 1.0, then exits 0.
+`--version` prints the project version, build commit and protocol 1.0, then exits 0.
 
 ### Required
 

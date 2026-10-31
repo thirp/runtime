@@ -38,7 +38,7 @@ Learn about the managed pilot at [thirp.net](https://thirp.net/).
 
 ## Project status
 
-- Source version: **0.16.5**
+- Source version: **0.16.6**
 - Wire protocol: **1.0**, frozen and documented in
   [docs/PROTOCOL.md](docs/PROTOCOL.md)
 - Platforms: **Linux** (operator release), **macOS arm64**, **macOS x86_64
