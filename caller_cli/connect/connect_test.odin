@@ -7,6 +7,7 @@ import cl "../../caller"
 import log "../../logging"
 import proto "../../protocol"
 import trans "../../transport"
+import "core:bytes"
 import "core:fmt"
 import "core:net"
 import "core:os"
@@ -42,6 +43,7 @@ Fixture :: struct {
 //   'P' early answer: read the request head, send a 403 and close without
 //       reading the body (what an API does on a refused POST)
 //   'H' read to EOF, then answer "got N" and close
+//   'B' read to EOF, then write HALF_CLOSE_BODY bytes and half-close
 //   'F' flood: write until the peer stops taking bytes, never read
 //   'S' slow sink: "S<N>\n" then N bytes, read at SLOW_CHUNK per SLOW_TICK
 //       (~320 KB/s, the field upload repro), then answer "got N"
@@ -64,6 +66,8 @@ Upstream :: struct {
 // reach the wrong stream (or arrive as zeros) name their source in a failure.
 // Echo payloads are ASCII; the fills are not, except FILL_EARLY.
 FILL_HALF_CLOSE :: u8(0xA1) // half-close client body ('H')
+FILL_HALF_CLOSE_BODY :: u8(0xA5) // full response after client half-close ('B')
+HALF_CLOSE_BODY :: 32 * 1024
 FILL_EARLY :: u8('a')       // early-answer client body ('P')
 FILL_SLOW_UPLOAD :: u8(0xA3) // slow-upload client body ('S')
 FILL_CAP_UPLOAD :: u8(0xA4)  // stream-cap upload body ('S')
@@ -76,6 +80,8 @@ fill_source :: proc(b: u8) -> string {
 		return "zeros (no test writer sends zeros)"
 	case FILL_HALF_CLOSE:
 		return "half-close client body"
+	case FILL_HALF_CLOSE_BODY:
+		return "half-close response body"
 	case FILL_EARLY:
 		return "early-answer client body"
 	case FILL_SLOW_UPLOAD:
@@ -417,6 +423,18 @@ upstream_conn :: proc(arg: ^UpConnArg) {
 		}
 		reply := fmt.tprintf("got %d", total)
 		_ = trans.connection_write(conn, transmute([]u8)reply)
+	case 'B':
+		for {
+			_, rerr := trans.connection_read(conn, buf[:])
+			if rerr != .None {
+				break
+			}
+		}
+		body := make([]u8, HALF_CLOSE_BODY)
+		fill_bytes(body, FILL_HALF_CLOSE_BODY)
+		_ = trans.connection_write(conn, body)
+		delete(body)
+		_ = trans.connection_shutdown_write(conn)
 	case 'Q':
 		// Field POST: read a fixed body, answer, close. The caller then
 		// half-closes or resets. Both orders have to drop the origin fd
@@ -638,6 +656,117 @@ test_connect_client_half_close_tears_down :: proc(t: ^testing.T) {
 		testing.expect(t, wait_bridges_zero(&ctl, 3 * time.Second), "bridge left open after half-close")
 	}
 	expect_echo(t, &ctl, "after-half-close")
+}
+
+// Client writes a request and half-closes. The origin answers with a fixed
+// body. The local client must read that body byte for byte, then EOF.
+@(test)
+test_connect_half_close_delivers_full_response :: proc(t: ^testing.T) {
+	fx: Fixture
+	if !fixture_start(t, &fx) {
+		return
+	}
+	defer fixture_stop(&fx)
+	ctl: RunControl
+	args := []string{"--broker", fx.broker, "--insecure", "--token", T_TOKEN_CALLER, "--service", T_SERVICE, "--listen", "127.0.0.1:0"}
+	r := RunArg{args = args, ctl = &ctl}
+	th := start_connect(t, &r)
+	defer stop_connect(&r, th)
+	if !sync.atomic_load(&ctl.ready) {
+		testing.expect(t, false, "not ready")
+		return
+	}
+
+	conn := local_dial(t, &ctl)
+	if conn == nil {
+		return
+	}
+	defer trans.connection_destroy(conn)
+	testing.expect_value(t, trans.connection_write(conn, []u8{'B'}), trans.TransportError.None)
+	testing.expect_value(t, trans.connection_shutdown_write(conn), trans.TransportError.None)
+	got := make([dynamic]u8)
+	defer delete(got)
+	rerr := read_all(conn, &got)
+	testing.expect(t, rerr != .Timeout, "half-closed client never got EOF")
+	want := make([]u8, HALF_CLOSE_BODY)
+	defer delete(want)
+	fill_bytes(want, FILL_HALF_CLOSE_BODY)
+	testing.expect(t, bytes.equal(got[:], want), "half-close response was not the full body")
+	testing.expect(t, wait_bridges_zero(&ctl, 3 * time.Second), "bridge left open after half-close")
+}
+
+REAL_AGENT_HALF_CLOSE_N :: 10_000
+
+kept_ids :: proc(server: ^brk.Server, role: proto.PeerRole) -> int {
+	sync.mutex_lock(&server.handlers_mutex)
+	defer sync.mutex_unlock(&server.handlers_mutex)
+	for h in server.handlers {
+		if h != nil && h.role == role && h.state == .Authenticated {
+			return brk.half_close_finished_len(&h.half_close_finished)
+		}
+	}
+	return -1
+}
+
+// Caller half-closes, the origin answers and closes, and this repo's agent
+// sends HALF_CLOSE and no CLOSE. The broker ring on that long-lived agent
+// connection must stay at its cap. A late CLOSE inside the window is
+// test_half_close_finished_ring_stays_bounded: the agent owns this socket,
+// so the wire test sends that CLOSE on the same caller-first sequence.
+@(test)
+test_real_agent_half_close_ring_stays_bounded :: proc(t: ^testing.T) {
+	fx: Fixture
+	if !fixture_start(t, &fx) {
+		return
+	}
+	defer fixture_stop(&fx)
+	ctl: RunControl
+	args := []string{"--broker", fx.broker, "--insecure", "--token", T_TOKEN_CALLER, "--service", T_SERVICE, "--listen", "127.0.0.1:0"}
+	r := RunArg{args = args, ctl = &ctl}
+	th := start_connect(t, &r)
+	defer stop_connect(&r, th)
+	if !sync.atomic_load(&ctl.ready) {
+		testing.expect(t, false, "not ready")
+		return
+	}
+
+	for _ in 0 ..< REAL_AGENT_HALF_CLOSE_N {
+		if testing.failed(t) {
+			return
+		}
+		conn := local_dial(t, &ctl)
+		if conn == nil {
+			return
+		}
+		testing.expect_value(t, trans.connection_write(conn, []u8{'H'}), trans.TransportError.None)
+		testing.expect_value(t, trans.connection_shutdown_write(conn), trans.TransportError.None)
+		got := make([dynamic]u8)
+		rerr := read_all(conn, &got)
+		testing.expect(t, rerr != .Timeout, "half-closed client never got EOF")
+		testing.expect_value(t, string(got[:]), "got 0")
+		delete(got)
+		trans.connection_destroy(conn)
+		start := time.now()
+		for sync.atomic_load(&ctl.live_bridges) != 0 {
+			if time.since(start) > 3 * time.Second {
+				testing.expect(t, false, "bridge left open after half-close")
+				return
+			}
+			time.sleep(100 * time.Microsecond)
+		}
+	}
+
+	agent_kept := kept_ids(&fx.server, .Agent)
+	caller_kept := kept_ids(&fx.server, .Caller)
+	fmt.printfln(
+		"real agent half_close ring: agent_kept=%d caller_kept=%d cap=%d after %d requests",
+		agent_kept,
+		caller_kept,
+		brk.HALF_CLOSE_FINISHED_CAP,
+		REAL_AGENT_HALF_CLOSE_N,
+	)
+	testing.expect_value(t, agent_kept, brk.HALF_CLOSE_FINISHED_CAP)
+	testing.expect(t, caller_kept >= 0 && caller_kept <= brk.HALF_CLOSE_FINISHED_CAP, "caller ring unbounded")
 }
 
 EarlyWriter :: struct {

@@ -354,6 +354,9 @@ relay_apply :: proc(
 	if !found {
 		return {}, .NotFound
 	}
+	if event == .Close && close_is_redundant(stream.state, from) {
+		return stream, .Ignored
+	}
 	next, aerr := apply_stream_event(stream.state, event, from)
 	if aerr != .None {
 		return stream, aerr
@@ -638,17 +641,25 @@ relay_take_streams_for_grant :: proc(
 	return taken
 }
 
-relay_set_grant_lease :: proc(server: ^Server, grant_id: string, until: time.Time) {
+relay_set_grant_lease :: proc(server: ^Server, grant_id: string, until: time.Time, valid_until := time.Time{}) {
 	if server == nil || len(grant_id) == 0 {
 		return
 	}
 	sync.mutex_lock(&server.routing_mutex)
 	defer sync.mutex_unlock(&server.routing_mutex)
-	for id, &stream in server.streams {
-		if stream.access_grant_id == grant_id {
-			stream.authorization_lease_until = until
-			server.streams[id] = stream
+	now := time.now()
+	for _, &stream in server.streams {
+		if stream.access_grant_id != grant_id {
+			continue
 		}
+		// A late refresh must not revive a stream awaiting its expiry RESET.
+		if _, expired := stream_grant_expiry_reason(stream, now); expired {
+			continue
+		}
+		if authz_time_is_set(valid_until) {
+			stream.valid_until = valid_until
+		}
+		stream.authorization_lease_until = until
 	}
 }
 

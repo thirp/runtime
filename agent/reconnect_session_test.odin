@@ -53,7 +53,7 @@ test_agent_reconnect_restores_registration :: proc(t: ^testing.T) {
 		thread.destroy(th)
 	}
 	wait_agent_connected(t, &agent)
-	_, found := brk.lookup_service(&fx.reg, sid)
+	_, found := brk.lookup_service_for_environment(&fx.reg, "", sid, "org/dev")
 	testing.expect(t, found)
 
 	sync_close_live(&agent)
@@ -67,7 +67,7 @@ test_agent_reconnect_restores_registration :: proc(t: ^testing.T) {
 	}
 	start := time.now()
 	for time.since(start) < 2 * time.Second {
-		_, found = brk.lookup_service(&fx.reg, sid)
+		_, found = brk.lookup_service_for_environment(&fx.reg, "", sid, "org/dev")
 		if !found {
 			break
 		}
@@ -76,13 +76,13 @@ test_agent_reconnect_restores_registration :: proc(t: ^testing.T) {
 	wait_agent_connected(t, &agent)
 	start = time.now()
 	for time.since(start) < 2 * time.Second {
-		_, found = brk.lookup_service(&fx.reg, sid)
+		_, found = brk.lookup_service_for_environment(&fx.reg, "", sid, "org/dev")
 		if found {
 			break
 		}
 		time.sleep(5 * time.Millisecond)
 	}
-	_, found = brk.lookup_service(&fx.reg, sid)
+	_, found = brk.lookup_service_for_environment(&fx.reg, "", sid, "org/dev")
 	testing.expect(t, found)
 
 	caller := dial_broker(t, &fx)

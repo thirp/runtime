@@ -5,10 +5,35 @@ import "core:strings"
 import "core:sync"
 import "core:time"
 
+service_key :: proc(environment: string, service_id: ServiceId, organization: OrganizationId = "") -> ServiceKey {
+	// Environment namespaces retain their existing identity. Organization is
+	// a separate component used only for account services without an environment.
+	key := ServiceKey {
+		environment = environment,
+		service_id  = service_id,
+	}
+	if len(environment) == 0 {
+		key.organization = organization
+	}
+	return key
+}
+
+free_service_key :: proc(key: ServiceKey, allocator := context.allocator) {
+	if len(key.environment) > 0 {
+		delete(key.environment, allocator)
+	}
+	if len(key.organization) > 0 {
+		delete(string(key.organization), allocator)
+	}
+	if len(key.service_id) > 0 {
+		delete(string(key.service_id), allocator)
+	}
+}
+
 registry_init :: proc(reg: ^Registry, allocator := context.allocator) -> RegistryError {
 	reg^ = {}
 	reg.allocator = allocator
-	reg.services = make(map[ServiceId]ServiceRegistration, allocator)
+	reg.services = make(map[ServiceKey]ServiceRegistration, allocator)
 	reg.sessions = make(map[SessionId]AgentSession, allocator)
 	reg.next_session_id = 1
 	reg.max_registrations_per_session = DEFAULT_MAX_REGISTRATIONS_PER_SESSION
@@ -21,14 +46,21 @@ registry_destroy :: proc(reg: ^Registry) {
 	}
 	for _, session in reg.sessions {
 		for sid in session.service_ids {
-			delete_key(&reg.services, sid)
-			delete(string(sid), reg.allocator)
+			stored, _ := delete_key(&reg.services, service_key(session.environment_id, sid, session.principal.organization))
+			if len(stored.service_id) > 0 {
+				free_service_key(stored, reg.allocator)
+			} else {
+				delete(string(sid), reg.allocator)
+			}
 		}
 		delete(session.service_ids)
+		if len(session.environment_id) > 0 {
+			delete(session.environment_id, reg.allocator)
+		}
 		destroy_principal(session.principal, reg.allocator)
 	}
-	for sid in reg.services {
-		delete(string(sid), reg.allocator)
+	for key in reg.services {
+		free_service_key(key, reg.allocator)
 	}
 	delete(reg.sessions)
 	delete(reg.services)
@@ -49,7 +81,8 @@ check_register_service_locked :: proc(reg: ^Registry, session_id: SessionId, ser
 	if !ok {
 		return .SessionNotFound
 	}
-	if _, exists := reg.services[service_id]; exists {
+	// Unique inside the environment, or the account when there is no environment.
+	if _, exists := reg.services[service_key(session.environment_id, service_id, session.principal.organization)]; exists {
 		return .ServiceAlreadyRegistered
 	}
 	if reg.max_registrations_per_session > 0 &&
@@ -72,10 +105,27 @@ register_service :: proc(reg: ^Registry, session_id: SessionId, service_id: Serv
 		return .OutOfMemory
 	}
 	owned_id := ServiceId(owned)
+	session := reg.sessions[session_id]
+	env_owned: string
+	org_owned: OrganizationId
+	if len(session.environment_id) > 0 {
+		cloned_env, env_err := strings.clone(session.environment_id, reg.allocator)
+		if env_err != .None {
+			delete(owned, reg.allocator)
+			return .OutOfMemory
+		}
+		env_owned = cloned_env
+	} else {
+		cloned_org, org_err := strings.clone(string(session.principal.organization), reg.allocator)
+		if org_err != .None {
+			delete(owned, reg.allocator)
+			return .OutOfMemory
+		}
+		org_owned = OrganizationId(cloned_org)
+	}
 	now := time.now()
 
-	session := reg.sessions[session_id]
-	reg.services[owned_id] = ServiceRegistration {
+	reg.services[service_key(env_owned, owned_id, org_owned)] = ServiceRegistration {
 		id            = owned_id,
 		owner         = session.principal.id,
 		organization  = session.principal.organization,
@@ -97,7 +147,8 @@ unregister_service :: proc(reg: ^Registry, session_id: SessionId, service_id: Se
 	if !ok {
 		return .SessionNotFound
 	}
-	rec, exists := reg.services[service_id]
+	probe := service_key(session.environment_id, service_id, session.principal.organization)
+	rec, exists := reg.services[probe]
 	if !exists {
 		return .None
 	}
@@ -105,18 +156,43 @@ unregister_service :: proc(reg: ^Registry, session_id: SessionId, service_id: Se
 		return .NotOwned
 	}
 
-	key, _ := delete_key(&reg.services, service_id)
+	stored, _ := delete_key(&reg.services, probe)
 	delete_key(&session.service_ids, service_id)
-	delete(string(key), reg.allocator)
+	free_service_key(stored, reg.allocator)
 	session.last_seen_at = time.now()
 	reg.sessions[session_id] = session
 	return .None
 }
 
+// Leftover global namespace only. Account and environment registrations
+// are not visible here.
 lookup_service :: proc(reg: ^Registry, service_id: ServiceId) -> (ServiceRegistration, bool) {
 	sync.mutex_lock(&reg.mutex)
 	defer sync.mutex_unlock(&reg.mutex)
-	rec, ok := reg.services[service_id]
+	rec, ok := reg.services[service_key("", service_id)]
+	return rec, ok
+}
+
+// Environment name first, or account name when only organization is supplied,
+// then the leftover global name. Environment lookups never probe account keys.
+// With neither environment nor organization, only the global key is visible.
+lookup_service_for_environment :: proc(
+	reg: ^Registry,
+	environment: string,
+	service_id: ServiceId,
+	organization: OrganizationId = "",
+) -> (
+	ServiceRegistration,
+	bool,
+) {
+	sync.mutex_lock(&reg.mutex)
+	defer sync.mutex_unlock(&reg.mutex)
+	if len(environment) > 0 || len(organization) > 0 {
+		if rec, ok := reg.services[service_key(environment, service_id, organization)]; ok {
+			return rec, true
+		}
+	}
+	rec, ok := reg.services[service_key("", service_id)]
 	return rec, ok
 }
 
@@ -163,9 +239,13 @@ remove_session_services_locked :: proc(reg: ^Registry, session_id: SessionId) ->
 		return .SessionNotFound
 	}
 	for sid in session.service_ids {
-		key, _ := delete_key(&reg.services, sid)
+		stored, _ := delete_key(&reg.services, service_key(session.environment_id, sid, session.principal.organization))
 		delete_key(&session.service_ids, sid)
-		delete(string(key), reg.allocator)
+		if len(stored.service_id) > 0 {
+			free_service_key(stored, reg.allocator)
+		} else {
+			delete(string(sid), reg.allocator)
+		}
 	}
 	session.last_seen_at = time.now()
 	reg.sessions[session_id] = session

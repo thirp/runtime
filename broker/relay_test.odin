@@ -278,7 +278,7 @@ test_relay_caller_disconnect_resets_stream_keeps_registration :: proc(t: ^testin
 	proto.frame_destroy(&reset_frame)
 
 	svc := must_service_id(t, TEST_SERVICE)
-	_, found := lookup_service(&reg, svc)
+	_, found := lookup_service_for_environment(&reg, "", svc, "org/dev")
 	testing.expect(t, found)
 	testing.expect_value(t, service_count(&reg), 1)
 }

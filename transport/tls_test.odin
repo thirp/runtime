@@ -1,5 +1,6 @@
 package transport
 
+import proto "../protocol"
 import "core:fmt"
 import "core:os"
 import "core:strings"
@@ -484,4 +485,165 @@ test_tls_alpn_http11_rejects_h2_only_client :: proc(t: ^testing.T) {
 	client, derr := connection_dial_tls(ep, cfg)
 	testing.expect_value(t, derr, TransportError.Tls)
 	testing.expect(t, client == nil)
+}
+
+// Peer shuts its write side after a request. The response written after that
+// half-close must arrive byte for byte. An unexpected TCP FIN must not mark
+// the TLS connection closed before that write.
+@(test)
+test_tls_response_after_peer_shutdown_write :: proc(t: ^testing.T) {
+	client, server, ctx, cert_path, key_path := start_tls_pair(t)
+	defer {
+		connection_destroy(client)
+		connection_destroy(server)
+		tls_server_context_destroy(ctx)
+		remove_temp_pem(cert_path)
+		remove_temp_pem(key_path)
+	}
+	_ = connection_set_recv_timeout(client, 2 * time.Second)
+	_ = connection_set_recv_timeout(server, 2 * time.Second)
+
+	testing.expect_value(t, connection_write(client, []u8{'B'}), TransportError.None)
+	testing.expect_value(t, connection_shutdown_write(client), TransportError.None)
+
+	got_req: [1]u8
+	n, rerr := connection_read(server, got_req[:])
+	testing.expect_value(t, rerr, TransportError.None)
+	testing.expect_value(t, n, 1)
+	testing.expect_value(t, got_req[0], u8('B'))
+
+	buf: [256]u8
+	for {
+		_, rerr = connection_read(server, buf[:])
+		if rerr != .None {
+			break
+		}
+	}
+	testing.expect_value(t, rerr, TransportError.Closed)
+
+	body := make([]u8, 20 * 1024)
+	defer delete(body)
+	for i in 0 ..< len(body) {
+		body[i] = u8(i + 1)
+	}
+	testing.expect_value(t, connection_write(server, body), TransportError.None)
+	testing.expect_value(t, connection_shutdown_write(server), TransportError.None)
+
+	got := make([dynamic]u8, 0, len(body))
+	defer delete(got)
+	read_buf: [4096]u8
+	for len(got) < len(body) {
+		m, err := connection_read(client, read_buf[:])
+		if m > 0 {
+			append(&got, ..read_buf[:m])
+		}
+		if err != .None {
+			break
+		}
+	}
+	testing.expect_value(t, len(got), len(body))
+	same := len(got) == len(body)
+	if same {
+		for i in 0 ..< len(body) {
+			if got[i] != body[i] {
+				same = false
+				break
+			}
+		}
+	}
+	testing.expect(t, same, "response after shutdown_write")
+}
+
+// The server writes a full body and then TCP FIN, with no TLS close_notify.
+// The client must read every byte and then see a clean close. Removing
+// SSL_OP_IGNORE_UNEXPECTED_EOF from tls_client_context_new makes this
+// extra read return .Tls.
+@(test)
+test_tls_client_unexpected_eof_is_clean_close :: proc(t: ^testing.T) {
+	client, server, ctx, cert_path, key_path := start_tls_pair(t)
+	defer {
+		connection_destroy(client)
+		connection_destroy(server)
+		tls_server_context_destroy(ctx)
+		remove_temp_pem(cert_path)
+		remove_temp_pem(key_path)
+	}
+	_ = connection_set_recv_timeout(client, 2 * time.Second)
+	_ = connection_set_recv_timeout(server, 2 * time.Second)
+
+	body := make([]u8, 4096)
+	defer delete(body)
+	for i in 0 ..< len(body) {
+		body[i] = u8(i)
+	}
+	testing.expect_value(t, connection_write(server, body), TransportError.None)
+	testing.expect_value(t, connection_shutdown_write(server), TransportError.None)
+
+	got := make([dynamic]u8, 0, len(body))
+	defer delete(got)
+	read_buf: [1024]u8
+	for len(got) < len(body) {
+		m, err := connection_read(client, read_buf[:])
+		if m > 0 {
+			append(&got, ..read_buf[:m])
+		}
+		if err != .None {
+			testing.expect_value(t, err, TransportError.None)
+			return
+		}
+	}
+	testing.expect_value(t, len(got), len(body))
+	same := true
+	for i in 0 ..< len(body) {
+		if got[i] != body[i] {
+			same = false
+			break
+		}
+	}
+	testing.expect(t, same, "client body")
+
+	n, err := connection_read(client, read_buf[:])
+	testing.expect_value(t, n, 0)
+	testing.expect_value(t, err, TransportError.Closed)
+}
+
+// The server writes a length-prefixed frame cut short, then TCP FIN and no
+// close_notify. OpenSSL 3.5.7 with SSL_OP_IGNORE_UNEXPECTED_EOF reports
+// that FIN as a clean close. read_frame must still fail at the frame
+// layer. conn_run treats that protocol error as the end of the session.
+@(test)
+test_tls_truncated_frame_is_frame_error :: proc(t: ^testing.T) {
+	client, server, ctx, cert_path, key_path := start_tls_pair(t)
+	defer {
+		connection_destroy(client)
+		connection_destroy(server)
+		tls_server_context_destroy(ctx)
+		remove_temp_pem(cert_path)
+		remove_temp_pem(key_path)
+	}
+	_ = connection_set_recv_timeout(client, 2 * time.Second)
+	_ = connection_set_recv_timeout(server, 2 * time.Second)
+
+	body := make([]u8, 64)
+	defer delete(body)
+	for i in 0 ..< len(body) {
+		body[i] = u8(i + 1)
+	}
+	raw, perr := proto.encode_frame(proto.FrameHeader{opcode = .Data, stream_id = 9}, body)
+	testing.expect_value(t, perr, proto.ProtocolError.None)
+	defer delete(raw)
+	cut := proto.HEADER_SIZE + 8
+	testing.expect(t, cut < len(raw))
+	testing.expect_value(t, connection_write(server, raw[:cut]), TransportError.None)
+	testing.expect_value(t, connection_shutdown_write(server), TransportError.None)
+
+	decoder: proto.FrameDecoder
+	testing.expect_value(t, proto.decoder_init(&decoder), proto.ProtocolError.None)
+	defer proto.decoder_destroy(&decoder)
+
+	frame, terr, rperr := read_frame(client, &decoder)
+	testing.expect_value(t, terr, TransportError.None)
+	testing.expect_value(t, rperr, proto.ProtocolError.Truncated)
+	proto.frame_destroy(&frame)
+	testing.expect(t, len(decoder.buf) > 0, "short frame was discarded")
 }

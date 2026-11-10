@@ -16,6 +16,10 @@ StreamError :: enum {
 	None,
 	IllegalEvent,
 	NotFound,
+	// CLOSE for a stream that is already closed, or already half-closed by
+	// the sender. Internal only: not a wire code, and not IllegalEvent,
+	// which aborts the stream.
+	Ignored,
 }
 
 IdentityError :: enum {

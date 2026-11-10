@@ -268,6 +268,8 @@ GRANT_A :: "grant-a"
 GRANT_B :: "grant-b"
 
 FixtureConnectAuthz :: struct {
+	revoked: bool,
+	connect_calls: int,
 	grant_a: string,
 	grant_b: string,
 	lease_a: time.Duration,
@@ -278,6 +280,12 @@ FixtureConnectAuthz :: struct {
 
 fixture_authorize_connect_grants :: proc(ctx: rawptr, req: ConnectAuthzRequest) -> (AuthzDecision, AuthzError) {
 	f := (^FixtureConnectAuthz)(ctx)
+	if f != nil {
+		sync.atomic_add(&f.connect_calls, 1)
+		if sync.atomic_load(&f.revoked) {
+			return AuthzDecision{reason = .Unauthorized}, .None
+		}
+	}
 	d: AuthzDecision
 	d.organization_id = string(req.principal.organization)
 	now := time.now()
@@ -313,8 +321,109 @@ fixture_authorize_connect_grants :: proc(ctx: rawptr, req: ConnectAuthzRequest) 
 	return d, .None
 }
 
+@(test)
+test_standing_caller_connect_rechecks_authorizer_before_open :: proc(t: ^testing.T) {
+	fx := FixtureConnectAuthz{grant_a = GRANT_A, lease_a = time.Hour, valid_a = time.Hour}
+	reg: Registry
+	store: auth.StaticTokenAuth
+	server: Server
+	quiet_test_server(t, &server, &reg, &store)
+	defer stop_test_server(&server, &store, &reg)
+	server.authorizer = Authorizer{ctx = &fx, authorize_connect = fixture_authorize_connect_grants}
+
+	agent, agent_dec := register_test_agent(t, &server)
+	defer trans.connection_destroy(agent)
+	defer proto.decoder_destroy(&agent_dec)
+	caller := dial_server(t, &server)
+	defer trans.connection_destroy(caller)
+	decoder: proto.FrameDecoder
+	handshake_caller(t, caller, &decoder)
+	defer proto.decoder_destroy(&decoder)
+	sid := open_test_stream(t, agent, &agent_dec, caller, &decoder)
+	must_write_stream(t, caller, .Data, []u8{'a'}, sid)
+	data := must_read_opcode(t, agent, &agent_dec, .Data)
+	testing.expect_value(t, string(data.payload), "a")
+	proto.frame_destroy(&data)
+
+	// Change policy on the same authenticated caller, with no lease poll/reset.
+	sync.atomic_store(&fx.revoked, true)
+	send_connect(t, caller, TEST_SERVICE)
+	expect_wire(t, caller, &decoder, .ConnectFailed, .Unauthorized)
+	testing.expect_value(t, sync.atomic_load(&fx.connect_calls), 2)
+	sync.mutex_lock(&server.routing_mutex)
+	testing.expect_value(t, len(server.streams), 1)
+	testing.expect_value(t, server.next_stream_id, u64(sid) + 1)
+	sync.mutex_unlock(&server.routing_mutex)
+
+	// Refusal must enqueue/forward neither OPEN nor DATA to the agent.
+	_ = trans.connection_set_recv_timeout(agent, 50 * time.Millisecond)
+	unexpected, terr, perr := trans.read_frame(agent, &agent_dec)
+	testing.expect_value(t, terr, trans.TransportError.Timeout)
+	testing.expect_value(t, perr, proto.ProtocolError.None)
+	proto.frame_destroy(&unexpected)
+
+	server_reset_grant(&server, GRANT_A)
+	reset := must_read_opcode(t, caller, &decoder, .Reset)
+	testing.expect_value(t, reset.header.stream_id, sid)
+	testing.expect_value(t, read_wire_failure(t, reset), proto.WireError.Unauthorized)
+	proto.frame_destroy(&reset)
+	agent_reset := must_read_opcode(t, agent, &agent_dec, .Reset)
+	testing.expect_value(t, agent_reset.header.stream_id, sid)
+	testing.expect_value(t, read_wire_failure(t, agent_reset), proto.WireError.Unauthorized)
+	proto.frame_destroy(&agent_reset)
+	testing.expect_value(t, relay_stream_count(&server), 0)
+	testing.expect_value(t, metrics_snapshot_counters(&server.metrics).resets[.GrantRevoked], u64(1))
+}
+
 add_caller_b :: proc(t: ^testing.T, store: ^auth.StaticTokenAuth, loc := #caller_location) {
 	testing.expect_value(t, auth.auth_add_token(store, TOKEN_CALLER_B, PRINCIPAL_CALLER_B), auth.AuthError.None, loc)
+}
+
+@(test)
+test_lease_refresh_keeps_stream_past_original_expiry :: proc(t: ^testing.T) {
+	fx := FixtureConnectAuthz{grant_a = GRANT_A, lease_a = 4 * time.Second, valid_a = time.Second}
+	reg: Registry
+	store: auth.StaticTokenAuth
+	server: Server
+	quiet_test_server(t, &server, &reg, &store)
+	defer stop_test_server(&server, &store, &reg)
+	server.authorizer = Authorizer{ctx = &fx, authorize_connect = fixture_authorize_connect_grants}
+
+	agent, agent_dec := register_test_agent(t, &server)
+	defer trans.connection_destroy(agent)
+	defer proto.decoder_destroy(&agent_dec)
+	caller := dial_server(t, &server)
+	defer trans.connection_destroy(caller)
+	decoder: proto.FrameDecoder
+	handshake_caller(t, caller, &decoder)
+	defer proto.decoder_destroy(&decoder)
+	sid := open_test_stream(t, agent, &agent_dec, caller, &decoder)
+	stream, found := relay_lookup_stream(&server, sid)
+	testing.expect(t, found)
+	if !found {
+		return
+	}
+	renewed := grant_refresh_after(stream.valid_until, time.Second)
+	lease := grant_refresh_after(renewed, time.Second)
+	server_set_grant_lease(&server, GRANT_A, lease, renewed)
+	// Sample fresh forwarding strictly after the original expiry.
+	after_original := grant_refresh_after(stream.valid_until, 50 * time.Millisecond)
+	remaining := time.Duration(after_original._nsec - time.now()._nsec)
+	if remaining > 0 {
+		time.sleep(remaining)
+	}
+	must_write_stream(t, caller, .Data, []u8{'r'}, sid)
+	data := must_read_opcode(t, agent, &agent_dec, .Data)
+	testing.expect_value(t, data.header.stream_id, sid)
+	testing.expect_value(t, string(data.payload), "r")
+	proto.frame_destroy(&data)
+
+	reset := must_read_opcode(t, caller, &decoder, .Reset)
+	testing.expect_value(t, reset.header.stream_id, sid)
+	testing.expect_value(t, read_wire_failure(t, reset), proto.WireError.Timeout)
+	proto.frame_destroy(&reset)
+	testing.expect(t, time.now()._nsec >= renewed._nsec)
+	testing.expect(t, metrics_snapshot_counters(&server.metrics).resets[.GrantExpired] >= 1)
 }
 
 @(test)

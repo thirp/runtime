@@ -89,11 +89,11 @@ test_remove_session_services_leaves_session :: proc(t: ^testing.T) {
 	svc := must_service_id(t, "game/7QF3P9")
 	testing.expect_value(t, register_service(&reg, sid, svc), RegistryError.None)
 	testing.expect_value(t, remove_session_services(&reg, sid), RegistryError.None)
-	_, found := lookup_service(&reg, svc)
+	_, found := lookup_service_for_environment(&reg, "", svc, "org/dev")
 	testing.expect(t, !found)
 	testing.expect_value(t, service_count(&reg), 0)
 	testing.expect_value(t, register_service(&reg, sid, svc), RegistryError.None)
-	rec, ok := lookup_service(&reg, svc)
+	rec, ok := lookup_service_for_environment(&reg, "", svc, "org/dev")
 	testing.expect(t, ok)
 	testing.expect_value(t, rec.agent_session, sid)
 }

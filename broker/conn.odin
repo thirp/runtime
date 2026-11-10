@@ -44,6 +44,20 @@ ConnHandler :: struct {
 	last_ping_sent:  time.Time,
 	caller_counted:  bool,
 	close_reason:    ConnCloseReason,
+	// Stream ids this connection ended with the second HALF_CLOSE. The row
+	// is already gone, so a following CLOSE for one of these ids must not
+	// RESET StreamNotFound. Both peers get the id: the agent half-closes
+	// second when the caller goes first, and the caller half-closes second
+	// in the other order, and either side may send the later CLOSE.
+	//
+	// Fixed ring, not a growable list. This repo's agent never sends that
+	// CLOSE (agent_maybe_finish), so one id per request would sit on the
+	// session until disconnect. Stream ids are monotonic for the whole
+	// server, not per connection, so a watermark would also swallow CLOSE
+	// for streams this connection never half-closed. 256 matches
+	// DEFAULT_MAX_STREAMS_PER_SESSION and stays fixed when that cap is
+	// unset. An id that ages out of the ring gets STREAM_NOT_FOUND again.
+	half_close_finished: HalfCloseFinished,
 }
 
 conn_start_outbox :: proc(h: ^ConnHandler) -> bool {
@@ -445,7 +459,7 @@ conn_handle_authenticate :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 			return true
 		}
 		principal.capabilities = h.capabilities + policy_capabilities(&h.server.policy, pid)
-		sid, rerr := registry_add_session(h.server.registry, principal)
+		sid, rerr := registry_add_session(h.server.registry, principal, h.environment_id)
 		if rerr != .None {
 			_ = conn_send_failure(h, .Error, .InternalError)
 			return true
@@ -800,7 +814,7 @@ conn_handle_connect :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 	}
 
 	lookup_started := time.now()
-	rec, found := lookup_service(h.server.registry, msg.service_id)
+	rec, found := lookup_service_for_environment(h.server.registry, h.environment_id, msg.service_id, OrganizationId(h.organization))
 	metrics_observe(&h.server.metrics, .ServiceLookup, time.since(lookup_started))
 	if !found {
 		metrics_inc_connect_failure(&h.server.metrics, .ServiceNotFound)
@@ -1003,9 +1017,60 @@ conn_handle_open_failed :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 	return false
 }
 
+// Test hook. Production leaves pause and watch_close false, so both
+// procedures return without waiting. The race test arms pause so the
+// handler that applies the second HALF_CLOSE stops before it drops the
+// row. watch_close lets that test wait until a CLOSE has finished.
+HalfClosePause :: struct {
+	mutex:       sync.Mutex,
+	cond:        sync.Cond,
+	pause:       bool,
+	paused:      bool,
+	release:     bool,
+	watch_close: bool,
+	close_done:  bool,
+}
+
+half_close_terminal_pause :: proc(server: ^Server) {
+	if server == nil {
+		return
+	}
+	p := &server.half_close_pause
+	sync.mutex_lock(&p.mutex)
+	defer sync.mutex_unlock(&p.mutex)
+	if !p.pause {
+		return
+	}
+	p.paused = true
+	sync.cond_broadcast(&p.cond)
+	for p.pause && !p.release {
+		sync.cond_wait(&p.cond, &p.mutex)
+	}
+	p.paused = false
+}
+
+half_close_pause_note_close :: proc(server: ^Server) {
+	if server == nil {
+		return
+	}
+	p := &server.half_close_pause
+	sync.mutex_lock(&p.mutex)
+	defer sync.mutex_unlock(&p.mutex)
+	if !p.watch_close {
+		return
+	}
+	p.close_done = true
+	sync.cond_broadcast(&p.cond)
+}
+
 conn_handle_stream_frame :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 	from: StreamPeer = h.role == .Agent ? .Agent : .Caller
 	event: StreamEvent
+	// Procedure-scoped, so this runs after CLOSE is finished, including
+	// Ignored and abort. A decode failure returns before event is Close.
+	defer if event == .Close {
+		half_close_pause_note_close(h.server)
+	}
 	switch frame.header.opcode {
 	case .Data:
 		event = .Data
@@ -1033,9 +1098,21 @@ conn_handle_stream_frame :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 
 	stream, err := relay_apply(h.server, frame.header.stream_id, event, from)
 	if err == .NotFound {
+		// The second HALF_CLOSE already ended this stream and recorded
+		// closed. A following CLOSE from the same connection is the old
+		// agent's finish, not an unknown stream.
+		if event == .Close && half_close_finished_take(h, frame.header.stream_id) {
+			return false
+		}
 		metrics_inc_reset(&h.server.metrics, .StreamNotFound)
 		conn_log_stream_not_found(h, frame.header.stream_id)
 		_ = conn_send_failure_stream(h, .Reset, .StreamNotFound, frame.header.stream_id)
+		return false
+	}
+	// Already closed, or this side already half-closed. Leave the queued
+	// response and the row alone. Do not RESET, and do not record closed
+	// again. The completing HALF_CLOSE does that once.
+	if err == .Ignored {
 		return false
 	}
 	if err != .None {
@@ -1071,6 +1148,12 @@ conn_handle_stream_frame :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 	// STREAM_NOT_FOUND for whatever frame followed the drop. Leave those
 	// frames queued and append this HALF_CLOSE after them.
 	terminal := stream_state_is_terminal(stream.state)
+	// State is already terminal and the row is still in the table. The
+	// race test parks this thread here so the other side's CLOSE is
+	// applied before the row is removed. Unarmed, this returns at once.
+	if terminal && event == .HalfClose {
+		half_close_terminal_pause(h.server)
+	}
 	if terminal && event != .HalfClose {
 		server_drop_stream_queues(h.server, stream)
 	}
@@ -1082,16 +1165,96 @@ conn_handle_stream_frame :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 		trans.connection_release(peer)
 	}
 	if terminal {
-		if event == .Close {
+		if event == .Close || event == .HalfClose {
 			latest, found := relay_lookup_stream(h.server, stream.id)
 			if found {
 				stream = latest
 			}
+			// One closed outcome. CLOSE records it here. The second
+			// HALF_CLOSE ends the stream too; the following CLOSE must
+			// not be required for the outcome, and must not emit again.
 			server_emit_connection(h.server, connection_event_from_stream(.Closed, stream))
+			if event == .HalfClose {
+				half_close_finished_remember(h, stream)
+			}
 		}
 		relay_drop_stream(h.server, stream.id)
 	}
 	return false
+}
+
+// DEFAULT_MAX_STREAMS_PER_SESSION. A connection can have more historical
+// streams than live ones; only the most recent finished ids are kept.
+HALF_CLOSE_FINISHED_CAP :: 256
+
+HalfCloseFinished :: struct {
+	mutex: sync.Mutex,
+	ids:   [HALF_CLOSE_FINISHED_CAP]proto.StreamId,
+	n:     int,
+}
+
+half_close_finished_add :: proc(slot: ^HalfCloseFinished, stream_id: proto.StreamId) {
+	sync.mutex_lock(&slot.mutex)
+	defer sync.mutex_unlock(&slot.mutex)
+	for i in 0 ..< slot.n {
+		if slot.ids[i] == stream_id {
+			return
+		}
+	}
+	if slot.n < HALF_CLOSE_FINISHED_CAP {
+		slot.ids[slot.n] = stream_id
+		slot.n += 1
+		return
+	}
+	// Drop the oldest. A later CLOSE for that id is STREAM_NOT_FOUND.
+	for i in 0 ..< HALF_CLOSE_FINISHED_CAP - 1 {
+		slot.ids[i] = slot.ids[i + 1]
+	}
+	slot.ids[HALF_CLOSE_FINISHED_CAP - 1] = stream_id
+}
+
+half_close_finished_take :: proc(h: ^ConnHandler, stream_id: proto.StreamId) -> bool {
+	slot := &h.half_close_finished
+	sync.mutex_lock(&slot.mutex)
+	defer sync.mutex_unlock(&slot.mutex)
+	for i in 0 ..< slot.n {
+		if slot.ids[i] != stream_id {
+			continue
+		}
+		for j in i ..< slot.n - 1 {
+			slot.ids[j] = slot.ids[j + 1]
+		}
+		slot.n -= 1
+		slot.ids[slot.n] = 0
+		return true
+	}
+	return false
+}
+
+half_close_finished_len :: proc(slot: ^HalfCloseFinished) -> int {
+	sync.mutex_lock(&slot.mutex)
+	defer sync.mutex_unlock(&slot.mutex)
+	return slot.n
+}
+
+// Record the id on the sender and on the other peer. handlers_mutex is
+// held across the peer update so cleanup cannot free that handler first.
+// Ring lock is taken only while handlers_mutex is held or from the
+// connection's own thread, and take never acquires handlers_mutex.
+half_close_finished_remember :: proc(h: ^ConnHandler, stream: RelayStream) {
+	half_close_finished_add(&h.half_close_finished, stream.id)
+	other := stream.caller_conn if h.conn == stream.agent_conn else stream.agent_conn
+	if other == nil || other == h.conn || h.server == nil {
+		return
+	}
+	sync.mutex_lock(&h.server.handlers_mutex)
+	defer sync.mutex_unlock(&h.server.handlers_mutex)
+	for peer in h.server.handlers {
+		if peer != nil && peer.conn == other {
+			half_close_finished_add(&peer.half_close_finished, stream.id)
+			return
+		}
+	}
 }
 
 conn_enqueue_stream :: proc(

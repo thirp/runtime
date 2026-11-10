@@ -28,6 +28,19 @@ must_add_session :: proc(t: ^testing.T, reg: ^Registry, principal: Principal, lo
 	return sid
 }
 
+must_add_session_env :: proc(
+	t: ^testing.T,
+	reg: ^Registry,
+	principal: Principal,
+	environment: string,
+	loc := #caller_location,
+) -> SessionId {
+	sid, err := registry_add_session(reg, principal, environment)
+	testing.expect_value(t, err, RegistryError.None, loc)
+	testing.expect(t, sid != INVALID_SESSION_ID, loc = loc)
+	return sid
+}
+
 json_event :: proc(event: string) -> string {
 	return fmt.tprintf("\"event\":\"%s\"", event)
 }

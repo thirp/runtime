@@ -92,6 +92,23 @@ stream_state_is_terminal :: proc(state: StreamState) -> bool {
 	return state == .Closed || state == .Reset
 }
 
+// CLOSE must not move state or become an illegal event. The row can still
+// be in the table after the second HALF_CLOSE until that handler drops it,
+// and the side that already half-closed may send CLOSE before the other
+// side finishes. The completing HALF_CLOSE records closed once.
+close_is_redundant :: proc(state: StreamState, from: StreamPeer) -> bool {
+	if state == .Closed {
+		return true
+	}
+	if state == .AgentHalfClosed && from == .Agent {
+		return true
+	}
+	if state == .CallerHalfClosed && from == .Caller {
+		return true
+	}
+	return false
+}
+
 stream_peer_opposite :: proc(from: StreamPeer) -> StreamPeer {
 	if from == .Caller {
 		return .Agent

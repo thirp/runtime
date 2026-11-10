@@ -215,11 +215,11 @@ fi
 if ! grep -q 'macos-15-intel' "${ROOT}/docs/BUILDING.md"; then
 	fail_msg "BUILDING.md missing macos-15-intel"
 fi
-if ! grep -q 'v0.16.4' "${ROOT}/docs/QUICKSTART.md"; then
-	fail_msg "QUICKSTART.md missing v0.16.4"
+if ! grep -q 'v0.16.6' "${ROOT}/docs/QUICKSTART.md"; then
+	fail_msg "QUICKSTART.md missing v0.16.6"
 fi
-if ! grep -q 'v0.16.4' "${ROOT}/README.md"; then
-	fail_msg "README.md missing v0.16.4"
+if ! grep -q 'v0.16.6' "${ROOT}/README.md"; then
+	fail_msg "README.md missing v0.16.6"
 fi
 if ! grep -q 'dev-2026-07' "${ROOT}/docs/CHANGELOG.md"; then
 	fail_msg "CHANGELOG.md missing the dev-2026-07 Odin pin note"

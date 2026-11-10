@@ -340,7 +340,7 @@ test_open_during_register_backoff_keeps_session :: proc(t: ^testing.T) {
 	live_i := -1
 	for i in 0 ..< N {
 		name := fmt.tprintf("demo/open%02d", i)
-		if _, found := brk.lookup_service(&fx.reg, must_service(t, name)); found {
+		if _, found := brk.lookup_service_for_environment(&fx.reg, "", must_service(t, name), "org/dev"); found {
 			live_i = i
 			break
 		}

@@ -44,22 +44,24 @@ Learn about the managed pilot at [thirp.net](https://thirp.net/).
 - Platforms: **Linux** (operator release), **macOS arm64**, **macOS x86_64
   (Intel)**, and **Windows AMD64** (data-plane Agent/Caller CLIs and C ABI
   shared libraries). One download:
-  [v0.16.4](https://github.com/thirp/runtime/releases/tag/v0.16.4).
-- SDKs: Odin source packages and one embed SDK tarball whose `c/lib/` holds
-  `libthirp.so` (linux-x86_64), `libthirp.dylib` (darwin-arm64 and
-  darwin-x86_64), and `libthirp.dll` (windows-amd64).
-- Release artifacts on `v0.16.4` are archives:
+  [v0.16.6](https://github.com/thirp/runtime/releases/tag/v0.16.6).
+- SDKs: Odin source packages. Each published platform archive includes the
+  C ABI shared library: `libthirp.so` (linux-x86_64), `libthirp.dylib`
+  (darwin-arm64 and darwin-x86_64), and `libthirp.dll` (windows-amd64). A
+  combined embed SDK tarball is not attached to v0.16.6.
+- Release artifacts on `v0.16.6` are archives:
   - Linux operator, attached by `scripts/publish_github.sh --release`:
-    `thirp-runtime-linux-x86_64-0.16.4.tar.gz` (`thirp-broker`, `thirp-agent`,
+    `thirp-runtime-linux-x86_64-0.16.6.tar.gz` (`thirp-broker`, `thirp-agent`,
     `thirp-connect`, `thirp-web-ingress`, `libthirp.so`, the Broker tarball,
     source archive, SBOM, checksums, and provenance)
-  - Embed SDK and data-plane archives, attached by the `dataplane-release`
-    workflow on that same tag: `thirp-runtime-sdk-0.16.4.tar.gz`,
-    `thirp-runtime-macos-arm64-0.16.4.tar.gz`,
-    `thirp-runtime-macos-x86_64-0.16.4.tar.gz`, and
-    `thirp-runtime-windows-AMD64-0.16.4.zip`. Apple Developer ID and
-    Authenticode are not claimed until those certificates are present at
-    build time.
+  - Data-plane archives also attached to that tag:
+    `thirp-runtime-macos-arm64-0.16.6.tar.gz`,
+    `thirp-runtime-macos-x86_64-0.16.6.tar.gz`, and
+    `thirp-runtime-windows-AMD64-0.16.6.zip`. Checksums, the signature, and
+    provenance are inside the archives (the later macOS arm64 archive has
+    checksums and provenance but no `SHA256SUMS.asc`). Apple Developer ID
+    and Authenticode are not claimed. The Windows zip does not vendor the
+    OpenSSL 3 DLLs (`libssl-3-x64.dll` / `libcrypto-3-x64.dll`).
 
 The self-hosted Runtime implements TLS, role separation, deny-by-default
 production policy, bounded resources, reconnect, health/metrics, and graceful
@@ -104,10 +106,11 @@ certificate, starts each component, and sends an HTTP request through the relay.
 **Start here: [Local TLS quickstart](docs/QUICKSTART.md).**
 
 Download published archives from
-[v0.16.4](https://github.com/thirp/runtime/releases/tag/v0.16.4).
+[v0.16.6](https://github.com/thirp/runtime/releases/tag/v0.16.6).
 The Linux operator archive includes `thirp-web-ingress` and the Broker
-collection. The SDK tarball and the macOS and Windows data-plane archives are
-attached by GitHub Actions. Checksums are inside each archive. To
+collection. The macOS and Windows data-plane archives are attached to the
+same Release. A combined embed SDK tarball is not attached to v0.16.6.
+Checksums are inside each archive. To
 compile individual components, or to produce a platform release tree, see
 [Building, testing, and packaging](docs/BUILDING.md).
 

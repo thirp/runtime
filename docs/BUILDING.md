@@ -136,17 +136,22 @@ cl /Fe:thirp-c-smoke.exe c_abi\smoke.c /I c_abi libthirp.lib
 ### All platforms
 
 ```bash
-odin test . -all-packages
+odin test . -all-packages -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true
 ```
 
 The full command runs the protocol, transport, authentication, Broker, Agent,
 Caller, configuration, logging, version, C ABI, and Web Ingress tests.
 
+Odin's test runner tracks allocations but, by default, only prints `+++ leak`
+and still exits 0 (`ODIN_TEST_FAIL_ON_BAD_MEMORY` defaults to false in
+`core:testing`). The define above turns those into test failures. A package
+cannot change that default.
+
 On macOS, add the OpenSSL linker flags:
 
 ```bash
 OPENSSL_LIB="$(brew --prefix openssl@3)/lib"
-odin test . -all-packages -extra-linker-flags:"-L${OPENSSL_LIB}"
+odin test . -all-packages -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true -extra-linker-flags:"-L${OPENSSL_LIB}"
 ```
 
 On Windows, ensure OpenSSL 3 DLLs are in PATH.

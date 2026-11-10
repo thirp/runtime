@@ -24,7 +24,8 @@ write_frame :: proc(
 }
 
 // read_frame returns a complete frame. The caller must proto.frame_destroy the
-// result. Timeout and Closed are transport errors; decoder failures are protocol errors.
+// result. Timeout and a clean Closed are transport errors. Decoder failures,
+// and EOF while a short frame is still buffered, are protocol errors.
 read_frame :: proc(
 	conn: ^Connection,
 	decoder: ^proto.FrameDecoder,
@@ -40,12 +41,28 @@ read_frame :: proc(
 			return next, .None, .None
 		}
 		n, rerr := connection_read(conn, buf[:])
-		if rerr != .None {
-			return {}, rerr, .None
+		if n > 0 {
+			push_err := proto.decoder_push(decoder, buf[:n])
+			if push_err != .None {
+				return {}, .None, push_err
+			}
 		}
-		push_err := proto.decoder_push(decoder, buf[:n])
-		if push_err != .None {
-			return {}, .None, push_err
+		if rerr != .None {
+			// Bytes can arrive in the same read as EOF. Deliver a complete
+			// frame if one is buffered. A leftover short frame must not
+			// look like a clean close: the broker ends the session on this
+			// error. EOF with an empty decoder stays a clean close.
+			if rerr == .Closed && len(decoder.buf) > 0 {
+				done, ready, cerr := proto.decoder_next(decoder, allocator)
+				if cerr != .None {
+					return {}, .None, cerr
+				}
+				if ready {
+					return done, .None, .None
+				}
+				return {}, .None, .Truncated
+			}
+			return {}, rerr, .None
 		}
 	}
 }

@@ -16,7 +16,7 @@ test_reconnect_restores_registration :: proc(t: ^testing.T) {
 
 	agent, agent_dec := register_test_agent(t, &server)
 	svc := must_service_id(t, TEST_SERVICE)
-	_, found := lookup_service(&reg, svc)
+	_, found := lookup_service_for_environment(&reg, "", svc, "org/dev")
 	testing.expect(t, found)
 
 	proto.decoder_destroy(&agent_dec)
@@ -24,19 +24,19 @@ test_reconnect_restores_registration :: proc(t: ^testing.T) {
 
 	deadline := time.now()
 	for time.since(deadline) < 2 * time.Second {
-		_, found = lookup_service(&reg, svc)
+		_, found = lookup_service_for_environment(&reg, "", svc, "org/dev")
 		if !found {
 			break
 		}
 		time.sleep(5 * time.Millisecond)
 	}
-	_, found = lookup_service(&reg, svc)
+	_, found = lookup_service_for_environment(&reg, "", svc, "org/dev")
 	testing.expect(t, !found)
 
 	agent2, agent_dec2 := register_test_agent(t, &server)
 	defer trans.connection_destroy(agent2)
 	defer proto.decoder_destroy(&agent_dec2)
-	_, found = lookup_service(&reg, svc)
+	_, found = lookup_service_for_environment(&reg, "", svc, "org/dev")
 	testing.expect(t, found)
 
 	caller := dial_server(t, &server)

@@ -106,3 +106,15 @@ test_stream_terminal_rejects_further_events :: proc(t: ^testing.T) {
 	testing.expect_value(t, check_stream_event(.Closed, .Data, .Caller), StreamError.IllegalEvent)
 	testing.expect_value(t, check_stream_event(.Reset, .Close, .Agent), StreamError.IllegalEvent)
 }
+
+@(test)
+test_close_is_redundant_for_finished_sender :: proc(t: ^testing.T) {
+	testing.expect(t, close_is_redundant(.Closed, .Agent))
+	testing.expect(t, close_is_redundant(.Closed, .Caller))
+	testing.expect(t, close_is_redundant(.AgentHalfClosed, .Agent))
+	testing.expect(t, close_is_redundant(.CallerHalfClosed, .Caller))
+	testing.expect(t, !close_is_redundant(.AgentHalfClosed, .Caller))
+	testing.expect(t, !close_is_redundant(.CallerHalfClosed, .Agent))
+	testing.expect(t, !close_is_redundant(.Open, .Agent))
+	testing.expect(t, !close_is_redundant(.Reset, .Caller))
+}

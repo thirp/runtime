@@ -40,12 +40,22 @@ ServiceRegistration :: struct {
 	last_seen_at:  time.Time,
 }
 
+// Map key for one registered name. Without an environment, organization
+// selects the account namespace; both empty selects the leftover global one.
+// Stored keys own their strings; a probe does not.
+ServiceKey :: struct {
+	environment:  string,
+	organization: OrganizationId,
+	service_id:   ServiceId,
+}
+
 AgentSession :: struct {
-	id:            SessionId,
-	principal:     Principal,
-	registered_at: time.Time,
-	last_seen_at:  time.Time,
-	service_ids:   map[ServiceId]struct{},
+	id:             SessionId,
+	principal:      Principal,
+	environment_id: string, // empty: account namespace; owned by the registry
+	registered_at:  time.Time,
+	last_seen_at:   time.Time,
+	service_ids:    map[ServiceId]struct{},
 }
 
 StreamState :: enum {
@@ -77,7 +87,7 @@ StreamEvent :: enum {
 Registry :: struct {
 	mutex:           sync.Mutex,
 	allocator:       mem.Allocator,
-	services:                      map[ServiceId]ServiceRegistration,
+	services:                      map[ServiceKey]ServiceRegistration,
 	sessions:                      map[SessionId]AgentSession,
 	next_session_id:               u64,
 	max_registrations_per_session: int,

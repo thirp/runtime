@@ -231,7 +231,7 @@ test_conn_hello_auth_register_then_lookup :: proc(t: ^testing.T) {
 	proto.frame_destroy(&ok_frame)
 
 	svc := must_service_id(t, TEST_SERVICE)
-	rec, found := lookup_service(&reg, svc)
+	rec, found := lookup_service_for_environment(&reg, "", svc, "org/dev")
 	testing.expect(t, found)
 	testing.expect_value(t, string(rec.id), TEST_SERVICE)
 	testing.expect_value(t, string(rec.owner), PRINCIPAL_HOST)
@@ -535,7 +535,7 @@ test_conn_unregister_drops_lookup :: proc(t: ^testing.T) {
 	delete(string((proto.decode_unregister_ok(ok_unreg.payload) or_else proto.UnregisterOk{}).service_id))
 	proto.frame_destroy(&ok_unreg)
 	svc := must_service_id(t, TEST_SERVICE)
-	_, found := lookup_service(&reg, svc)
+	_, found := lookup_service_for_environment(&reg, "", svc, "org/dev")
 	testing.expect(t, !found)
 	testing.expect_value(t, service_count(&reg), 0)
 	testing.expect_value(t, server.metrics.unregistrations_total, u64(1))

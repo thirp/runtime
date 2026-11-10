@@ -20,7 +20,7 @@ Any agent or caller that speaks protocol 1.0 can talk to a protocol 1.0 broker. 
 Do not infer protocol compatibility from the executable version. `--version` always prints both, for example:
 
 ```text
-thirp-broker 0.16.4 (commit <sha>, protocol 1.0)
+thirp-broker 0.16.6 (commit <sha>, protocol 1.0)
 ```
 
 A single-broker restart interrupts active sessions. Drain rejects new `REGISTER` / `CONNECT`, lets existing streams finish within `shutdown_grace`, then exits. Agents reconnect and re-register the desired set. `thirp-connect` reconnects the broker session; lost local sockets still close. See [OPERATIONS.md](OPERATIONS.md).
@@ -57,9 +57,13 @@ import thirp_caller "thirp:caller"
 
 ## Artifact and target matrix
 
-`v0.16.4` publishes the Linux operator as `thirp-runtime-linux-x86_64-0.16.4.tar.gz`. Inside it: `thirp-broker`, `thirp-agent`, `thirp-connect`, `thirp-web-ingress`, `libthirp.so`, and the Broker Odin collection tarball. The same Release carries one embed SDK tarball with `libthirp` for **linux-x86_64**, **darwin-arm64**, **darwin-x86_64**, and **windows-amd64**, plus data-plane archives with `thirp-agent`, `thirp-connect`, and the shared library for **macOS arm64**, **macOS x86_64 (Intel)**, and **Windows AMD64** (see [BUILDING.md](BUILDING.md#macos-and-windows-data-plane-release)). GitHub Actions builds those libraries and packs the SDK; the publisher dry-run does not. Broker and Web Ingress remain Linux-primary. No static `libthirp.a`. OpenSSL 3 (`libssl` / `libcrypto`) is required at runtime for TLS. CI pins the Odin compiler to `dev-2026-07`.
+`v0.16.6` publishes the Linux operator as `thirp-runtime-linux-x86_64-0.16.6.tar.gz`. Inside it: `thirp-broker`, `thirp-agent`, `thirp-connect`, `thirp-web-ingress`, `libthirp.so`, and the Broker Odin collection tarball. The same Release also carries data-plane archives with `thirp-agent`, `thirp-connect`, and the shared library for **macOS arm64**, **macOS x86_64 (Intel)**, and **Windows AMD64**: `thirp-runtime-macos-arm64-0.16.6.tar.gz`, `thirp-runtime-macos-x86_64-0.16.6.tar.gz`, and `thirp-runtime-windows-AMD64-0.16.6.zip` (see [BUILDING.md](BUILDING.md#macos-and-windows-data-plane-release)). A combined embed SDK tarball is not attached to v0.16.6. Broker and Web Ingress remain Linux-primary. No static `libthirp.a`. OpenSSL 3 (`libssl` / `libcrypto`) is required at runtime for TLS; the Windows zip does not vendor `libssl-3-x64.dll` or `libcrypto-3-x64.dll`. CI pins the Odin compiler to `dev-2026-07`.
 
 The embed SDK (`thirp-runtime-sdk-<VERSION>.tar.gz`) does not include Broker or `auth`. The Broker collection (`thirp-runtime-broker-<VERSION>.tar.gz`) adds those Odin packages and does not include the C ABI. There is no third foundation tarball. Sibling checkout is still the repository root.
+
+## Service ids
+
+A `service_id` is unique per environment when the broker knows the environment, and per organization when it does not. `REGISTER` and `CONNECT` are still only `service_id`.
 
 ## Join codes
 

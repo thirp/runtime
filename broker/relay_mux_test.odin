@@ -553,7 +553,7 @@ test_relay_close_one_stream_others_unaffected :: proc(t: ^testing.T) {
 	testing.expect(t, !workers[2].failed)
 
 	svc := must_service_id(t, TEST_SERVICE)
-	_, found := lookup_service(&reg, svc)
+	_, found := lookup_service_for_environment(&reg, "", svc, "org/dev")
 	testing.expect(t, found)
 	testing.expect_value(t, service_count(&reg), 1)
 

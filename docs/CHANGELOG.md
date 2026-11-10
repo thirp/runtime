@@ -2,6 +2,16 @@
 
 Project version is independent of the wire protocol version. This tree speaks protocol 1.0. See [COMPATIBILITY.md](COMPATIBILITY.md).
 
+## Unreleased
+
+Protocol 1.0, the C ABI, and the wire are unchanged.
+
+- The broker registry keys a service by `(environment_id, service_id)` when the authenticated session has an environment, and by `(organization, service_id)` when it has none. Two organizations can register the same `service_id` on one broker and each reaches only its own; an environment caller no longer falls back into an account registration. `CONNECT` uses the authenticated organization; no wire field is added.
+- TLS treats a peer TCP half-close as a clean EOF (`SSL_OP_IGNORE_UNEXPECTED_EOF` on OpenSSL 3.5.7), including a record cut mid-way, so a response still in flight can be written. A short frame left at that EOF is `ProtocolError.Truncated` from `read_frame` and ends the session. A real syscall error still marks the connection closed.
+- The second `HALF_CLOSE` records one connection `closed` outcome and remembers that stream id on both peers, in a fixed 256-slot ring. A following `CLOSE` for an id still in the ring is ignored, so it does not `RESET` `STREAM_NOT_FOUND` and does not record `closed` again. An id that ages out of the ring, and any other unknown `CLOSE`, still gets `STREAM_NOT_FOUND`.
+- Linux accept sets `SOCK_CLOEXEC` atomically, so a forked child no longer inherits an accepted connection and holds its EOF open.
+- A `CLOSE` that arrives while the stream is already closed, or from the side that already half-closed, is ignored. Queued data stays, `closed` is still recorded once, and the broker does not `RESET` `PROTOCOL_ERROR`.
+
 ## 0.16.6
 
 - Bump the runtime/release version so builds from current master are distinguishable from the shipped 0.16.5 (`8992319`). Protocol 1.0 is unchanged.

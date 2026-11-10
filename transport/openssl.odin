@@ -19,6 +19,9 @@ SSL_ERROR_WANT_READ :: 2
 SSL_ERROR_WANT_WRITE :: 3
 SSL_ERROR_SYSCALL :: 5
 SSL_ERROR_ZERO_RETURN :: 6
+// OpenSSL SSL_OP_BIT(7). A TCP FIN without close_notify is a clean EOF
+// (SSL_ERROR_ZERO_RETURN) so the other side can still write.
+SSL_OP_IGNORE_UNEXPECTED_EOF :: u64(1) << 7
 SSL_CTRL_MODE :: 33
 SSL_CTRL_SET_TLSEXT_HOSTNAME :: 55
 SSL_CTRL_SET_MIN_PROTO_VERSION :: 123
@@ -62,6 +65,7 @@ foreign openssl {
 	TLS_client_method :: proc() -> SSL_METHOD ---
 	SSL_CTX_new :: proc(method: SSL_METHOD) -> SSL_CTX ---
 	SSL_CTX_free :: proc(ctx: SSL_CTX) ---
+	SSL_CTX_set_options :: proc(ctx: SSL_CTX, op: u64) -> u64 ---
 	SSL_CTX_ctrl :: proc(ctx: SSL_CTX, cmd: c.int, larg: c.long, parg: rawptr) -> c.long ---
 	SSL_CTX_use_certificate_file :: proc(ctx: SSL_CTX, file: cstring, type: c.int) -> c.int ---
 	SSL_CTX_use_certificate_chain_file :: proc(ctx: SSL_CTX, file: cstring) -> c.int ---

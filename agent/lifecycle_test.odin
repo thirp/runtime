@@ -49,7 +49,7 @@ test_agent_unregister_a_keeps_b_across_reconnect :: proc(t: ^testing.T) {
 
 	testing.expect_value(t, unregister_service(&agent, sid_a), AgentError.None)
 	wait_lookup(t, &fx.reg, sid_a, false)
-	_, found_b := brk.lookup_service(&fx.reg, sid_b)
+	_, found_b := brk.lookup_service_for_environment(&fx.reg, "", sid_b, "org/dev")
 	testing.expect(t, found_b)
 
 	expect_connect_failed(t, &fx, TEST_SERVICE, proto.WireError.ServiceNotFound)
@@ -65,7 +65,7 @@ test_agent_unregister_a_keeps_b_across_reconnect :: proc(t: ^testing.T) {
 	}
 	wait_agent_connected(t, &agent)
 	wait_lookup(t, &fx.reg, sid_b, true)
-	_, found_a := brk.lookup_service(&fx.reg, sid_a)
+	_, found_a := brk.lookup_service_for_environment(&fx.reg, "", sid_a, "org/dev")
 	testing.expect(t, !found_a)
 	echo_via_service(t, &fx, TEST_SERVICE_B, []u8{'b', '2'})
 }
@@ -73,13 +73,13 @@ test_agent_unregister_a_keeps_b_across_reconnect :: proc(t: ^testing.T) {
 wait_lookup :: proc(t: ^testing.T, reg: ^brk.Registry, id: proto.ServiceId, want: bool, loc := #caller_location) {
 	start := time.now()
 	for time.since(start) < 2 * time.Second {
-		_, found := brk.lookup_service(reg, id)
+		_, found := brk.lookup_service_for_environment(reg, "", id, "org/dev")
 		if found == want {
 			return
 		}
 		time.sleep(5 * time.Millisecond)
 	}
-	_, found := brk.lookup_service(reg, id)
+	_, found := brk.lookup_service_for_environment(reg, "", id, "org/dev")
 	testing.expect_value(t, found, want, loc)
 }
 

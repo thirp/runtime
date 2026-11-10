@@ -35,7 +35,7 @@ test_agent_stop_unregisters_before_exit :: proc(t: ^testing.T) {
 	run.agent = &agent
 	th := thread.create_and_start_with_poly_data(&run, agent_run_proc)
 	wait_agent_connected(t, &agent)
-	_, found := brk.lookup_service(&fx.reg, sid)
+	_, found := brk.lookup_service_for_environment(&fx.reg, "", sid, "org/dev")
 	testing.expect(t, found)
 
 	peer := dial_broker(t, &fx)

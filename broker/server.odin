@@ -74,6 +74,9 @@ Server :: struct {
 	metrics_listening:         bool,
 	metrics_stop:              bool,
 	metrics_thread:            ^thread.Thread,
+	// Tests hold the handler after a terminal HALF_CLOSE is applied and
+	// before the row is removed. Production leaves it unarmed.
+	half_close_pause:          HalfClosePause,
 }
 
 server_init :: proc(
@@ -326,8 +329,10 @@ server_reset_grant :: proc(server: ^Server, grant_id: string) {
 	}
 }
 
-server_set_grant_lease :: proc(server: ^Server, grant_id: string, until: time.Time) {
-	relay_set_grant_lease(server, grant_id, until)
+// Pass valid_until only when a successful authorizer refresh supplies the
+// admission expiry. Older lease-only callers leave that deadline unchanged.
+server_set_grant_lease :: proc(server: ^Server, grant_id: string, until: time.Time, valid_until := time.Time{}) {
+	relay_set_grant_lease(server, grant_id, until, valid_until)
 }
 
 server_copy_stream_grant_ids :: proc(

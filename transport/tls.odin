@@ -33,6 +33,9 @@ tls_server_context_init :: proc(
 		SSL_CTX_free(ctx)
 		return nil, .Tls
 	}
+	// Peer SHUT_WR is a FIN, not a broken TLS session. Without this, the
+	// read fails hard and a response still in flight cannot be written.
+	_ = SSL_CTX_set_options(ctx, SSL_OP_IGNORE_UNEXPECTED_EOF)
 	SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nil)
 
 	cert_c := strings.clone_to_cstring(cert_path, allocator)
@@ -141,6 +144,14 @@ tls_client_context_new :: proc(cfg: TlsClientConfig, allocator := context.alloca
 		SSL_CTX_free(ctx)
 		return nil, .Tls
 	}
+	// SSL_OP_IGNORE_UNEXPECTED_EOF on OpenSSL 3.5.7: a TCP FIN with no
+	// close_notify is a clean EOF, and so is a TLS record cut mid-way.
+	// Both are SSL_ERROR_ZERO_RETURN, mapped to TransportError.Closed,
+	// not .Tls. Frames are length-prefixed, so that is safe. read_frame
+	// returns ProtocolError.Truncated when EOF leaves a short frame
+	// buffered, and the session ends. A FIN after a complete frame leaves
+	// the decoder empty, so the next read is a clean close.
+	_ = SSL_CTX_set_options(ctx, SSL_OP_IGNORE_UNEXPECTED_EOF)
 	SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nil)
 	if len(cfg.ca_path) == 0 {
 		if !tls_client_context_load_system_ca(ctx) {
@@ -337,7 +348,8 @@ tls_map_ssl_error :: proc(conn: ^Connection, rc: c.int, ssl_err: c.int) -> Trans
 	case SSL_ERROR_WANT_READ, SSL_ERROR_WANT_WRITE:
 		return .WouldBlock
 	case SSL_ERROR_ZERO_RETURN:
-		// Peer close_notify. Same as a TCP FIN: the reply can still be written.
+		// close_notify, or a TCP FIN accepted by SSL_OP_IGNORE_UNEXPECTED_EOF.
+		// The reply can still be written. Do not set conn.closed.
 		return .Closed
 	case SSL_ERROR_SYSCALL:
 		when ODIN_OS == .Linux {

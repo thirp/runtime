@@ -461,7 +461,14 @@ listener_accept :: proc(l: ^Listener, allocator := context.allocator) -> (^Conne
 	if l == nil || l.closed {
 		return nil, .Closed
 	}
-	sock, source, err := net.accept_tcp(l.socket)
+	sock: net.TCP_Socket
+	source: net.Endpoint
+	err: net.Accept_Error
+	when ODIN_OS == .Linux {
+		sock, source, err = listener_accept_cloexec(l.socket)
+	} else {
+		sock, source, err = net.accept_tcp(l.socket)
+	}
 	if err != .None {
 		if l.closed {
 			return nil, .Closed
