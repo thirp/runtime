@@ -1,5 +1,6 @@
 # Build a Windows data-plane release tree: thirp-agent.exe, thirp-connect.exe,
-# libthirp.dll, docs, provenance, SHA-256 checksums, optional GPG / Authenticode.
+# libthirp.dll, OpenSSL 3 DLLs, docs, provenance, SHA-256 checksums,
+# optional GPG / Authenticode (Thirp binaries only).
 param(
 	[switch]$SkipBuild
 )
@@ -66,11 +67,27 @@ if ($OdinMonth -lt "2026-07") {
 	throw "release_windows: Odin $OdinVer is older than minimum dev-2026-07"
 }
 
-$OpenSsl = Get-Command openssl -ErrorAction SilentlyContinue
-if (-not $OpenSsl) {
-	throw "release_windows: OpenSSL not found. Install OpenSSL 3 for Windows"
+# Match build_windows.bat: never pick up unrelated OpenSSL copies from PATH.
+$OpenSslRoot = $env:OPENSSL_ROOT_DIR
+if (-not $OpenSslRoot) {
+	foreach ($candidate in @("C:\Program Files\OpenSSL", "C:\Program Files\OpenSSL-Win64")) {
+		if (Test-Path (Join-Path $candidate "bin\openssl.exe") -PathType Leaf) {
+			$OpenSslRoot = $candidate
+			break
+		}
+	}
 }
-$OpenSslVer = (& openssl version 2>&1 | Out-String).Trim() -replace '\s+', ' '
+if (-not $OpenSslRoot) {
+	throw "release_windows: OpenSSL 3 build tree not found; set OPENSSL_ROOT_DIR"
+}
+$OpenSsl = Join-Path $OpenSslRoot "bin\openssl.exe"
+if (-not (Test-Path $OpenSsl -PathType Leaf)) {
+	throw "release_windows: missing $OpenSsl; OPENSSL_ROOT_DIR must point to the OpenSSL 3 build tree"
+}
+$OpenSslVer = (& $OpenSsl version 2>&1 | Out-String).Trim() -replace '\s+', ' '
+if ($LASTEXITCODE -ne 0 -or $OpenSslVer -notmatch '^OpenSSL 3\.') {
+	throw "release_windows: Windows dataplane must be built against OpenSSL 3; $OpenSsl reports: $OpenSslVer"
+}
 
 $Arch = $env:PROCESSOR_ARCHITECTURE
 if (-not $Arch) { $Arch = "AMD64" }
@@ -80,7 +97,7 @@ $Out = Join-Path $Root "dist\thirp-runtime-windows-$Version"
 $Archive = Join-Path $Root "dist\thirp-runtime-windows-$Arch-$Version.zip"
 
 Write-Host "release_windows: building $Version commit $Commit ($Worktree) $Arch"
-Write-Host "release_windows: openssl=$OpenSslVer path=$($OpenSsl.Source)"
+Write-Host "release_windows: openssl=$OpenSslVer path=$OpenSsl"
 Write-Host "release_windows: odin=$OdinVer path=$($Odin.Source)"
 if (-not $SkipBuild) {
 	$BuildBatRel = "scripts\build_windows.bat"
@@ -108,6 +125,26 @@ foreach ($name in @("thirp-agent.exe", "thirp-connect.exe", "libthirp.dll")) {
 	}
 }
 
+# MSVC release runners have dumpbin; also catch a mismatched -SkipBuild tree.
+$DumpBin = Get-Command dumpbin -ErrorAction SilentlyContinue
+if ($DumpBin) {
+	foreach ($name in @("thirp-agent.exe", "thirp-connect.exe", "libthirp.dll")) {
+		$imports = (& $DumpBin.Source /imports (Join-Path $Out $name) 2>&1 | Out-String)
+		if ($LASTEXITCODE -ne 0) { throw "release_windows: dumpbin failed for $name" }
+		if ($imports -match '(?i)lib(?:ssl|crypto)-4-[\w-]+\.dll') {
+			throw "release_windows: $name imports OpenSSL 4; Windows dataplane must be built against OpenSSL 3"
+		}
+	}
+}
+
+foreach ($name in @("libssl-3-x64.dll", "libcrypto-3-x64.dll")) {
+	$source = Join-Path $OpenSslRoot "bin\$name"
+	if (-not (Test-Path $source -PathType Leaf)) {
+		throw "release_windows: missing $source; install OpenSSL 3 with both libssl-3-x64.dll and libcrypto-3-x64.dll in the build tree (OpenSSL 4 is not compatible)"
+	}
+	Copy-Item $source (Join-Path $Out $name) -Force
+}
+
 Copy-Item (Join-Path $Root "c_abi\thirp.h") (Join-Path $Out "thirp.h") -Force
 Copy-Item (Join-Path $Root "LICENSE") (Join-Path $Out "LICENSE") -Force
 Copy-Item (Join-Path $Root "NOTICE") (Join-Path $Out "NOTICE") -Force
@@ -123,7 +160,7 @@ odin: $OdinVer
 openssl: $OpenSslVer
 target: windows $Arch
 artifact_kind: dataplane
-components: thirp-agent thirp-connect libthirp
+components: thirp-agent thirp-connect libthirp libssl-3-x64.dll libcrypto-3-x64.dll
 build_command: scripts/release_windows.ps1
 built_at: $Date
 "@
@@ -136,6 +173,7 @@ if ($Pfx) {
 		throw "release_windows: THIRP_WINDOWS_PFX is set but signtool.exe is not on PATH"
 	}
 	$PfxPass = $env:THIRP_WINDOWS_PFX_PASSWORD
+	# Preserve the third-party OpenSSL DLLs as supplied; do not sign with Thirp's PFX.
 	foreach ($bin in @("thirp-agent.exe", "thirp-connect.exe", "libthirp.dll")) {
 		$args = @("sign", "/fd", "SHA256", "/td", "SHA256", "/tr", "http://timestamp.digicert.com", "/f", $Pfx)
 		if ($PfxPass) { $args += @("/p", $PfxPass) }
@@ -145,15 +183,17 @@ if ($Pfx) {
 			throw "release_windows: signtool failed for $bin"
 		}
 	}
-	Write-Host "release_windows: Authenticode-signed with THIRP_WINDOWS_PFX"
+	Write-Host "release_windows: Thirp binaries Authenticode-signed with THIRP_WINDOWS_PFX; OpenSSL DLLs kept as supplied"
 } else {
-	Write-Host "release_windows: Authenticode PFX not set (THIRP_WINDOWS_PFX); binaries are unsigned"
+	Write-Host "release_windows: Authenticode PFX not set (THIRP_WINDOWS_PFX); Thirp binaries are unsigned; OpenSSL DLLs kept as supplied"
 }
 
 $SumFiles = @(
 	"thirp-agent.exe",
 	"thirp-connect.exe",
 	"libthirp.dll",
+	"libssl-3-x64.dll",
+	"libcrypto-3-x64.dll",
 	"thirp.h",
 	"LICENSE",
 	"NOTICE",

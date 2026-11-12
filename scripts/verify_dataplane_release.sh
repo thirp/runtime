@@ -25,7 +25,7 @@ darwin)
 	FORBIDDEN=(thirp-broker thirp-web-ingress thirp-broker.exe thirp-web-ingress.exe libthirp.so libthirp.dll)
 	;;
 windows)
-	BINS=(thirp-agent.exe thirp-connect.exe libthirp.dll)
+	BINS=(thirp-agent.exe thirp-connect.exe libthirp.dll libssl-3-x64.dll libcrypto-3-x64.dll)
 	FORBIDDEN=(thirp-broker thirp-web-ingress thirp-broker.exe thirp-web-ingress.exe libthirp.so libthirp.dylib)
 	;;
 *)

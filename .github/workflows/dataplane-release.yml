@@ -135,17 +135,28 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install OpenSSL
+      - name: Install OpenSSL 3
         shell: pwsh
         run: |
-          choco install openssl --no-progress -y
-          $candidates = @(
-            "C:\Program Files\OpenSSL-Win64",
-            "C:\Program Files\OpenSSL"
-          )
-          $root = $candidates | Where-Object { Test-Path (Join-Path $_ "bin\openssl.exe") } | Select-Object -First 1
-          if (-not $root) { throw "OpenSSL install root not found under $($candidates -join ', ')" }
+          # Pinned OpenSSL 3.5.9 (same series as shipped 0.16.6 provenance) from the
+          # Win64 OpenSSL publisher, hash-checked. Chocolatey has no 3.5.9 package, and
+          # its older 3.x packages point at installers the publisher has removed (404).
+          $url = "https://slproweb.com/download/Win64OpenSSL-3_5_9.exe"
+          $sha256 = "5fe338c81d62515df7292f16542a0eef2a29db3efc023cd5a8c08ec3c97027ae"
+          $root = "C:\Program Files\OpenSSL"
+          $exe = Join-Path $env:RUNNER_TEMP "Win64OpenSSL-3_5_9.exe"
+          Invoke-WebRequest -Uri $url -OutFile $exe
+          $got = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant()
+          if ($got -ne $sha256) { throw "OpenSSL installer SHA256 mismatch: $got" }
+          $p = Start-Process -FilePath $exe -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-", "/DIR=`"$root`"") -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "OpenSSL 3.5.9 install failed ($($p.ExitCode))" }
+          if (-not (Test-Path (Join-Path $root "bin\openssl.exe") -PathType Leaf)) { throw "OpenSSL install root not found at $root" }
           $bin = Join-Path $root "bin"
+          foreach ($name in @("libssl-3-x64.dll", "libcrypto-3-x64.dll")) {
+            if (-not (Test-Path (Join-Path $bin $name) -PathType Leaf)) { throw "OpenSSL 3 install missing $bin\$name" }
+          }
+          $ver = (& (Join-Path $bin "openssl.exe") version | Out-String).Trim()
+          if ($ver -notmatch '^OpenSSL 3\.5\.9') { throw "Expected OpenSSL 3.5.9, got: $ver" }
           $lib = Join-Path $root "lib"
           Add-Content -Path $env:GITHUB_PATH -Value $bin
           if (Test-Path $lib) { Add-Content -Path $env:GITHUB_PATH -Value $lib }

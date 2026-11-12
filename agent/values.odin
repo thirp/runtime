@@ -20,6 +20,10 @@ LOG_EVENT_RATE_LIMITED :: "rate_limited"
 // One line per service that is live on the broker session.
 LOG_EVENT_REGISTERED :: "registered"
 HEARTBEAT_INTERVAL :: 15 * time.Second
+// No inbound frame for three heartbeat intervals. Our own Ping does not
+// count: the broker must send a frame (including Ping or Pong).
+READ_IDLE_TIMEOUT :: 45 * time.Second
+LOG_REASON_IDLE :: "idle"
 LOCAL_READ_BUF :: 16 * 1024
 // Default no-progress limit for one stream (see AgentConfig).
 DEFAULT_STREAM_STALL_TIMEOUT :: 30 * time.Second

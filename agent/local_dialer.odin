@@ -649,12 +649,26 @@ agent_handle_unregister_reply :: proc(relay: ^AgentRelay, frame: proto.Frame) {
 	sync.mutex_unlock(&relay.agent.mutex)
 }
 
-agent_relay_loop :: proc(relay: ^AgentRelay, decoder: ^proto.FrameDecoder) {
+agent_read_idle_limit :: proc(agent: ^Agent) -> time.Duration {
+	_ = agent
+	return READ_IDLE_TIMEOUT
+}
+
+agent_relay_loop :: proc(relay: ^AgentRelay, decoder: ^proto.FrameDecoder) -> (reason: string) {
+	reason = "disconnected"
 	nonce: u64
 	last_ping := time.now()
+	last_recv := last_ping
 	for {
 		if sync.atomic_load(&relay.agent.stop) {
 			agent_shutdown_session(relay, decoder)
+			return
+		}
+		// Check before any Ping write: a successful outbound write into a
+		// half-open socket's send queue is not evidence the broker is live.
+		if time.since(last_recv) >= agent_read_idle_limit(relay.agent) {
+			reason = LOG_REASON_IDLE
+			agent_log(relay.agent, .Info, "disconnected", log.LogFields{reason = reason})
 			return
 		}
 		when ODIN_TEST {
@@ -690,6 +704,7 @@ agent_relay_loop :: proc(relay: ^AgentRelay, decoder: ^proto.FrameDecoder) {
 		if terr != .None || perr != .None {
 			return
 		}
+		last_recv = time.now()
 		switch frame.header.opcode {
 		case .Ping:
 			msg, merr := proto.decode_ping(frame.payload)

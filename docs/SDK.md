@@ -140,7 +140,7 @@ The published embed SDK tarball ships every `libthirp` next to one header, `c/in
 | `darwin-x86_64` | `c/lib/darwin-x86_64/libthirp.dylib` |
 | `windows-amd64` | `c/lib/windows-amd64/libthirp.dll` |
 
-`scripts/assemble_sdk.sh` builds that tarball from the platform artifacts. `scripts/release.sh` on one machine still packs only the library it just built, so `scripts/verify_sdk.sh` can link it; that host tarball is not the published SDK. Each library links system OpenSSL 3 (`libssl` / `libcrypto`). No static library. No versioned soname. Data-plane archives still ship the Agent and Caller CLIs beside their own copy of `libthirp`.
+`scripts/assemble_sdk.sh` builds that tarball from the platform artifacts. `scripts/release.sh` on one machine still packs only the library it just built, so `scripts/verify_sdk.sh` can link it; that host tarball is not the published SDK. Each library dynamically links OpenSSL 3 (`libssl` / `libcrypto`); standalone SDK consumers must supply it for their target. No static library. No versioned soname. Data-plane archives ship the Agent and Caller CLIs beside their own copy of `libthirp`. The Windows data-plane zip also vendors `libssl-3-x64.dll` and `libcrypto-3-x64.dll` from the build tree. Linux/macOS archives use distro / Homebrew OpenSSL without vendoring it.
 
 ```bash
 cc -o echo_client examples/c/echo_client/echo_client.c \

@@ -182,6 +182,44 @@ fi
 if ! grep -q 'ZipFileExtensions' "${ROOT}/scripts/release_windows.ps1"; then
 	fail_msg "release_windows.ps1 must write zip entries with ZipFile"
 fi
+# Keep the OpenSSL copy allowlist and checksum list scoped to their own blocks.
+WINDOWS_RELEASE="${ROOT}/scripts/release_windows.ps1"
+openssl_copy="$(sed -n '/^foreach (\$name in @("libssl-3-x64.dll"/,/^}/p' "$WINDOWS_RELEASE")"
+windows_sums="$(sed -n '/^\$SumFiles = @(/,/^)/p' "$WINDOWS_RELEASE")"
+for dll in libssl-3-x64.dll libcrypto-3-x64.dll; do
+	if ! grep -qF "\"$dll\"" <<<"$openssl_copy"; then
+		fail_msg "release_windows.ps1 must copy ${dll} from the OpenSSL build tree"
+	fi
+	if ! grep -qxF "$(printf '\t\"%s\",' "$dll")" <<<"$windows_sums"; then
+		fail_msg "release_windows.ps1 SumFiles missing ${dll}"
+	fi
+done
+for needle in 'Join-Path $OpenSslRoot "bin\$name"' \
+	'Test-Path $source -PathType Leaf' \
+	'Copy-Item $source (Join-Path $Out $name) -Force'; do
+	if ! grep -qF "$needle" <<<"$openssl_copy"; then
+		fail_msg "release_windows.ps1 OpenSSL copy block missing ${needle}"
+	fi
+done
+if grep -qE 'Copy-Item.*lib(ssl|crypto)-4-|foreach.*lib(ssl|crypto)-4-' "$WINDOWS_RELEASE"; then
+	fail_msg "release_windows.ps1 must not copy OpenSSL 4 DLLs"
+fi
+windows_job="$(sed -n '/^  windows:/,/^  publish:/p' "${ROOT}/.github/workflows/dataplane-release.yml")"
+if grep -qE '^[[:space:]]*choco install openssl' <<<"$windows_job"; then
+	fail_msg "workflow Windows job must not install OpenSSL through Chocolatey (unpinned selects 4.x; old 3.x packages 404)"
+fi
+for needle in \
+	'$url = "https://slproweb.com/download/Win64OpenSSL-3_' \
+	'$sha256 = "' \
+	'Get-FileHash -Algorithm SHA256' \
+	"if (\$ver -notmatch '^OpenSSL 3\\."; do
+	if ! grep -qF "$needle" <<<"$windows_job"; then
+		fail_msg "workflow Windows OpenSSL install must be a hash-pinned OpenSSL 3 installer (missing ${needle})"
+	fi
+done
+if ! grep -qE '^[[:space:]]*\$sha256 = "[0-9a-f]{64}"$' <<<"$windows_job"; then
+	fail_msg "workflow Windows OpenSSL installer SHA256 must be a full 64-hex pin"
+fi
 if grep -q 'use all or dataplane)' "${ROOT}/scripts/build_windows.bat"; then
 	fail_msg "build_windows.bat unknown-mode echo still has cmd.exe-breaking parentheses"
 fi
@@ -215,11 +253,11 @@ fi
 if ! grep -q 'macos-15-intel' "${ROOT}/docs/BUILDING.md"; then
 	fail_msg "BUILDING.md missing macos-15-intel"
 fi
-if ! grep -q 'v0.16.6' "${ROOT}/docs/QUICKSTART.md"; then
-	fail_msg "QUICKSTART.md missing v0.16.6"
+if ! grep -q 'v0.16.7' "${ROOT}/docs/QUICKSTART.md"; then
+	fail_msg "QUICKSTART.md missing v0.16.7"
 fi
-if ! grep -q 'v0.16.6' "${ROOT}/README.md"; then
-	fail_msg "README.md missing v0.16.6"
+if ! grep -q 'v0.16.7' "${ROOT}/README.md"; then
+	fail_msg "README.md missing v0.16.7"
 fi
 if ! grep -q 'dev-2026-07' "${ROOT}/docs/CHANGELOG.md"; then
 	fail_msg "CHANGELOG.md missing the dev-2026-07 Odin pin note"
@@ -290,7 +328,7 @@ if ! bash "${ROOT}/scripts/verify_dataplane_release.sh" "${FIX}/darwin-intel" da
 	fail_msg "verify_dataplane_release.sh rejected a valid darwin x86_64 fixture"
 fi
 
-for name in thirp-agent.exe thirp-connect.exe libthirp.dll thirp.h LICENSE NOTICE CHANGELOG.md DEPENDENCIES.md; do
+for name in thirp-agent.exe thirp-connect.exe libthirp.dll libssl-3-x64.dll libcrypto-3-x64.dll thirp.h LICENSE NOTICE CHANGELOG.md DEPENDENCIES.md; do
 	printf 'windows-%s\n' "$name" > "${FIX}/windows/${name}"
 done
 cat > "${FIX}/windows/PROVENANCE.txt" <<'EOF'
@@ -299,13 +337,31 @@ version: 0.16.3
 source_commit: deadbeef
 target: windows AMD64
 artifact_kind: dataplane
-components: thirp-agent thirp-connect libthirp
+components: thirp-agent thirp-connect libthirp libssl-3-x64.dll libcrypto-3-x64.dll
 build_command: scripts/release_windows.ps1
 EOF
-write_sums "${FIX}/windows" thirp-agent.exe thirp-connect.exe libthirp.dll thirp.h LICENSE NOTICE CHANGELOG.md DEPENDENCIES.md PROVENANCE.txt
+write_sums "${FIX}/windows" thirp-agent.exe thirp-connect.exe libthirp.dll libssl-3-x64.dll libcrypto-3-x64.dll thirp.h LICENSE NOTICE CHANGELOG.md DEPENDENCIES.md PROVENANCE.txt
 if ! bash "${ROOT}/scripts/verify_dataplane_release.sh" "${FIX}/windows" windows; then
 	fail_msg "verify_dataplane_release.sh rejected a valid windows fixture"
 fi
+
+# Reject each missing DLL even when the remaining files have valid checksums.
+# Also reject DLLs present on disk but absent from SHA256SUMS.
+for dll in libssl-3-x64.dll libcrypto-3-x64.dll; do
+	mkdir -p "${FIX}/windows-missing" "${FIX}/windows-unsummed"
+	cp -a "${FIX}/windows/." "${FIX}/windows-missing/"
+	cp -a "${FIX}/windows/." "${FIX}/windows-unsummed/"
+	awk -v dll="$dll" '$2 != dll' "${FIX}/windows/SHA256SUMS" > "${FIX}/windows-missing/SHA256SUMS"
+	cp "${FIX}/windows-missing/SHA256SUMS" "${FIX}/windows-unsummed/SHA256SUMS"
+	rm "${FIX}/windows-missing/$dll"
+	for tree in windows-missing windows-unsummed; do
+		if bash "${ROOT}/scripts/verify_dataplane_release.sh" "${FIX}/$tree" windows >"${FIX}/$tree.log" 2>&1; then
+			fail_msg "verify_dataplane_release.sh accepted ${tree} ${dll}"
+		elif ! grep -qF "missing ${dll}" "${FIX}/$tree.log"; then
+			fail_msg "verify_dataplane_release.sh failed without identifying ${dll}"
+		fi
+	done
+done
 
 cp -a "${FIX}/darwin/." "${FIX}/bad/"
 printf 'nope\n' > "${FIX}/bad/thirp-broker"

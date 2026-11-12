@@ -94,7 +94,7 @@ Or use the convenience script:
 scripts\build_windows.bat
 ```
 
-`build_windows.bat` finds `libssl.lib` under `OPENSSL_ROOT_DIR` (or `C:\Program Files\OpenSSL`, then `OpenSSL-Win64`) and prepends that directory to `LIB`. Chocolatey OpenSSL 4 installs at `C:\Program Files\OpenSSL`.
+`build_windows.bat` finds `libssl.lib` under `OPENSSL_ROOT_DIR` (or `C:\Program Files\OpenSSL`, then `C:\Program Files\OpenSSL-Win64`, when `bin\openssl.exe` exists) and prepends that directory to `LIB`. Select an OpenSSL 3 tree: an unpinned Chocolatey install can select OpenSSL 4, which is the wrong ABI. Windows release CI installs OpenSSL 3.5.9 from the Win64 OpenSSL installer at a pinned SHA-256 into `C:\Program Files\OpenSSL`.
 
 ## Build the C ABI
 
@@ -129,7 +129,7 @@ odin build c_abi -build-mode:shared -out:libthirp.dll
 cl /Fe:thirp-c-smoke.exe c_abi\smoke.c /I c_abi libthirp.lib
 ```
 
-`libthirp.dll` links system OpenSSL 3 libraries.
+`libthirp.dll` dynamically links OpenSSL 3. The Windows data-plane zip includes the matching DLLs; a standalone build or SDK consumer must supply them.
 
 ## Run the test suite
 
@@ -154,7 +154,7 @@ OPENSSL_LIB="$(brew --prefix openssl@3)/lib"
 odin test . -all-packages -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true -extra-linker-flags:"-L${OPENSSL_LIB}"
 ```
 
-On Windows, ensure OpenSSL 3 DLLs are in PATH.
+For local tests from a Windows build tree, ensure OpenSSL 3 DLLs are beside the test executable or on `PATH`. The Windows data-plane release zip includes those DLLs beside its executables and needs no system OpenSSL at runtime.
 
 A test run is not successful if it logs `+++ leak`, even when the process exits
 with status 0.
@@ -190,7 +190,7 @@ See [SDK.md](SDK.md) for lifecycle and API guidance.
 
 - **Linux**: Operator archive from `scripts/release.sh`, `thirp-runtime-linux-<arch>-<VERSION>.tar.gz` (`thirp-broker`, `thirp-agent`, `thirp-connect`, `thirp-web-ingress`, `libthirp.so`, Broker tarball, source, SBOM, provenance, checksums). That archive is the Linux asset attached to `v<VERSION>` by `scripts/publish_github.sh --release`.
 - **macOS**: Data-plane release tree (`thirp-agent`, `thirp-connect`, `libthirp.dylib`) via `scripts/release_macos.sh` on **arm64** (`macos-latest`) and **x86_64 (Intel)** (`macos-15-intel`). The workflow attaches both archives to the same `v<VERSION>` Release.
-- **Windows**: Data-plane release tree (`thirp-agent.exe`, `thirp-connect.exe`, `libthirp.dll`) via `scripts/release_windows.ps1` (AMD64), attached to that same Release.
+- **Windows**: Data-plane release tree (`thirp-agent.exe`, `thirp-connect.exe`, `libthirp.dll`, `libssl-3-x64.dll`, `libcrypto-3-x64.dll`) via `scripts/release_windows.ps1` (AMD64), attached to that same Release.
 
 macOS and Windows agents and callers connect outbound to a Linux broker over TLS.
 Broker / Web Ingress / full operator stacks remain Linux-primary in published
@@ -244,7 +244,8 @@ If the Thirp publish key is in the local GPG agent, `scripts/release.sh` detache
 ## macOS and Windows data-plane release
 
 These scripts produce the same kind of checksummed tree as Linux, limited to
-the data plane: Agent CLI, Caller CLI, and `libthirp`. Protocol 1.0 is unchanged.
+the data plane: Agent CLI, Caller CLI, and `libthirp`, plus the OpenSSL 3 DLLs
+on Windows. Protocol 1.0 is unchanged.
 
 ### macOS
 
@@ -294,8 +295,19 @@ dist\thirp-runtime-windows-<VERSION>\
 dist\thirp-runtime-windows-<arch>-<VERSION>.zip
 ```
 
-Authenticode signing is skipped unless `THIRP_WINDOWS_PFX` (and optional
-`THIRP_WINDOWS_PFX_PASSWORD`) is set and `signtool.exe` is on `PATH`.
+The tree and zip include `libssl-3-x64.dll` and `libcrypto-3-x64.dll` beside
+`thirp-agent.exe`, `thirp-connect.exe`, and `libthirp.dll`. The release script
+selects the same OpenSSL 3 root as `build_windows.bat` and copies only those two
+DLLs from its `bin\` directory. Both are required and included in `SHA256SUMS`;
+that root's `openssl version` is recorded in `PROVENANCE.txt`. OpenSSL 4 is
+rejected. With `-SkipBuild`, select the OpenSSL 3 tree used for the existing
+binaries. Linux and macOS archives continue to use distro / Homebrew OpenSSL
+without vendoring it.
+
+Authenticode signing of the three Thirp binaries is skipped unless
+`THIRP_WINDOWS_PFX` (and optional `THIRP_WINDOWS_PFX_PASSWORD`) is set and
+`signtool.exe` is on `PATH`. The third-party OpenSSL DLLs are kept as supplied
+and are not signed with the Thirp PFX.
 
 ### Verify a downloaded tree
 

@@ -32,7 +32,7 @@
       "licenseConcluded": "Apache-2.0",
       "licenseDeclared": "Apache-2.0",
       "copyrightText": "NOASSERTION",
-      "comment": "System libssl/libcrypto. Not vendored. See docs/DEPENDENCIES.md."
+      "comment": "Linux/macOS use system/Homebrew libssl/libcrypto, not vendored. The Windows data-plane zip vendors libssl-3-x64.dll and libcrypto-3-x64.dll from the OpenSSL 3 tree used at build time. See docs/DEPENDENCIES.md."
     }
   ],
   "relationships": [

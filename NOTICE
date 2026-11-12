@@ -4,5 +4,8 @@ Copyright 2026 Charles Benedict, Jr.
 Licensed under the Apache License, Version 2.0.
 See the LICENSE file in the project root.
 
-This product links system OpenSSL 3 (libssl and libcrypto), licensed
-under Apache-2.0. OpenSSL is not vendored. See docs/DEPENDENCIES.md.
+This product links OpenSSL 3 (libssl and libcrypto), licensed under
+Apache-2.0. The Windows data-plane zip vendors libssl-3-x64.dll and
+libcrypto-3-x64.dll from the OpenSSL build tree used to link the binaries.
+Linux and macOS archives use system / Homebrew OpenSSL, not vendored.
+See docs/DEPENDENCIES.md.

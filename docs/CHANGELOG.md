@@ -4,8 +4,12 @@ Project version is independent of the wire protocol version. This tree speaks pr
 
 ## Unreleased
 
+## 0.16.7
+
 Protocol 1.0, the C ABI, and the wire are unchanged.
 
+- `thirp-agent` now drops a session with no inbound frame for 45 seconds (`reason=idle`) and reconnects, matching `thirp-connect`. Protocol 1.0, the C ABI, and the wire are unchanged.
+- The Windows data-plane zip now vendors `libssl-3-x64.dll` and `libcrypto-3-x64.dll` beside the executables, so a clean install starts without system OpenSSL or OpenSSL DLLs on `PATH`. Protocol 1.0, the C ABI, and the wire are unchanged.
 - The broker registry keys a service by `(environment_id, service_id)` when the authenticated session has an environment, and by `(organization, service_id)` when it has none. Two organizations can register the same `service_id` on one broker and each reaches only its own; an environment caller no longer falls back into an account registration. `CONNECT` uses the authenticated organization; no wire field is added.
 - TLS treats a peer TCP half-close as a clean EOF (`SSL_OP_IGNORE_UNEXPECTED_EOF` on OpenSSL 3.5.7), including a record cut mid-way, so a response still in flight can be written. A short frame left at that EOF is `ProtocolError.Truncated` from `read_frame` and ends the session. A real syscall error still marks the connection closed.
 - The second `HALF_CLOSE` records one connection `closed` outcome and remembers that stream id on both peers, in a fixed 256-slot ring. A following `CLOSE` for an id still in the ring is ignored, so it does not `RESET` `STREAM_NOT_FOUND` and does not record `closed` again. An id that ages out of the ring, and any other unknown `CLOSE`, still gets `STREAM_NOT_FOUND`.

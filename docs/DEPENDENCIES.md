@@ -35,8 +35,10 @@ This inventory is the source of truth for the release SBOM (`scripts/sbom.spdx.j
 - **What:** OpenSSL 3 for Windows
 - **Used for:** same TLS operations as Linux
 - **License:** Apache-2.0
-- **Install:** official Windows binaries from [wiki.openssl.org](https://wiki.openssl.org/index.php/Binaries) or via package manager (vcpkg, Chocolatey)
-- **Link:** `foreign import "system:libssl.lib"` and `"system:libcrypto.lib"` (MSVC needs the `.lib` suffix; without it the linker looks for `libssl.obj`). `scripts/build_windows.bat` adds the directory containing `libssl.lib` to `LIB` (`OPENSSL_ROOT_DIR`, then `C:\Program Files\OpenSSL`, then `OpenSSL-Win64`; including `lib\VC\x64\MD`). OpenSSL 4 via Chocolatey installs at `C:\Program Files\OpenSSL`.
+- **Install for builds:** OpenSSL 3 Windows binaries from a provider listed at [wiki.openssl.org](https://wiki.openssl.org/index.php/Binaries) or via package manager. Windows release CI installs OpenSSL 3.5.9 from the Win64 OpenSSL installer at a pinned SHA-256; an unpinned Chocolatey `openssl` install now selects OpenSSL 4, which is the wrong ABI.
+- **Link:** `foreign import "system:libssl.lib"` and `"system:libcrypto.lib"` (MSVC needs the `.lib` suffix; without it the linker looks for `libssl.obj`). `scripts/build_windows.bat` adds the directory containing `libssl.lib` to `LIB` (`OPENSSL_ROOT_DIR`, then `C:\Program Files\OpenSSL`, then `C:\Program Files\OpenSSL-Win64`; including `lib\VC\x64\MD`). The default roots are considered only when they contain `bin\openssl.exe`.
+- **Distribution:** the Windows data-plane zip vendors `libssl-3-x64.dll` and `libcrypto-3-x64.dll` beside the executables. `scripts/release_windows.ps1` copies both from the selected build tree's `bin\`, includes them in `SHA256SUMS`, and records that tree's `openssl version` in `PROVENANCE.txt`. Missing OpenSSL 3 DLLs fail the release; OpenSSL 4 DLLs are not substitutes. A released zip needs no system OpenSSL or OpenSSL DLLs on `PATH` at runtime.
+- **Signing:** OpenSSL DLLs are preserved as supplied by the OpenSSL build; they are not signed with `THIRP_WINDOWS_PFX`.
 - **CA verification:** Windows ROOT certificate store via `CertOpenSystemStoreW` / `d2i_X509` / `X509_STORE_add_cert` (`crypt32.lib`, a Windows system library)
 
 ## Platform-specific system libraries
@@ -57,4 +59,4 @@ This inventory is the source of truth for the release SBOM (`scripts/sbom.spdx.j
 
 ## Summary
 
-`libthirp.so`, `libthirp.dylib`, and `libthirp.dll` link the system OpenSSL 3 through `transport`. No extra third-party library is added for the shared object.
+`libthirp.so`, `libthirp.dylib`, and `libthirp.dll` dynamically link OpenSSL 3 through `transport`. Linux uses distro OpenSSL and macOS uses Homebrew OpenSSL; neither archive vendors it. The Windows data-plane zip carries the two OpenSSL 3 DLLs used at build time. Standalone SDK consumers must still supply OpenSSL 3 for their target.
