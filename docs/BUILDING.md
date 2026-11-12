@@ -24,7 +24,7 @@ provenance. See [DEPENDENCIES.md](DEPENDENCIES.md) for the dependency inventory.
 macOS builds are supported for CLIs and `libthirp.dylib`. Requirements:
 
 - [Odin](https://odin-lang.org/) `dev-2026-07` or later
-- OpenSSL 3 via Homebrew: `brew install openssl@3`
+- OpenSSL 3 build prefix with host-architecture `libssl.a` and `libcrypto.a` (Homebrew or MacPorts; see `OPENSSL_PREFIX` below)
 - Xcode Command Line Tools
 
 ### Windows
@@ -61,21 +61,30 @@ directories.
 ### macOS
 
 ```bash
-# Ensure OpenSSL 3 is installed
-brew install openssl@3
-
-# Build with linker flags pointing to Homebrew OpenSSL
-OPENSSL_LIB="$(brew --prefix openssl@3)/lib"
-odin build broker_cli -out:thirp-broker -extra-linker-flags:"-L${OPENSSL_LIB}"
-odin build agent_cli -out:thirp-agent -extra-linker-flags:"-L${OPENSSL_LIB}"
-odin build caller_cli -out:thirp-connect -extra-linker-flags:"-L${OPENSSL_LIB}"
-odin build web_ingress_cli -out:thirp-web-ingress -extra-linker-flags:"-L${OPENSSL_LIB}"
+# Lab M4 / Homebrew example:
+export OPENSSL_PREFIX=/opt/homebrew/opt/openssl@3
+# Lab iMac / MacPorts example instead:
+# export OPENSSL_PREFIX=/opt/local/libexec/openssl3
+bash scripts/build_macos.sh all        # also Broker and Web Ingress
+# bash scripts/build_macos.sh dataplane # Agent, Connect, libthirp.dylib
 ```
 
-Or use the convenience script:
+An explicit prefix takes priority; when unset the scripts try
+`brew --prefix openssl@3`, then fail with instructions. They never install
+software. Both static archives must contain the host architecture (checked with
+`lipo -info`). The shared helper stages them relative to the importing
+`transport` package, in gitignored `transport/build/openssl-darwin-arm64` or
+`openssl-darwin-amd64`. Every build passes `-define:OPENSSL_STATIC=true`.
+No OpenSSL `-L` path is used. MacPorts' private `-lz` uses system zlib;
+unrecognized private libraries fail for review. To select an existing compiler,
+set `ODIN=/path/to/odin` for the build or replay, or put it on PATH.
+
+For a manual build, source the same staging helper from the repo root:
 
 ```bash
-scripts/build_macos.sh
+source scripts/macos_openssl.sh
+macos_prepare_openssl
+odin build agent_cli -out:thirp-agent -define:OPENSSL_STATIC=true -extra-linker-flags:"$OPENSSL_LINK_FLAGS"
 ```
 
 ### Windows
@@ -115,12 +124,13 @@ documented in [SDK.md](SDK.md#c-abi).
 ### macOS
 
 ```bash
-OPENSSL_LIB="$(brew --prefix openssl@3)/lib"
-odin build c_abi -build-mode:shared -out:libthirp.dylib -extra-linker-flags:"-L${OPENSSL_LIB}"
+source scripts/macos_openssl.sh
+macos_prepare_openssl
+odin build c_abi -build-mode:shared -out:libthirp.dylib -define:OPENSSL_STATIC=true -extra-linker-flags:"$OPENSSL_LINK_FLAGS"
 cc -o thirp-c-smoke c_abi/smoke.c -I c_abi -L. -lthirp -Wl,-rpath,$PWD
 ```
 
-`libthirp.dylib` links Homebrew OpenSSL 3.
+`libthirp.dylib` statically links OpenSSL 3 inside the shared library. SDK consumers need no separate OpenSSL install on macOS.
 
 ### Windows
 
@@ -147,11 +157,12 @@ and still exits 0 (`ODIN_TEST_FAIL_ON_BAD_MEMORY` defaults to false in
 `core:testing`). The define above turns those into test failures. A package
 cannot change that default.
 
-On macOS, add the OpenSSL linker flags:
+On macOS, stage and use the same static OpenSSL archives for tests:
 
 ```bash
-OPENSSL_LIB="$(brew --prefix openssl@3)/lib"
-odin test . -all-packages -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true -extra-linker-flags:"-L${OPENSSL_LIB}"
+source scripts/macos_openssl.sh
+macos_prepare_openssl
+odin test . -all-packages -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true -define:OPENSSL_STATIC=true -extra-linker-flags:"$OPENSSL_LINK_FLAGS"
 ```
 
 For local tests from a Windows build tree, ensure OpenSSL 3 DLLs are beside the test executable or on `PATH`. The Windows data-plane release zip includes those DLLs beside its executables and needs no system OpenSSL at runtime.
@@ -176,12 +187,13 @@ odin build examples/sdk/odin/ephemeral_host -collection:thirp=.
 odin build examples/sdk/odin/join_code_client -collection:thirp=.
 ```
 
-On macOS, add OpenSSL linker flags:
+On macOS, use the staged static archives:
 
 ```bash
-OPENSSL_LIB="$(brew --prefix openssl@3)/lib"
-odin build examples/sdk/odin/ephemeral_host -collection:thirp=. -extra-linker-flags:"-L${OPENSSL_LIB}"
-odin build examples/sdk/odin/join_code_client -collection:thirp=. -extra-linker-flags:"-L${OPENSSL_LIB}"
+source scripts/macos_openssl.sh
+macos_prepare_openssl
+odin build examples/sdk/odin/ephemeral_host -collection:thirp=. -define:OPENSSL_STATIC=true -extra-linker-flags:"$OPENSSL_LINK_FLAGS"
+odin build examples/sdk/odin/join_code_client -collection:thirp=. -define:OPENSSL_STATIC=true -extra-linker-flags:"$OPENSSL_LINK_FLAGS"
 ```
 
 See [SDK.md](SDK.md) for lifecycle and API guidance.
@@ -249,7 +261,7 @@ on Windows. Protocol 1.0 is unchanged.
 
 ### macOS
 
-Must run on Darwin with Homebrew OpenSSL 3 and Odin `dev-2026-07` or later:
+Must run on Darwin with an OpenSSL 3 static-archive prefix and Odin `dev-2026-07` or later:
 
 ```bash
 scripts/release_macos.sh
@@ -301,8 +313,8 @@ selects the same OpenSSL 3 root as `build_windows.bat` and copies only those two
 DLLs from its `bin\` directory. Both are required and included in `SHA256SUMS`;
 that root's `openssl version` is recorded in `PROVENANCE.txt`. OpenSSL 4 is
 rejected. With `-SkipBuild`, select the OpenSSL 3 tree used for the existing
-binaries. Linux and macOS archives continue to use distro / Homebrew OpenSSL
-without vendoring it.
+binaries. Linux dynamically links distro OpenSSL; macOS statically links the
+build prefix’s OpenSSL 3 archives.
 
 Authenticode signing of the three Thirp binaries is skipped unless
 `THIRP_WINDOWS_PFX` (and optional `THIRP_WINDOWS_PFX_PASSWORD`) is set and
@@ -320,6 +332,30 @@ bash scripts/verify_dataplane_release.sh dist/thirp-runtime-macos-<arch>-<VERSIO
 
 ```powershell
 # Windows: Get-FileHash against each SHA256SUMS line
+```
+
+For Darwin trees the verifier also runs `scripts/verify_macho_dependencies.sh`.
+It parses every Mach-O and every fat slice on Linux or macOS, rejects OpenSSL
+and package-manager dylibs, and allows only `/usr/lib/`, `/System/Library/`,
+or relative loader paths whose basename is shipped in the archive. When present,
+`otool -L` adds readable lines to the log. Build and release both run the guard.
+Provenance records `$OPENSSL_PREFIX/bin/openssl version` and the selected prefix.
+
+Owen's native proofs are `scripts/macos_static_openssl_replay.sh` on each Mac
+as Clay. Set `OPENSSL_PREFIX` and `ODIN` or PATH first; the script creates a
+new detached worktree and logs under its `evidence/`. If copied outside the
+checkout, set `THIRP_SOURCE` to this branch's checkout. It builds a release,
+checks the unpacked archive, ad-hoc signs copies with hardened runtime, checks
+versions and dyld output, builds MODE=all for a local ephemeral-port TLS broker
+registration, and runs the full static-linked Odin suite. It never hides either
+OpenSSL prefix or touches live agents, launchd, or Clay's 0.16.7 artifacts.
+
+The real old-archive regression can run on Linux using downloaded or cached assets:
+
+```bash
+THIRP_MACOS_0167_ARCHIVE_DIR=/path/to/v0.16.7-assets bash scripts/release_dataplane_test.sh
+# The directory must contain thirp-runtime-macos-{arm64,x86_64}-0.16.7.tar.gz.
+# Both old archives must FAIL the guard with a forbidden OpenSSL dependency.
 ```
 
 The GPG fingerprint is in [SECURITY.md](SECURITY.md#release-signing). Unsigned

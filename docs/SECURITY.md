@@ -19,7 +19,7 @@ OS-level signatures are separate and optional:
 
 Those certificates are not in this repository. Without them, Gatekeeper and SmartScreen warn; `SHA256SUMS` still identifies the files. See [BUILDING.md](BUILDING.md#signing-blockers-certs-pending).
 
-Data-plane archives on `v0.16.7` are checksummed. They include `SHA256SUMS.asc`
+Data-plane archives on `v0.16.8` are checksummed. They include `SHA256SUMS.asc`
 only when the publish key was present at build time, and they are not
 Apple- or Authenticode-signed unless those certificates were present. Verify
 with `SHA256SUMS`. Do not claim Developer ID, notarization, or Authenticode

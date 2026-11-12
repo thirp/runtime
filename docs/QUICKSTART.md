@@ -29,15 +29,15 @@ files. See [DEPENDENCIES.md](DEPENDENCIES.md).
 
 ### Download the Linux release
 
-Download `thirp-runtime-linux-x86_64-0.16.7.tar.gz` from the
-[v0.16.7 GitHub release](https://github.com/thirp/runtime/releases/tag/v0.16.7).
+Download `thirp-runtime-linux-x86_64-0.16.8.tar.gz` from the
+[v0.16.8 GitHub release](https://github.com/thirp/runtime/releases/tag/v0.16.8).
 That archive is the Linux operator bundle. It contains `thirp-broker`,
 `thirp-agent`, `thirp-connect`, `thirp-web-ingress`, `libthirp.so`, and the
 checksums. Extract it, verify, and make the binaries executable:
 
 ```bash
-tar -xzf thirp-runtime-linux-x86_64-0.16.7.tar.gz
-cd thirp-runtime-linux-x86_64-0.16.7
+tar -xzf thirp-runtime-linux-x86_64-0.16.8.tar.gz
+cd thirp-runtime-linux-x86_64-0.16.8
 sha256sum -c SHA256SUMS
 chmod +x thirp-broker thirp-agent thirp-connect thirp-web-ingress
 ```
@@ -49,20 +49,20 @@ and command in [SECURITY.md](SECURITY.md#release-signing).
 
 This walkthrough uses the Linux operator binaries above. Agent, Caller, and
 `libthirp` for macOS and Windows are on the same Release,
-[v0.16.7](https://github.com/thirp/runtime/releases/tag/v0.16.7). They are not
+[v0.16.8](https://github.com/thirp/runtime/releases/tag/v0.16.8). They are not
 used in this walkthrough. Checksums, the signature, and provenance are inside
 the archives. Apple Developer ID and Authenticode are not claimed.
 The Windows zip vendors the OpenSSL 3 DLLs (`libssl-3-x64.dll` /
 `libcrypto-3-x64.dll`). Verify with `SHA256SUMS` and
 [BUILDING.md](BUILDING.md#verify-a-downloaded-tree). A combined embed SDK
-tarball is not attached to v0.16.7.
+tarball is not attached to v0.16.8.
 
-| Platform | Asset on `v0.16.7` |
+| Platform | Asset on `v0.16.8` |
 |---|---|
-| Linux operator, including Web Ingress | `thirp-runtime-linux-x86_64-0.16.7.tar.gz` |
-| macOS arm64 | `thirp-runtime-macos-arm64-0.16.7.tar.gz` |
-| macOS x86_64 (Intel) | `thirp-runtime-macos-x86_64-0.16.7.tar.gz` |
-| Windows AMD64 | `thirp-runtime-windows-AMD64-0.16.7.zip` |
+| Linux operator, including Web Ingress | `thirp-runtime-linux-x86_64-0.16.8.tar.gz` |
+| macOS arm64 | `thirp-runtime-macos-arm64-0.16.8.tar.gz` |
+| macOS x86_64 (Intel) | `thirp-runtime-macos-x86_64-0.16.8.tar.gz` |
+| Windows AMD64 | `thirp-runtime-windows-AMD64-0.16.8.zip` |
 
 ### Or build from source
 

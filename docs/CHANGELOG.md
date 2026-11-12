@@ -2,7 +2,9 @@
 
 Project version is independent of the wire protocol version. This tree speaks protocol 1.0. See [COMPATIBILITY.md](COMPATIBILITY.md).
 
-## Unreleased
+## 0.16.8
+
+- macOS arm64 and x86_64 data-plane binaries and `libthirp.dylib` statically link OpenSSL 3 from `OPENSSL_PREFIX`, so a hardened-runtime Developer ID signed agent starts without Homebrew or MacPorts and avoids Team-ID library validation failures. Protocol 1.0, the C ABI, and the wire are unchanged.
 
 ## 0.16.7
 

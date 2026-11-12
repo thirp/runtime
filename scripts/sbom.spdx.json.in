@@ -32,7 +32,7 @@
       "licenseConcluded": "Apache-2.0",
       "licenseDeclared": "Apache-2.0",
       "copyrightText": "NOASSERTION",
-      "comment": "Linux/macOS use system/Homebrew libssl/libcrypto, not vendored. The Windows data-plane zip vendors libssl-3-x64.dll and libcrypto-3-x64.dll from the OpenSSL 3 tree used at build time. See docs/DEPENDENCIES.md."
+      "comment": "macOS data-plane statically links OpenSSL 3 libssl.a and libcrypto.a from OPENSSL_PREFIX; PROVENANCE.txt records that prefix and its bin/openssl version. Linux dynamically links system OpenSSL, not vendored. The Windows data-plane zip vendors libssl-3-x64.dll and libcrypto-3-x64.dll from the OpenSSL 3 tree used at build time. See docs/DEPENDENCIES.md."
     }
   ],
   "relationships": [

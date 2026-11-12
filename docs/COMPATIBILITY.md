@@ -20,7 +20,7 @@ Any agent or caller that speaks protocol 1.0 can talk to a protocol 1.0 broker. 
 Do not infer protocol compatibility from the executable version. `--version` always prints both, for example:
 
 ```text
-thirp-broker 0.16.7 (commit <sha>, protocol 1.0)
+thirp-broker 0.16.8 (commit <sha>, protocol 1.0)
 ```
 
 A single-broker restart interrupts active sessions. Drain rejects new `REGISTER` / `CONNECT`, lets existing streams finish within `shutdown_grace`, then exits. Agents reconnect and re-register the desired set. `thirp-connect` reconnects the broker session; lost local sockets still close. See [OPERATIONS.md](OPERATIONS.md).
@@ -34,7 +34,7 @@ A single-broker restart interrupts active sessions. Drain rejects new `REGISTER`
 - After 0.16.0, existing function signatures and numeric error codes do not change silently.
 - Project `0.x` may add functions. Removals or signature changes require a [CHANGELOG.md](CHANGELOG.md) entry.
 - Handles are opaque. Do not depend on Odin struct layout, allocators, or `context`.
-- The published SDK tarball contains `libthirp.so`, both `libthirp.dylib` builds, and `libthirp.dll` under `c/lib/<target>/`. Data-plane release trees also carry the shared library next to the Agent and Caller CLIs. Each library dynamically links OpenSSL 3 (`libssl` / `libcrypto`). Linux/macOS archives use distro / Homebrew OpenSSL, not vendored. The Windows data-plane zip includes `libssl-3-x64.dll` and `libcrypto-3-x64.dll` from the build tree beside the executables, so it needs no system OpenSSL or OpenSSL DLLs on `PATH` at runtime. Standalone SDK consumers must supply OpenSSL 3. See [DEPENDENCIES.md](DEPENDENCIES.md).
+- The published SDK tarball contains `libthirp.so`, both `libthirp.dylib` builds, and `libthirp.dll` under `c/lib/<target>/`. Data-plane release trees also carry the shared library next to the Agent and Caller CLIs. macOS `libthirp.dylib` statically links OpenSSL 3 from the build `OPENSSL_PREFIX`; neither Homebrew nor MacPorts is needed at runtime. Linux dynamically links distro OpenSSL 3 (not vendored). The Windows data-plane zip includes `libssl-3-x64.dll` and `libcrypto-3-x64.dll` from the build tree beside the executables, so it needs no system OpenSSL or OpenSSL DLLs on `PATH` at runtime. Standalone Linux SDK consumers must supply OpenSSL 3; Windows SDK consumers must supply the matching DLLs. See [DEPENDENCIES.md](DEPENDENCIES.md).
 - `THIRP_VERSION_STRING` is the project version, not the protocol version. Identify a built `.so` with `SHA256SUMS` and `PROVENANCE.txt`.
 - `thirp_conn_read` / `thirp_conn_write` block. Language bindings that cannot block the main thread must call them from a worker thread.
 
@@ -57,7 +57,7 @@ import thirp_caller "thirp:caller"
 
 ## Artifact and target matrix
 
-`v0.16.7` publishes the Linux operator as `thirp-runtime-linux-x86_64-0.16.7.tar.gz`. Inside it: `thirp-broker`, `thirp-agent`, `thirp-connect`, `thirp-web-ingress`, `libthirp.so`, and the Broker Odin collection tarball. The same Release also carries data-plane archives with `thirp-agent`, `thirp-connect`, and the shared library for **macOS arm64**, **macOS x86_64 (Intel)**, and **Windows AMD64**: `thirp-runtime-macos-arm64-0.16.7.tar.gz`, `thirp-runtime-macos-x86_64-0.16.7.tar.gz`, and `thirp-runtime-windows-AMD64-0.16.7.zip` (see [BUILDING.md](BUILDING.md#macos-and-windows-data-plane-release)). A combined embed SDK tarball is not attached to v0.16.7. Broker and Web Ingress remain Linux-primary. No static `libthirp.a`. OpenSSL 3 (`libssl` / `libcrypto`) is required at runtime for TLS; the Windows data-plane zip includes `libssl-3-x64.dll` and `libcrypto-3-x64.dll` from the build tree beside the executables, so it needs no system OpenSSL or OpenSSL DLLs on `PATH` at runtime. CI pins the Odin compiler to `dev-2026-07`.
+`v0.16.8` publishes the Linux operator as `thirp-runtime-linux-x86_64-0.16.8.tar.gz`. Inside it: `thirp-broker`, `thirp-agent`, `thirp-connect`, `thirp-web-ingress`, `libthirp.so`, and the Broker Odin collection tarball. The same Release also carries data-plane archives with `thirp-agent`, `thirp-connect`, and the shared library for **macOS arm64**, **macOS x86_64 (Intel)**, and **Windows AMD64**: `thirp-runtime-macos-arm64-0.16.8.tar.gz`, `thirp-runtime-macos-x86_64-0.16.8.tar.gz`, and `thirp-runtime-windows-AMD64-0.16.8.zip` (see [BUILDING.md](BUILDING.md#macos-and-windows-data-plane-release)). A combined embed SDK tarball is not attached to v0.16.8. Broker and Web Ingress remain Linux-primary. No static `libthirp.a`. The published v0.16.7 macOS binaries dynamically link package-manager OpenSSL and require that install at runtime; v0.16.8 and later statically link OpenSSL 3 on both macOS architectures, including inside `libthirp.dylib`. Linux still requires system OpenSSL 3 for TLS; the Windows data-plane zip includes `libssl-3-x64.dll` and `libcrypto-3-x64.dll` from the build tree beside the executables, so it needs no system OpenSSL or OpenSSL DLLs on `PATH` at runtime. CI pins the Odin compiler to `dev-2026-07`.
 
 The embed SDK (`thirp-runtime-sdk-<VERSION>.tar.gz`) does not include Broker or `auth`. The Broker collection (`thirp-runtime-broker-<VERSION>.tar.gz`) adds those Odin packages and does not include the C ABI. There is no third foundation tarball. Sibling checkout is still the repository root.
 

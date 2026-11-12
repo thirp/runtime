@@ -23,12 +23,14 @@ This inventory is the source of truth for the release SBOM (`scripts/sbom.spdx.j
 
 ### macOS
 
-- **What:** Homebrew `openssl@3`
-- **Used for:** same TLS operations as Linux
+- **What:** OpenSSL 3 from the build machine's `OPENSSL_PREFIX`, including `lib/libssl.a` and `lib/libcrypto.a` for the host architecture (arm64 or x86_64).
+- **Used for:** same TLS operations as Linux; statically linked into Agent, Connect, `libthirp.dylib`, and the optional Broker / Web Ingress CLIs.
 - **License:** Apache-2.0
-- **Install:** `brew install openssl@3`
-- **Build:** requires `-extra-linker-flags:"-L$(brew --prefix openssl@3)/lib"` so the linker finds OpenSSL 3 instead of Apple's LibreSSL
-- **CA verification:** `SSL_CTX_set_default_verify_paths` first; falls back to `/etc/ssl/cert.pem` if default paths fail
+- **Build sources:** Homebrew `openssl@3` or MacPorts OpenSSL 3. Set `OPENSSL_PREFIX` explicitly; otherwise the scripts try `brew --prefix openssl@3`. No Homebrew install or admin access is required when a prefix is supplied. Dylibs alone are insufficient.
+- **Build:** scripts stage the two archives under `transport/build/openssl-darwin-{arm64,amd64}/` and pass `-define:OPENSSL_STATIC=true`. Private `-lz` is linked as the Apple SDK stub `$(xcrun --sdk macosx --show-sdk-path)/usr/lib/libz.tbd` by path, so a toolchain `-L/opt/local/lib` cannot substitute MacPorts zlib; at runtime it loads `/usr/lib/libz.1.dylib`. Security and CoreFoundation frameworks are system dependencies.
+- **Runtime:** Homebrew and MacPorts are unnecessary, including for standalone macOS SDK consumers of `libthirp.dylib`. The release guard rejects OpenSSL dylibs and other third-party dependencies in every Mach-O/slice.
+- **Provenance:** `PROVENANCE.txt` records the selected prefix and its `$OPENSSL_PREFIX/bin/openssl version`, not PATH's possibly LibreSSL binary. The lab M4 uses 3.5.9 at `/opt/homebrew/opt/openssl@3`; the iMac uses 3.6.5 at `/opt/local/libexec/openssl3`. These are examples, not a single pinned macOS version.
+- **CA verification:** `SSL_CTX_set_default_verify_paths` first, then `/etc/ssl/cert.pem` if those paths fail. The build prefix's OPENSSLDIR is baked into the archives and may be absent on customer Macs; keep this stock-macOS CA fallback. Explicit local broker `ca_path` / `--tls-ca` still works.
 
 ### Windows
 
@@ -59,4 +61,4 @@ This inventory is the source of truth for the release SBOM (`scripts/sbom.spdx.j
 
 ## Summary
 
-`libthirp.so`, `libthirp.dylib`, and `libthirp.dll` dynamically link OpenSSL 3 through `transport`. Linux uses distro OpenSSL and macOS uses Homebrew OpenSSL; neither archive vendors it. The Windows data-plane zip carries the two OpenSSL 3 DLLs used at build time. Standalone SDK consumers must still supply OpenSSL 3 for their target.
+`libthirp.dylib` remains a shared library with OpenSSL 3 statically linked inside it; macOS runtimes need neither Homebrew nor MacPorts. Linux `libthirp.so` dynamically links distro OpenSSL 3 (not vendored), which SDK consumers must supply. Windows `libthirp.dll` dynamically links the OpenSSL 3 DLLs included in the data-plane zip; standalone Windows SDK consumers must supply those DLLs. Exact build versions are recorded in release provenance.

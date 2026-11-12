@@ -64,6 +64,10 @@ ALLOW_SCRIPTS=(
 	scripts/release_windows.bat
 	scripts/release_dataplane_test.sh
 	scripts/verify_dataplane_release.sh
+	scripts/macos_openssl.sh
+	scripts/verify_macho_dependencies.sh
+	scripts/macho_guard_test.sh
+	scripts/macos_static_openssl_replay.sh
 	scripts/build_macos.sh
 	scripts/build_windows.bat
 	scripts/ci_setup_odin.sh
@@ -179,6 +183,8 @@ copy_dir() {
 for pkg in "${ALLOW_PACKAGES[@]}"; do
 	copy_dir "$pkg"
 done
+# Static OpenSSL staging is local build input, never public source content.
+rm -rf "${STAGE}/transport/build"
 copy_dir examples
 
 for f in "${ALLOW_ROOT_FILES[@]}" "${ALLOW_DOCS[@]}" "${ALLOW_SCRIPTS[@]}" "${ALLOW_DEPLOY[@]}"; do

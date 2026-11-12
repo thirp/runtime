@@ -52,6 +52,21 @@ when ODIN_OS == .Windows {
 		"system:libssl.lib",
 		"system:libcrypto.lib",
 	}
+} else when ODIN_OS == .Darwin && #config(OPENSSL_STATIC, false) {
+	// Paths are relative to this package; scripts/macos_openssl.sh stages them.
+	when ODIN_ARCH == .arm64 {
+		foreign import openssl {
+			"build/openssl-darwin-arm64/libssl.a",
+			"build/openssl-darwin-arm64/libcrypto.a",
+		}
+	} else when ODIN_ARCH == .amd64 {
+		foreign import openssl {
+			"build/openssl-darwin-amd64/libssl.a",
+			"build/openssl-darwin-amd64/libcrypto.a",
+		}
+	} else {
+		#panic("OPENSSL_STATIC supports only Darwin arm64 and amd64")
+	}
 } else {
 	foreign import openssl {
 		"system:ssl",

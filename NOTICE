@@ -7,5 +7,8 @@ See the LICENSE file in the project root.
 This product links OpenSSL 3 (libssl and libcrypto), licensed under
 Apache-2.0. The Windows data-plane zip vendors libssl-3-x64.dll and
 libcrypto-3-x64.dll from the OpenSSL build tree used to link the binaries.
-Linux and macOS archives use system / Homebrew OpenSSL, not vendored.
+macOS binaries statically link libssl.a and libcrypto.a from the build machine’s
+OPENSSL_PREFIX (Homebrew or MacPorts); no package-manager OpenSSL is needed at
+runtime. PROVENANCE.txt records that prefix and its bin/openssl version.
+Linux dynamically links system OpenSSL, not vendored.
 See docs/DEPENDENCIES.md.

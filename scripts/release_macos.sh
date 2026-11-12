@@ -18,18 +18,10 @@ release_require_project_version "$VERSION"
 release_git_state
 release_require_odin
 
-if ! command -v brew >/dev/null 2>&1; then
-	echo "release_macos: Homebrew is required (brew install openssl@3)" >&2
-	exit 1
-fi
-if ! brew list openssl@3 >/dev/null 2>&1; then
-	echo "release_macos: OpenSSL 3 not found. Install with: brew install openssl@3" >&2
-	exit 1
-fi
-
-OPENSSL_PREFIX="$(brew --prefix openssl@3)"
-OPENSSL_LIB="${OPENSSL_PREFIX}/lib"
-OPENSSL_VER="$(openssl version 2>&1 | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+# build_macos.sh passes -define:OPENSSL_STATIC=true to every build.
+# shellcheck source=macos_openssl.sh
+source "${ROOT}/scripts/macos_openssl.sh"
+macos_prepare_openssl
 ARCH="$(uname -m)"
 DATE="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
@@ -47,7 +39,7 @@ if [[ ! -x "${OUT}/thirp-agent" || ! -x "${OUT}/thirp-connect" || ! -f "${OUT}/l
 fi
 
 release_copy_dataplane_docs "$OUT"
-release_write_dataplane_provenance "$OUT" "darwin ${ARCH}" "scripts/release_macos.sh" "$OPENSSL_VER" "$DATE"
+release_write_dataplane_provenance "$OUT" "darwin ${ARCH}" "scripts/release_macos.sh" "$OPENSSL_VER (static libssl.a + libcrypto.a; prefix=$OPENSSL_PREFIX)" "$DATE"
 
 if [[ -n "${THIRP_MACOS_CODESIGN_IDENTITY:-}" ]]; then
 	for bin in thirp-agent thirp-connect libthirp.dylib; do

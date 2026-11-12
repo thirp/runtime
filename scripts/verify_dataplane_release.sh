@@ -97,6 +97,10 @@ if [[ -f "${OUT}/SHA256SUMS.asc" ]]; then
 	fi
 fi
 
+if [[ "$PLATFORM" == darwin ]]; then
+	if ! bash "$(dirname "$0")/verify_macho_dependencies.sh" "$OUT"; then fail=1; fi
+fi
+
 if [[ "$fail" -ne 0 ]]; then
 	echo "verify_dataplane_release: FAIL ${OUT}" >&2
 	exit 1

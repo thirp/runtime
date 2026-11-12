@@ -8,8 +8,8 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 MODE="all"
-if [[ "${1:-}" == "dataplane" ]]; then
-	MODE="dataplane"
+if [[ "${1:-}" == "dataplane" || "${1:-}" == "all" ]]; then
+	MODE="$1"
 elif [[ -n "${1:-}" ]]; then
 	echo "build_macos: unknown mode: ${1} (use all or dataplane)" >&2
 	exit 1
@@ -26,18 +26,15 @@ ARCH="$(uname -m)"
 
 echo "Building thirp-runtime ${VERSION} for macOS ${ARCH} (${MODE})..."
 
-if ! command -v odin >/dev/null 2>&1; then
+ODIN="${ODIN:-odin}"
+if ! command -v "$ODIN" >/dev/null 2>&1; then
 	echo "Error: odin compiler not found. Install from https://odin-lang.org/" >&2
 	exit 1
 fi
 
-if ! command -v brew >/dev/null 2>&1 || ! brew list openssl@3 >/dev/null 2>&1; then
-	echo "Error: OpenSSL 3 not found. Install with: brew install openssl@3" >&2
-	exit 1
-fi
-
-OPENSSL_PREFIX="$(brew --prefix openssl@3)"
-OPENSSL_LIB="${OPENSSL_PREFIX}/lib"
+# shellcheck source=macos_openssl.sh
+source "${ROOT}/scripts/macos_openssl.sh"
+macos_prepare_openssl
 
 OUT="${ROOT}/dist/thirp-runtime-macos-${ARCH}-${VERSION}"
 rm -rf "$OUT"
@@ -45,16 +42,18 @@ mkdir -p "$OUT"
 
 echo "Building binaries..."
 if [[ "$MODE" == "all" ]]; then
-	odin build broker_cli -out:"${OUT}/thirp-broker" -define:THIRP_COMMIT="\"${COMMIT}\"" -extra-linker-flags:"-L${OPENSSL_LIB}"
-	odin build web_ingress_cli -out:"${OUT}/thirp-web-ingress" -define:THIRP_COMMIT="\"${COMMIT}\"" -extra-linker-flags:"-L${OPENSSL_LIB}"
+	"$ODIN" build broker_cli -out:"${OUT}/thirp-broker" -define:THIRP_COMMIT="\"${COMMIT}\"" -define:OPENSSL_STATIC=true -extra-linker-flags:"${OPENSSL_LINK_FLAGS}"
+	"$ODIN" build web_ingress_cli -out:"${OUT}/thirp-web-ingress" -define:THIRP_COMMIT="\"${COMMIT}\"" -define:OPENSSL_STATIC=true -extra-linker-flags:"${OPENSSL_LINK_FLAGS}"
 fi
-odin build agent_cli -out:"${OUT}/thirp-agent" -define:THIRP_COMMIT="\"${COMMIT}\"" -extra-linker-flags:"-L${OPENSSL_LIB}"
-odin build caller_cli -out:"${OUT}/thirp-connect" -define:THIRP_COMMIT="\"${COMMIT}\"" -extra-linker-flags:"-L${OPENSSL_LIB}"
-odin build c_abi -build-mode:shared -out:"${OUT}/libthirp.dylib" -extra-linker-flags:"-L${OPENSSL_LIB}"
+"$ODIN" build agent_cli -out:"${OUT}/thirp-agent" -define:THIRP_COMMIT="\"${COMMIT}\"" -define:OPENSSL_STATIC=true -extra-linker-flags:"${OPENSSL_LINK_FLAGS}"
+"$ODIN" build caller_cli -out:"${OUT}/thirp-connect" -define:THIRP_COMMIT="\"${COMMIT}\"" -define:OPENSSL_STATIC=true -extra-linker-flags:"${OPENSSL_LINK_FLAGS}"
+"$ODIN" build c_abi -build-mode:shared -out:"${OUT}/libthirp.dylib" -define:OPENSSL_STATIC=true -extra-linker-flags:"${OPENSSL_LINK_FLAGS}"
 
 cp "${ROOT}/c_abi/thirp.h" "${OUT}/thirp.h"
 cp "${ROOT}/LICENSE" "${OUT}/LICENSE"
 cp "${ROOT}/NOTICE" "${OUT}/NOTICE"
+
+bash "${ROOT}/scripts/verify_macho_dependencies.sh" "$OUT"
 
 echo "macOS binaries built in ${OUT}"
 echo ""

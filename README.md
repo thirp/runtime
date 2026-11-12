@@ -38,26 +38,26 @@ Learn about the managed pilot at [thirp.net](https://thirp.net/).
 
 ## Project status
 
-- Source version: **0.16.7**
+- Source version: **0.16.8**
 - Wire protocol: **1.0**, frozen and documented in
   [docs/PROTOCOL.md](docs/PROTOCOL.md)
 - Platforms: **Linux** (operator release), **macOS arm64**, **macOS x86_64
   (Intel)**, and **Windows AMD64** (data-plane Agent/Caller CLIs and C ABI
   shared libraries). One download:
-  [v0.16.7](https://github.com/thirp/runtime/releases/tag/v0.16.7).
+  [v0.16.8](https://github.com/thirp/runtime/releases/tag/v0.16.8).
 - SDKs: Odin source packages. Each published platform archive includes the
   C ABI shared library: `libthirp.so` (linux-x86_64), `libthirp.dylib`
   (darwin-arm64 and darwin-x86_64), and `libthirp.dll` (windows-amd64). A
-  combined embed SDK tarball is not attached to v0.16.7.
-- Release artifacts on `v0.16.7` are archives:
+  combined embed SDK tarball is not attached to v0.16.8.
+- Release artifacts on `v0.16.8` are archives:
   - Linux operator, attached by `scripts/publish_github.sh --release`:
-    `thirp-runtime-linux-x86_64-0.16.7.tar.gz` (`thirp-broker`, `thirp-agent`,
+    `thirp-runtime-linux-x86_64-0.16.8.tar.gz` (`thirp-broker`, `thirp-agent`,
     `thirp-connect`, `thirp-web-ingress`, `libthirp.so`, the Broker tarball,
     source archive, SBOM, checksums, and provenance)
   - Data-plane archives also attached to that tag:
-    `thirp-runtime-macos-arm64-0.16.7.tar.gz`,
-    `thirp-runtime-macos-x86_64-0.16.7.tar.gz`, and
-    `thirp-runtime-windows-AMD64-0.16.7.zip`. Checksums, the signature, and
+    `thirp-runtime-macos-arm64-0.16.8.tar.gz`,
+    `thirp-runtime-macos-x86_64-0.16.8.tar.gz`, and
+    `thirp-runtime-windows-AMD64-0.16.8.zip`. Checksums, the signature, and
     provenance are inside the archives. Apple Developer ID
     and Authenticode are not claimed. The Windows zip vendors the
     OpenSSL 3 DLLs (`libssl-3-x64.dll` / `libcrypto-3-x64.dll`).
@@ -105,10 +105,10 @@ certificate, starts each component, and sends an HTTP request through the relay.
 **Start here: [Local TLS quickstart](docs/QUICKSTART.md).**
 
 Download published archives from
-[v0.16.7](https://github.com/thirp/runtime/releases/tag/v0.16.7).
+[v0.16.8](https://github.com/thirp/runtime/releases/tag/v0.16.8).
 The Linux operator archive includes `thirp-web-ingress` and the Broker
 collection. The macOS and Windows data-plane archives are attached to the
-same Release. A combined embed SDK tarball is not attached to v0.16.7.
+same Release. A combined embed SDK tarball is not attached to v0.16.8.
 Checksums are inside each archive. To
 compile individual components, or to produce a platform release tree, see
 [Building, testing, and packaging](docs/BUILDING.md).

@@ -253,11 +253,11 @@ fi
 if ! grep -q 'macos-15-intel' "${ROOT}/docs/BUILDING.md"; then
 	fail_msg "BUILDING.md missing macos-15-intel"
 fi
-if ! grep -q 'v0.16.7' "${ROOT}/docs/QUICKSTART.md"; then
-	fail_msg "QUICKSTART.md missing v0.16.7"
+if ! grep -q 'v0.16.8' "${ROOT}/docs/QUICKSTART.md"; then
+	fail_msg "QUICKSTART.md missing v0.16.8"
 fi
-if ! grep -q 'v0.16.7' "${ROOT}/README.md"; then
-	fail_msg "README.md missing v0.16.7"
+if ! grep -q 'v0.16.8' "${ROOT}/README.md"; then
+	fail_msg "README.md missing v0.16.8"
 fi
 if ! grep -q 'dev-2026-07' "${ROOT}/docs/CHANGELOG.md"; then
 	fail_msg "CHANGELOG.md missing the dev-2026-07 Odin pin note"
@@ -276,6 +276,29 @@ fi
 if ! grep -q 'THIRP_WINDOWS_PFX' "${ROOT}/docs/BUILDING.md"; then
 	fail_msg "BUILDING.md missing Authenticode blocker name"
 fi
+
+# macOS builds share staging/prefix resolution; every build uses static imports.
+for script in scripts/build_macos.sh scripts/release_macos.sh; do
+	for needle in macos_openssl.sh macos_prepare_openssl OPENSSL_STATIC; do
+		grep -q "$needle" "$script" || fail_msg "$script missing $needle"
+	done
+	if grep -qE 'brew list|OPENSSL_LIB=|-L.*OPENSSL_LIB' "$script"; then
+		fail_msg "$script still uses the dynamic Homebrew-only link path"
+	fi
+done
+if grep '"\$ODIN" build' scripts/build_macos.sh | grep -v -- '-define:OPENSSL_STATIC=true'; then
+	fail_msg 'a macOS build omits OPENSSL_STATIC'
+fi
+for needle in OPENSSL_PREFIX 'brew --prefix openssl@3' libssl.a libcrypto.a 'lipo -info' 'usr/lib/libz.tbd' 'rm -f'; do
+	grep -qF -- "$needle" scripts/macos_openssl.sh || fail_msg "macos_openssl.sh missing $needle"
+done
+for f in scripts/macos_openssl.sh scripts/verify_macho_dependencies.sh scripts/macho_guard_test.sh scripts/macos_static_openssl_replay.sh; do
+	bash -n "$f" || fail_msg "bash syntax: $f"
+	grep -qF "$f" scripts/stage_public_tree.sh || fail_msg "public allowlist missing $f"
+	if [[ -f scripts/publish_github.sh ]]; then
+		grep -qF "$f" scripts/publish_github.sh || fail_msg "public path missing $f"
+	fi
+done
 
 # Fixture: darwin tree verifies; broker binary is rejected.
 FIX="${ROOT}/dist/dataplane-release-test"
@@ -298,6 +321,7 @@ write_sums() {
 for name in thirp-agent thirp-connect libthirp.dylib thirp.h LICENSE NOTICE CHANGELOG.md DEPENDENCIES.md; do
 	printf 'darwin-%s\n' "$name" > "${FIX}/darwin/${name}"
 done
+bash scripts/macho_guard_test.sh "${FIX}/darwin" seed
 cat > "${FIX}/darwin/PROVENANCE.txt" <<'EOF'
 name: thirp-runtime
 version: 0.16.3
@@ -416,6 +440,79 @@ cp "${SDK_FIX}/thirp-runtime-macos-arm64-test.tar.gz" "$SHORT/"
 cp "${SDK_FIX}/thirp-runtime-macos-x86_64-test.tar.gz" "$SHORT/"
 if bash "${ROOT}/scripts/assemble_sdk.sh" "$SHORT" >/dev/null 2>&1; then
 	fail_msg "assemble_sdk.sh accepted a fixture with no Windows library"
+fi
+
+# Exercise real shared-helper behavior with read-only command/prefix fixtures.
+MOCK="$FIX/openssl-helper"
+mkdir -p "$MOCK/bin" "$MOCK/prefix/lib/pkgconfig" "$MOCK/prefix/bin" "$MOCK/work"
+printf 'ssl archive\n' > "$MOCK/prefix/lib/libssl.a"
+printf 'crypto archive\n' > "$MOCK/prefix/lib/libcrypto.a"
+cat > "$MOCK/prefix/bin/openssl" <<'SH'
+#!/usr/bin/env bash
+echo 'OpenSSL 3.6.5 fixture'
+SH
+cat > "$MOCK/bin/uname" <<'SH'
+#!/usr/bin/env bash
+case "$1" in -s) echo Darwin ;; -m) echo "${MOCK_ARCH:-x86_64}" ;; esac
+SH
+cat > "$MOCK/bin/lipo" <<'SH'
+#!/usr/bin/env bash
+echo "Non-fat file: $2 is architecture: ${MOCK_LIB_ARCH:-x86_64}"
+SH
+cat > "$MOCK/bin/brew" <<'SH'
+#!/usr/bin/env bash
+[[ ${MOCK_BREW:-0} == 1 && $* == '--prefix openssl@3' ]] || exit 1
+echo "$MOCK_PREFIX"
+SH
+mkdir -p "$MOCK/sdk/usr/lib" && : > "$MOCK/sdk/usr/lib/libz.tbd"
+printf '#!/usr/bin/env bash\necho %s\n' "$MOCK/sdk" > "$MOCK/bin/xcrun"
+chmod +x "$MOCK/bin/"* "$MOCK/prefix/bin/openssl"
+helper_run() (
+	cd "$MOCK/work"
+	export PATH="$MOCK/bin:$PATH" MOCK_PREFIX="$MOCK/prefix"
+	source "$ROOT/scripts/macos_openssl.sh"
+	chmod 0444 "$MOCK/prefix/lib/libssl.a" "$MOCK/prefix/lib/libcrypto.a"
+	macos_prepare_openssl || exit 1
+	# release_macos.sh and build_macos.sh both prepare; restaging read-only archives must work.
+	macos_prepare_openssl || exit 1
+	cmp "$MOCK/prefix/lib/libssl.a" "$OPENSSL_STAGE/libssl.a" || exit 1
+	cmp "$MOCK/prefix/lib/libcrypto.a" "$OPENSSL_STAGE/libcrypto.a" || exit 1
+	[[ "$OPENSSL_VER" == 'OpenSSL 3.6.5 fixture' && "$OPENSSL_LINK_FLAGS" != *-L* ]] || exit 1
+	if [[ ${EXPECT_ZLIB:-0} == 1 ]]; then [[ "$OPENSSL_LINK_FLAGS" == *" $MOCK/sdk/usr/lib/libz.tbd"* && "$OPENSSL_LINK_FLAGS" != *libz.dylib* ]]; fi
+)
+if ! (export OPENSSL_PREFIX="$MOCK/prefix"; helper_run); then fail_msg 'explicit prefix without Homebrew'; fi
+printf 'Libs.private: -lz\n' > "$MOCK/prefix/lib/pkgconfig/libcrypto.pc"
+if ! (unset OPENSSL_PREFIX; export MOCK_BREW=1 EXPECT_ZLIB=1; helper_run); then fail_msg 'brew fallback / system zlib'; fi
+if ! (export OPENSSL_PREFIX="$MOCK/prefix" MOCK_ARCH=arm64 MOCK_LIB_ARCH=arm64; helper_run); then fail_msg 'arm64 archive staging'; fi
+if (export OPENSSL_PREFIX="$MOCK/prefix" MOCK_LIB_ARCH=arm64; helper_run) > "$MOCK/wrong-arch.log" 2>&1; then fail_msg 'accepted wrong archive arch'; fi
+if (unset OPENSSL_PREFIX; helper_run) > "$MOCK/no-prefix.log" 2>&1; then fail_msg 'accepted no usable prefix'; fi
+printf 'Libs.private: -L/opt/local/lib -lz\n' > "$MOCK/prefix/lib/pkgconfig/libcrypto.pc"
+if (export OPENSSL_PREFIX="$MOCK/prefix"; helper_run) > "$MOCK/private.log" 2>&1; then fail_msg 'accepted private third-party -L'; fi
+rm "$MOCK/prefix/lib/libssl.a"
+if (export OPENSSL_PREFIX="$MOCK/prefix"; helper_run) > "$MOCK/missing.log" 2>&1; then fail_msg 'accepted prefix without libssl.a'; fi
+
+if ! bash scripts/macho_guard_test.sh "${FIX}/macho"; then
+	fail_msg "portable Mach-O guard regression"
+fi
+
+# Optional real release regression: downloaded archives or a local cache.
+# THIRP_MACOS_0167_ARCHIVE_DIR=/path/to/assets bash scripts/release_dataplane_test.sh
+if [[ -n ${THIRP_MACOS_0167_ARCHIVE_DIR:-} ]]; then
+	for arch in arm64 x86_64; do
+		asset="$THIRP_MACOS_0167_ARCHIVE_DIR/thirp-runtime-macos-$arch-0.16.7.tar.gz"
+		[[ -f "$asset" ]] || { fail_msg "missing real regression archive $asset"; continue; }
+		mkdir -p "$FIX/old-$arch"
+		tar -xzf "$asset" -C "$FIX/old-$arch"
+		tree="$(dirname "$(find "$FIX/old-$arch" -name thirp-agent -type f | head -1)")"
+		if bash scripts/verify_macho_dependencies.sh "$tree" > "$FIX/old-$arch.log" 2>&1; then
+			fail_msg "guard accepted published v0.16.7 $arch"
+		elif ! grep -q 'forbidden dependency:' "$FIX/old-$arch.log"; then
+			cat "$FIX/old-$arch.log"; fail_msg "old archive rejected without dependency diagnosis"
+		else
+			cat "$FIX/old-$arch.log"
+			echo "release_dataplane_test: expected guard FAIL on published v0.16.7 $arch"
+		fi
+	done
 fi
 
 rm -rf "$FIX"
