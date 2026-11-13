@@ -64,7 +64,7 @@ Learn about the managed pilot at [thirp.net](https://thirp.net/).
 
 The self-hosted Runtime implements TLS, role separation, deny-by-default
 production policy, bounded resources, reconnect, health/metrics, and graceful
-drain. The 24-hour soak has not been run. Some qualification work is documented
+drain. Qualification work, including a lab soak, is documented
 at ([OPERATIONS.md](docs/OPERATIONS.md#resource-limits)). Web
 Ingress has additional edge-facing limitations described in the
 [security model](docs/SECURITY.md).
