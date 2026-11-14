@@ -265,32 +265,45 @@ connection_dial_tls :: proc(
 	if derr != .None {
 		return nil, derr
 	}
+	err := connection_tls_connect(conn, cfg)
+	if err != .None {
+		connection_destroy(conn, allocator)
+		return nil, err
+	}
+	return conn, .None
+}
+
+// Upgrade an owned TCP connection before sharing it. The caller may bound
+// the entire setup by shutting down this socket at its absolute deadline.
+// Keep the legacy TLS receive timeout for users of connection_dial_tls.
+connection_tls_connect :: proc(conn: ^Connection, cfg: TlsClientConfig, timeout := TLS_HANDSHAKE_TIMEOUT) -> TransportError {
+	if conn == nil || len(cfg.server_name) == 0 || !conn_io_enter(conn) {
+		return .Tls
+	}
+	defer conn_io_exit(conn)
+	allocator := conn.allocator
 	owned_ctx, cerr := tls_client_context_new(cfg, allocator)
 	if cerr != .None {
-		connection_destroy(conn, allocator)
-		return nil, cerr
+		return cerr
 	}
 	ERR_clear_error()
 	ssl := SSL_new(owned_ctx)
 	if ssl == nil {
 		SSL_CTX_free(owned_ctx)
-		connection_destroy(conn, allocator)
-		return nil, .Tls
+		return .Tls
 	}
 	ssl_enable_partial_write(ssl)
 	if !ssl_set_fd_noclose(ssl, connection_socket_fd(conn)) {
 		SSL_free(ssl)
 		SSL_CTX_free(owned_ctx)
-		connection_destroy(conn, allocator)
-		return nil, .Tls
+		return .Tls
 	}
 	name_c := strings.clone_to_cstring(cfg.server_name, allocator)
 	defer delete(name_c, allocator)
 	if SSL_set1_host(ssl, name_c) != 1 {
 		SSL_free(ssl)
 		SSL_CTX_free(owned_ctx)
-		connection_destroy(conn, allocator)
-		return nil, .Tls
+		return .Tls
 	}
 	if !cfg.omit_sni {
 		ssl_set_sni(ssl, name_c)
@@ -299,25 +312,22 @@ connection_dial_tls :: proc(
 		if SSL_set_alpn_protos(ssl, raw_data(cfg.alpn), c.uint(len(cfg.alpn))) != 0 {
 			SSL_free(ssl)
 			SSL_CTX_free(owned_ctx)
-			connection_destroy(conn, allocator)
-			return nil, .Tls
+			return .Tls
 		}
 	}
 
-	_ = connection_set_recv_timeout(conn, TLS_HANDSHAKE_TIMEOUT)
+	_ = connection_set_recv_timeout(conn, timeout)
 	rc := SSL_connect(ssl)
 	if rc != 1 || SSL_get_verify_result(ssl) != X509_V_OK {
 		SSL_free(ssl)
 		SSL_CTX_free(owned_ctx)
-		connection_destroy(conn, allocator)
-		return nil, .Tls
+		return .Tls
 	}
 	aerr := tls_attach_ssl(conn, ssl, owned_ctx)
 	if aerr != .None {
-		connection_destroy(conn, allocator)
-		return nil, aerr
+		return aerr
 	}
-	return conn, .None
+	return .None
 }
 
 tls_poll_timeout_ms :: proc(timeout: time.Duration) -> c.int {

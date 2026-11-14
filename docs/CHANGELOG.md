@@ -2,6 +2,11 @@
 
 Project version is independent of the wire protocol version. This tree speaks protocol 1.0. See [COMPATIBILITY.md](COMPATIBILITY.md).
 
+## 0.16.9
+
+- Bump runtime version to 0.16.9. `CallerConfig.dial_timeout` now bounds the entire broker session setup (TCP, TLS, Hello/HelloAck and Authenticate) with one deadline, both at initialization and reconnect. Setup expiry returns the existing retryable `CallerError.Timeout` and logs `broker_setup_timeout` with `phase=tcp|tls|handshake`. Zero preserves the previous behavior. The deadline waiter is cancelled and joined before normal session reads/writes. Protocol 1.0, broker behavior, and the C ABI configuration are unchanged.
+- The TCP timeout dial also uses non-blocking connect and readiness/error checks on macOS and Windows, where the previous fallback ignored a positive timeout.
+
 ## 0.16.8
 
 - macOS arm64 and x86_64 data-plane binaries and `libthirp.dylib` statically link OpenSSL 3 from `OPENSSL_PREFIX`, so a hardened-runtime Developer ID signed agent starts without Homebrew or MacPorts and avoids Team-ID library validation failures. Protocol 1.0, the C ABI, and the wire are unchanged.

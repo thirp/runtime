@@ -74,6 +74,7 @@ log_event :: proc(logger: ^Logger, level: LogLevel, event: string, fields: LogFi
 	append_opt_string(&buf, "remote_address", fields.remote_address)
 	append_opt_string(&buf, "error_code", fields.error_code)
 	append_opt_string(&buf, "reason", fields.reason)
+	append_opt_string(&buf, "phase", fields.phase)
 	if fields.streams_set {
 		append_string(&buf, ",\"streams\":")
 		append_u64(&buf, u64(fields.streams))

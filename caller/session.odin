@@ -58,15 +58,20 @@ caller_init :: proc(c: ^Caller, config: CallerConfig) -> CallerError {
 	c.config.implementation = implementation
 	c.streams = make(map[proto.StreamId]^Conn)
 
-	conn, derr := caller_dial_broker(c)
+	setup: BrokerSetup
+	broker_setup_begin(&setup, c)
+	conn, derr := caller_dial_broker(c, &setup)
 	if derr != .None {
+		err := broker_setup_finish(&setup, c, derr == .Timeout && setup.deadline != {} ? CallerError.Timeout : .Transport)
+		trans.connection_destroy(conn)
 		caller_free_config(c)
 		delete(c.streams)
 		c.streams = nil
-		return .Transport
+		return err
 	}
 	c.conn = conn
 	if proto.decoder_init(&c.decoder) != .None {
+		_ = broker_setup_finish(&setup, c, .Internal)
 		trans.connection_destroy(conn)
 		c.conn = nil
 		caller_free_config(c)
@@ -76,7 +81,8 @@ caller_init :: proc(c: ^Caller, config: CallerConfig) -> CallerError {
 	}
 	// Handshake writes Hello and Authenticate through the session queue.
 	caller_bind_session(c, conn)
-	if hs := caller_handshake(c); hs != .None {
+	setup.phase = SETUP_PHASE_HANDSHAKE
+	if hs := broker_setup_finish(&setup, c, caller_handshake(c)); hs != .None {
 		caller_unbind_session(conn)
 		caller_delete_queues(c)
 		proto.decoder_destroy(&c.decoder)
@@ -215,19 +221,32 @@ caller_free_config :: proc(c: ^Caller) {
 	c.config.implementation = ""
 }
 
-caller_dial_broker :: proc(c: ^Caller) -> (^trans.Connection, trans.TransportError) {
+caller_dial_broker :: proc(c: ^Caller, setup: ^BrokerSetup) -> (^trans.Connection, trans.TransportError) {
 	conn: ^trans.Connection
 	derr: trans.TransportError
-	if c.config.insecure {
+	if setup.deadline == {} {
 		conn, derr = trans.connection_dial(c.config.broker)
 	} else {
+		left := time.diff(time.now(), setup.deadline)
+		if left <= 0 {return nil, .Timeout}
+		conn, derr = trans.connection_dial_timeout(c.config.broker, left)
+	}
+	if derr != .None {return nil, derr}
+	setup.conn = conn
+	if setup.deadline != {} {
+		setup.waiter = thread.create_and_start_with_poly_data(setup, broker_setup_wait)
+		if setup.waiter == nil {return conn, .OutOfMemory}
+	}
+	if !c.config.insecure {
+		setup.phase = SETUP_PHASE_TLS
 		name := c.config.tls_server_name
 		if len(name) == 0 {
 			name = net.address_to_string(c.config.broker.address)
 		}
-		conn, derr = trans.connection_dial_tls(
-			c.config.broker,
+		derr = trans.connection_tls_connect(
+			conn,
 			trans.TlsClientConfig{ca_path = c.config.tls_ca, server_name = name},
+			setup.deadline == {} ? trans.TLS_HANDSHAKE_TIMEOUT : 0,
 		)
 	}
 	if derr == .None {
@@ -420,11 +439,18 @@ caller_reconnect :: proc(c: ^Caller, attempt: ^int) -> bool {
 	attempt^ = 1
 
 	for !sync.atomic_load(&c.stop) {
-		conn, derr := caller_dial_broker(c)
+		setup: BrokerSetup
+		broker_setup_begin(&setup, c)
+		conn, derr := caller_dial_broker(c, &setup)
 		if derr != .None {
+			setup_err := broker_setup_finish(&setup, c, derr == .Timeout ? CallerError.Timeout : .Transport)
+			if setup_err == .Timeout && setup.deadline != {} {derr = .Timeout}
+			trans.connection_destroy(conn)
 			cap_attempt := attempt^
 			reason := "network"
-			if derr == .Tls {
+			if derr == .Timeout && setup.deadline != {} {
+				reason = LOG_BROKER_SETUP_TIMEOUT
+			} else if derr == .Tls {
 				reason = "tls"
 				cap_attempt = 8
 			} else if derr == .InvalidEndpoint {
@@ -437,7 +463,8 @@ caller_reconnect :: proc(c: ^Caller, attempt: ^int) -> bool {
 			continue
 		}
 		caller_set_conn(c, conn)
-		hs := caller_handshake(c)
+		setup.phase = SETUP_PHASE_HANDSHAKE
+		hs := broker_setup_finish(&setup, c, caller_handshake(c))
 		if hs == .None {
 			sync.mutex_lock(&c.mutex)
 			c.last_recv = time.now()
@@ -449,9 +476,17 @@ caller_reconnect :: proc(c: ^Caller, attempt: ^int) -> bool {
 			return true
 		}
 		caller_drop_conn(c)
+		// A timed-out peer may have left a partial HelloAck/auth frame.
+		// Never carry bytes from a failed setup onto the next socket.
+		if hs == .Timeout {
+			proto.decoder_destroy(&c.decoder)
+			if proto.decoder_init(&c.decoder) != .None {return false}
+		}
 		cap_attempt := attempt^
 		reason := "broker_unavailable"
-		if hs == .AuthFailed {
+		if hs == .Timeout {
+			reason = LOG_BROKER_SETUP_TIMEOUT
+		} else if hs == .AuthFailed {
 			caller_log(c, .Warn, "auth_failed", log.LogFields{error_code = "AUTHENTICATION_FAILED"})
 			reason = "authentication"
 			cap_attempt = 8

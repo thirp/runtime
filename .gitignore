@@ -11,7 +11,7 @@
 *.dylib
 *.dll
 thirp-broker
-thirp-agent
+/thirp-agent
 thirp-connect
 thirp-echo
 thirp-echo-http

@@ -46,6 +46,10 @@ test_log_event_includes_event_field :: proc(t: ^testing.T) {
 	got = string(cap.text[:])
 	testing.expect(t, strings.contains(got, "\"mode\":\"tls_passthrough\""))
 	testing.expect(t, strings.contains(got, "\"level\":\"info\""))
+	log_event(&logger, .Info, "broker_setup_timeout", LogFields{reason = "broker_setup_timeout", phase = "tls"})
+	got = string(cap.text[:])
+	testing.expect(t, strings.contains(got, "\"reason\":\"broker_setup_timeout\""))
+	testing.expect(t, strings.contains(got, "\"phase\":\"tls\""))
 }
 
 @(test)

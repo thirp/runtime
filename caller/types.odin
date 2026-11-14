@@ -86,7 +86,9 @@ CallerConfig :: struct {
 	tls_server_name: string,
 	implementation:  string,
 	logger:          ^log.Logger,
-	// 0 waits until CONNECT_OK or the session ends. thirp-connect passes
+	// Bounds broker setup (TCP, TLS, Hello and Authenticate together), and
+	// each stream CONNECT. 0 keeps legacy broker setup behavior and waits until
+	// CONNECT_OK or the session ends. thirp-connect passes
 	// DEFAULT_DIAL_TIMEOUT. Left 0 for the C SDK on purpose: there is no
 	// field on ThirpCallerConfig, and inventing a 10s bound there would
 	// fail dials that are slow but still moving. A stuck socket is still

@@ -21,6 +21,7 @@ LogFields :: struct {
 	remote_address:    string,
 	error_code:        string,
 	reason:            string,
+	phase:             string,
 	// stream_id is omitted when zero unless stream_id_set. streams is omitted
 	// unless streams_set, so a session drop can report that it killed none.
 	stream_id_set:     bool,
