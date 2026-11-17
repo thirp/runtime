@@ -143,6 +143,12 @@ Terminal 4:
 Existing TCP tools can now use loopback port `8000`; they do not need to speak
 the Thirp protocol.
 
+For a caller enrolled through the control plane, use
+`./thirp-connect --caller-conf /path/to/caller.conf` instead. One process serves
+all service/listen lines in the file. Keep the configuration and `caller.token`
+at mode `0600` in a `0700` directory; relative token and CA paths resolve beside
+the configuration. See [caller enrollment](../caller_cli/README.md#caller-enrollment).
+
 ## 7. Send a payload
 
 Terminal 5:

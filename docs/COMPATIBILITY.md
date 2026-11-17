@@ -81,7 +81,7 @@ Broker and agent config is line-oriented `key = value` ([OPERATIONS.md](OPERATIO
 - New keys may appear in later `0.x` releases.
 - Existing keys keep their meaning. A breaking change is called out in [CHANGELOG.md](CHANGELOG.md) with a migration example where feasible.
 - Security rules are never reinterpreted silently: grant prefix syntax, credential line grammar, `policy_mode`, and TLS-required-unless-insecure.
-- Flags-only launch (no `--config`) remains the development path. `thirp-connect` has no config file.
+- Flags-only launch (no `--config`) remains the development path. `thirp-connect` legacy mode uses flags and `--token-file`; enrolled callers use `--caller-conf PATH`. Mixing `--caller-conf` with `--broker`, `--token`, `--token-file`, `--service`, `--listen`, or TLS flags prints an error and exits 1.
 
 ## Rolling restart
 

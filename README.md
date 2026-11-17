@@ -91,6 +91,10 @@ authenticity proofs until OS-level signing lands; see
 `thirp-echo` and `thirp-echo-http` are local test fixtures, not installed
 products.
 
+For an enrolled caller, run `thirp-connect --caller-conf /path/to/caller.conf`.
+One process serves every service/listen link in that file and maintains its
+credentials. See [caller enrollment usage](caller_cli/README.md#caller-enrollment).
+
 ## Try it locally
 
 The supported local walkthrough uses TLS and exercises the complete path:

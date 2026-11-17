@@ -13,7 +13,7 @@ deploy/systemd/          thirp-broker.service, thirp-agent.service, thirp-web-in
 deploy/container/        Dockerfile for a pre-built broker binary
 ```
 
-`thirp-connect` has no config file. Use flags and `--token-file`. `thirp-web-ingress` accepts `--config` or flags.
+`thirp-connect` legacy mode uses flags and `--token-file`; enrolled callers use `--caller-conf PATH`. Mixing `--caller-conf` with `--broker`, `--token`, `--token-file`, `--service`, `--listen`, or TLS flags prints an error and exits 1. See [caller enrollment](../caller_cli/README.md#caller-enrollment). `thirp-web-ingress` accepts `--config` or flags.
 
 Process restart is the supported way to change configuration. There is no SIGHUP reload.
 
@@ -109,7 +109,7 @@ map = acme/site-17/inventory=127.0.0.1:7001
 
 Replace `broker.example` with the address the agent actually dials. `agent.token` contains only the raw agent secret (one line).
 
-Caller (flags only), permitted for `reporting-api` and denied for `inventory`:
+Legacy caller (flags only), permitted for `reporting-api` and denied for `inventory`:
 
 ```bash
 printf '%s\n' '<caller-secret>' > /etc/thirp/caller.token
@@ -126,7 +126,7 @@ Empty grants in production are valid (deny-all). Malformed grants fail startup; 
 
 - Prefer `--token-file` / `token_file`. Do not put long-lived secrets on the command line.
 - Broker token file: line grammar `TOKEN=PRINCIPAL[:ORG][;capabilities=...][;label=...][;expires=RFC3339]`. Agent and caller token files: raw secret only.
-- Mode `0600`. Group- or world-readable token files print a warning; the process still starts.
+- Mode `0600`. Broker, agent, and legacy caller token files that are group- or world-readable print a warning; this does not prevent startup. On Unix, enrolled callers reject configuration and token files with permissions wider than `0600` and exit 1. On Windows they require a protected DACL without inherited ACEs and refuse data-read grants to principals other than the current user and SYSTEM; rotation writes a current-user + SYSTEM DACL before any secret bytes. See [Caller enrollment](../caller_cli/README.md#caller-enrollment).
 - Tokens never appear in logs.
 
 ## Bind addresses
@@ -134,7 +134,7 @@ Empty grants in production are valid (deny-all). Malformed grants fail startup; 
 - Relay listen (`listen`) is the public switchboard port (example: `0.0.0.0:8443`).
 - Metrics/health (`metrics_listen`) is a separate plaintext HTTP socket with no authentication. Bind `127.0.0.1` or a management network. Do not expose it on the public internet.
 - `/metrics`, `/healthz`, and `/readyz` share that one socket. There is no second management port.
-- `thirp-connect --listen` controls who on the caller host can use the bridge. Examples use `127.0.0.1`. Binding all interfaces prints a warning.
+- `thirp-connect --listen` (legacy mode) or each `listen` address in `caller.conf` controls who on the caller host can use the bridge. Examples use `127.0.0.1`. Binding all interfaces prints a warning.
 
 ## Health and metrics
 
@@ -361,6 +361,6 @@ Threat model: [SECURITY.md](SECURITY.md).
 
 - One broker process. Restart drops sessions.
 - No SIGHUP; edit files and restart.
-- No caller config file.
+- Caller modes cannot be mixed: legacy mode uses flags and `--token-file`; enrolled callers use `--caller-conf PATH`. Adding `--broker`, `--token`, `--token-file`, `--service`, `--listen`, or TLS flags to `--caller-conf` prints an error and exits 1.
 - Metrics/health HTTP has no TLS and no authentication.
 - This tree does not claim an external security assessment. See [SECURITY.md](SECURITY.md).

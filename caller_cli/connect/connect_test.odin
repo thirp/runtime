@@ -60,6 +60,12 @@ Upstream :: struct {
 	waiting:     int, // atomic
 	release:     bool, // atomic
 	drop:        bool, // atomic: 'X' closes early
+	// Windows POST cleanup rendezvous. A full 'Q' response sends FIN, then
+	// keeps its test-owned handle until the client asserts response + EOF.
+	// Tickets exclude partial-body resets; each completed POST has one ack.
+	post_started:  int, // atomic
+	post_asserted: int, // atomic
+	cleanup_stop:  bool, // atomic: release waiters on test failure/teardown
 }
 
 // Every bulk test writer fills its buffers with its own byte, so bytes that
@@ -106,6 +112,10 @@ SLOW_CHUNK :: 16 * 1024
 // Field POST body. Sequential storms of this size are what stuck the caller
 // bridge and the agent origin socket.
 POST_BODY :: 46 * 1024
+// Keep all 2,000 requests on every OS. On Windows, Q origins send FIN and
+// await the client's response/EOF assertions before abortive cleanup. The
+// kind==1 pass can still leave 286 product agent-origin active closers in
+// TIME_WAIT; their close behaviour is deliberately unchanged.
 POST_STORM_N :: 2000
 X_HOLD :: 12 * time.Second
 SLOW_TICK :: 50 * time.Millisecond
@@ -216,7 +226,9 @@ connect_write_temp_pem :: proc(label, contents: string) -> (path: string, ok: bo
 	n := sync.atomic_add(&connect_tls_temp_seq, 1)
 	// Pid as well as the counter: parallel test processes share /tmp and
 	// would otherwise overwrite cert-1.pem.
-	path = fmt.aprintf("/tmp/thirp-connect-tls-%d-%s-%d.pem", os.get_pid(), label, n)
+	dir, derr := os.temp_directory(context.temp_allocator) // /tmp does not exist on Windows
+	if derr != nil || len(dir) == 0 {dir = "/tmp"}
+	path = fmt.aprintf("%s/thirp-connect-tls-%d-%s-%d.pem", dir, os.get_pid(), label, n)
 	err := os.write_entire_file(path, transmute([]u8)contents)
 	if err != nil {
 		delete(path)
@@ -249,6 +261,9 @@ agent_run :: proc(a: ^ag.Agent) {
 }
 
 fixture_stop :: proc(fx: ^Fixture) {
+	when ODIN_OS == .Windows {
+		sync.atomic_store(&fx.up.cleanup_stop, true)
+	}
 	ag.agent_stop(&fx.agent)
 	if fx.agent_th != nil {
 		thread.join(fx.agent_th)
@@ -309,8 +324,18 @@ upstream_conn :: proc(arg: ^UpConnArg) {
 	up := arg.up
 	conn := arg.conn
 	free(arg)
+	mode: u8
 	defer {
-		trans.connection_destroy(conn)
+		// Origins that produce a response must retain their normal FIN:
+		// resetting immediately after write can discard the response or
+		// replace the clean EOF under test. Q has an explicit rendezvous
+		// below; E/F/X/W finish only after peer IO ends or teardown releases
+		// them, with no pending response/EOF assertion.
+		if mode == 'E' || mode == 'F' || mode == 'X' || mode == 'W' || mode == 'Q' {
+			connect_test_connection_destroy(conn)
+		} else {
+			trans.connection_destroy(conn)
+		}
 		sync.atomic_sub(&up.live, 1)
 	}
 	buf: [4096]u8
@@ -318,7 +343,8 @@ upstream_conn :: proc(arg: ^UpConnArg) {
 	if err != .None || n != 1 {
 		return
 	}
-	switch buf[0] {
+	mode = buf[0]
+	switch mode {
 	case 'E':
 		for {
 			m, rerr := trans.connection_read(conn, buf[:])
@@ -447,7 +473,19 @@ upstream_conn :: proc(arg: ^UpConnArg) {
 			}
 			total += m
 		}
-		_ = trans.connection_write(conn, transmute([]u8)string("OK"))
+		when ODIN_OS == .Windows {
+			ticket := sync.atomic_add(&up.post_started, 1) + 1
+			_ = trans.connection_write(conn, transmute([]u8)string("OK"))
+			// Keep the original origin-first FIN, including when the local
+			// client has not half-closed. Do not reset until that FIN has
+			// crossed the agent, broker and caller and been asserted locally.
+			_ = trans.connection_shutdown_write(conn)
+			for sync.atomic_load(&up.post_asserted) < ticket && !sync.atomic_load(&up.cleanup_stop) {
+				time.sleep(time.Millisecond)
+			}
+		} else {
+			_ = trans.connection_write(conn, transmute([]u8)string("OK"))
+		}
 	}
 }
 
@@ -509,7 +547,7 @@ expect_echo :: proc(t: ^testing.T, ctl: ^RunControl, msg: string, loc := #caller
 	if conn == nil {
 		return
 	}
-	defer trans.connection_destroy(conn)
+	defer connect_test_connection_destroy(conn)
 	payload := fmt.tprintf("E%s", msg)
 	testing.expect_value(t, trans.connection_write(conn, transmute([]u8)payload), trans.TransportError.None, loc)
 	got := make([dynamic]u8)
@@ -652,7 +690,7 @@ test_connect_client_half_close_tears_down :: proc(t: ^testing.T) {
 		testing.expect(t, rerr != .Timeout, "half-closed client never got EOF")
 		testing.expect_value(t, string(got[:]), "got 99999")
 		delete(got)
-		trans.connection_destroy(conn)
+		connect_test_connection_destroy(conn)
 		testing.expect(t, wait_bridges_zero(&ctl, 3 * time.Second), "bridge left open after half-close")
 	}
 	expect_echo(t, &ctl, "after-half-close")
@@ -681,7 +719,7 @@ test_connect_half_close_delivers_full_response :: proc(t: ^testing.T) {
 	if conn == nil {
 		return
 	}
-	defer trans.connection_destroy(conn)
+	defer connect_test_connection_destroy(conn)
 	testing.expect_value(t, trans.connection_write(conn, []u8{'B'}), trans.TransportError.None)
 	testing.expect_value(t, trans.connection_shutdown_write(conn), trans.TransportError.None)
 	got := make([dynamic]u8)
@@ -695,7 +733,12 @@ test_connect_half_close_delivers_full_response :: proc(t: ^testing.T) {
 	testing.expect(t, wait_bridges_zero(&ctl, 3 * time.Second), "bridge left open after half-close")
 }
 
-REAL_AGENT_HALF_CLOSE_N :: 10_000
+// Each request opens two TCP connections. Windows test clients abort only
+// after the clean EOF assertion; the product agent remains a normal active
+// closer on the origin connection (up to N TIME_WAIT sockets). Keep >4x the
+// ring cap to exercise repeated eviction. The broker's wire test covers
+// 10,000 streams over persistent sockets.
+REAL_AGENT_HALF_CLOSE_N :: 4 * brk.HALF_CLOSE_FINISHED_CAP + 1
 
 kept_ids :: proc(server: ^brk.Server, role: proto.PeerRole) -> int {
 	sync.mutex_lock(&server.handlers_mutex)
@@ -730,7 +773,7 @@ test_real_agent_half_close_ring_stays_bounded :: proc(t: ^testing.T) {
 		return
 	}
 
-	for _ in 0 ..< REAL_AGENT_HALF_CLOSE_N {
+	for i in 0 ..< REAL_AGENT_HALF_CLOSE_N {
 		if testing.failed(t) {
 			return
 		}
@@ -742,10 +785,10 @@ test_real_agent_half_close_ring_stays_bounded :: proc(t: ^testing.T) {
 		testing.expect_value(t, trans.connection_shutdown_write(conn), trans.TransportError.None)
 		got := make([dynamic]u8)
 		rerr := read_all(conn, &got)
-		testing.expect(t, rerr != .Timeout, "half-closed client never got EOF")
-		testing.expect_value(t, string(got[:]), "got 0")
+		testing.expectf(t, rerr == .Closed && !conn.closed, "request %d: expected clean EOF, got %v (closed=%v)", i, rerr, conn.closed)
+		testing.expectf(t, string(got[:]) == "got 0", "request %d: expected got 0, got %q", i, string(got[:]))
 		delete(got)
-		trans.connection_destroy(conn)
+		connect_test_connection_destroy(conn)
 		start := time.now()
 		for sync.atomic_load(&ctl.live_bridges) != 0 {
 			if time.since(start) > 3 * time.Second {
@@ -833,7 +876,7 @@ test_connect_early_answer_while_client_sending :: proc(t: ^testing.T) {
 		trans.connection_shutdown_both(conn)
 		thread.join(wth)
 		thread.destroy(wth)
-		trans.connection_destroy(conn)
+		connect_test_connection_destroy(conn)
 		testing.expectf(t, wait_bridges_zero(&ctl, 4 * time.Second), "round %d: bridge still open", round)
 		expect_echo(t, &ctl, "after-403")
 	}
@@ -865,7 +908,7 @@ test_connect_stuck_stream_does_not_block_accepts :: proc(t: ^testing.T) {
 	if a == nil {
 		return
 	}
-	defer trans.connection_destroy(a)
+	defer connect_test_connection_destroy(a)
 	// The upstream floods A; A never reads. A's inbound fills and the session
 	// reader used to wait on it forever.
 	testing.expect_value(t, trans.connection_write(a, []u8{'F'}), trans.TransportError.None)
@@ -930,7 +973,7 @@ test_connect_upstream_closes_first_agent_closes_socket :: proc(t: ^testing.T) {
 			time.sleep(10 * time.Millisecond)
 		}
 		testing.expectf(t, sync.atomic_load(&fx.up.closed_seen) == round, "round %d: agent socket to upstream left open (CLOSE-WAIT)", round)
-		trans.connection_destroy(conn)
+		connect_test_connection_destroy(conn)
 		testing.expect(t, wait_bridges_zero(&ctl, 3 * time.Second), "bridge left open")
 	}
 }
@@ -973,7 +1016,7 @@ parallel_echo :: proc(p: ^ParallelEcho) {
 	if err != .None {
 		return
 	}
-	defer trans.connection_destroy(conn)
+	defer connect_test_connection_destroy(conn)
 	_ = trans.connection_set_recv_timeout(conn, 10 * time.Second)
 	msg := fmt.aprintf("parallel-%d", p.idx)
 	defer delete(msg)
@@ -1038,7 +1081,7 @@ test_connect_slow_upload_does_not_block_other_streams :: proc(t: ^testing.T) {
 	if conn == nil {
 		return
 	}
-	defer trans.connection_destroy(conn)
+	defer connect_test_connection_destroy(conn)
 	_ = trans.connection_set_send_timeout(conn, 0)
 	_ = trans.connection_set_recv_timeout(conn, expected * 2 + 30 * time.Second)
 	up := SlowUpload{conn = conn, size = size}
@@ -1223,7 +1266,7 @@ test_connect_upload_past_stream_cap_is_reset_others_unaffected :: proc(t: ^testi
 	if conn == nil {
 		return
 	}
-	defer trans.connection_destroy(conn)
+	defer connect_test_connection_destroy(conn)
 	_ = trans.connection_set_send_timeout(conn, 20 * time.Second)
 	u := CapUpload{conn = conn, mode = 'S', fill = FILL_CAP_UPLOAD, size = REPLAY_BIG_MB * 1000 * 1000}
 	start := time.now()
@@ -1340,7 +1383,7 @@ test_connect_never_read_uploads_hit_agent_caps :: proc(t: ^testing.T) {
 		trans.connection_shutdown_both(conns[i])
 		thread.join(ths[i])
 		thread.destroy(ths[i])
-		trans.connection_destroy(conns[i])
+		connect_test_connection_destroy(conns[i])
 	}
 	reset := 0
 	for i in 0 ..< N {
@@ -1392,14 +1435,14 @@ test_connect_agent_stream_cap_refuses_new_streams_only :: proc(t: ^testing.T) {
 	testing.expect(t, rerr != .Timeout, "refused stream was not closed")
 	testing.expect_value(t, len(got), 0)
 	delete(got)
-	trans.connection_destroy(extra)
+	connect_test_connection_destroy(extra)
 	// The held streams still work, and the session is up.
 	for i in 0 ..< 2 {
 		testing.expect_value(t, trans.connection_write(held[i], []u8{'k'}), trans.TransportError.None)
 		buf: [8]u8
 		n, rerr2 := trans.connection_read(held[i], buf[:])
 		testing.expect(t, rerr2 == .None && n == 1 && buf[0] == 'k', "held stream broken by the refusal")
-		trans.connection_destroy(held[i])
+		connect_test_connection_destroy(held[i])
 	}
 	testing.expect(t, session_up(&fx), "agent session lost")
 	testing.expect(t, wait_bridges_zero(&ctl, 3 * time.Second))
@@ -1436,7 +1479,7 @@ test_connect_paused_client_does_not_freeze_other_callers :: proc(t: ^testing.T) 
 	paused := make([dynamic]^trans.Connection)
 	defer {
 		for p in paused {
-			trans.connection_destroy(p)
+			connect_test_connection_destroy(p)
 		}
 		delete(paused)
 	}
@@ -1512,7 +1555,7 @@ test_connect_stop_with_reply_pending_returns :: proc(t: ^testing.T) {
 		stop_connect(&r, th)
 		return
 	}
-	defer trans.connection_destroy(conn)
+	defer connect_test_connection_destroy(conn)
 	testing.expect_value(t, trans.connection_write(conn, []u8{'W', 'q'}), trans.TransportError.None)
 	testing.expect_value(t, trans.connection_shutdown_write(conn), trans.TransportError.None)
 	wait := time.now()
@@ -1669,7 +1712,7 @@ hex_port :: proc(addr: string) -> int {
 	return int(v)
 }
 
-storm_read_ok :: proc(t: ^testing.T, conn: ^trans.Connection, loc := #caller_location) -> bool {
+storm_read_ok :: proc(t: ^testing.T, conn: ^trans.Connection, up: ^Upstream, loc := #caller_location) -> bool {
 	got := make([dynamic]u8, 0, 8)
 	defer delete(got)
 	buf: [64]u8
@@ -1680,7 +1723,7 @@ storm_read_ok :: proc(t: ^testing.T, conn: ^trans.Connection, loc := #caller_loc
 		}
 		if rerr != .None {
 			if strings.contains(string(got[:]), "OK") {
-				return true
+				break
 			}
 			testing.expectf(t, false, "POST response missing (%v, got %s)", rerr, string(got[:]), loc = loc)
 			return false
@@ -1689,6 +1732,16 @@ storm_read_ok :: proc(t: ^testing.T, conn: ^trans.Connection, loc := #caller_loc
 			testing.expect(t, false, "POST response too long", loc = loc)
 			return false
 		}
+	}
+	when ODIN_OS == .Windows {
+		// The origin sent a normal FIN and is holding its handle. Assert
+		// that FIN end-to-end before allowing either test endpoint to use
+		// abortive cleanup. No sleeps can safely substitute for this ack.
+		n, rerr := trans.connection_read(conn, buf[:])
+		clean := n == 0 && rerr == .Closed && !conn.closed
+		testing.expectf(t, clean, "POST expected clean EOF, got %v (bytes=%d closed=%v)", rerr, n, conn.closed, loc = loc)
+		sync.atomic_add(&up.post_asserted, 1)
+		return clean
 	}
 	return true
 }
@@ -1751,7 +1804,7 @@ test_post_storm_fds_and_streams_return_to_baseline :: proc(t: ^testing.T) {
 		if kind == 0 {
 			// Reset while the body is still going out.
 			testing.expect_value(t, trans.connection_write(conn, body[:1024]), trans.TransportError.None)
-			trans.connection_destroy(conn)
+			connect_test_connection_destroy(conn)
 			continue
 		}
 		testing.expect_value(t, trans.connection_write(conn, body), trans.TransportError.None)
@@ -1760,11 +1813,11 @@ test_post_storm_fds_and_streams_return_to_baseline :: proc(t: ^testing.T) {
 			// order that used to drop the queued reply and the peer EOF.
 			testing.expect_value(t, trans.connection_shutdown_write(conn), trans.TransportError.None)
 		}
-		if !storm_read_ok(t, conn) {
-			trans.connection_destroy(conn)
+		if !storm_read_ok(t, conn, &fx.up) {
+			connect_test_connection_destroy(conn)
 			return
 		}
-		trans.connection_destroy(conn)
+		connect_test_connection_destroy(conn)
 	}
 
 	streams, pumps, caller_streams, bridges, up_live, up_fds, listen_fds: int
@@ -1810,8 +1863,8 @@ test_post_storm_fds_and_streams_return_to_baseline :: proc(t: ^testing.T) {
 		return
 	}
 	testing.expect_value(t, trans.connection_write(again, body), trans.TransportError.None)
-	ok := storm_read_ok(t, again)
-	trans.connection_destroy(again)
+	ok := storm_read_ok(t, again, &fx.up)
+	connect_test_connection_destroy(again)
 	testing.expect(t, ok, "dial after the storm did not complete")
 
 	// Origin is gone. The next dial must fail in the agent, log the target
@@ -1832,11 +1885,17 @@ test_post_storm_fds_and_streams_return_to_baseline :: proc(t: ^testing.T) {
 	if refused == nil {
 		return
 	}
-	_ = trans.connection_set_recv_timeout(refused, 2 * time.Second)
+	when ODIN_OS == .Windows {
+		// Windows retries refused loopback connects before reporting failure (~2.1s).
+		REFUSED_ORIGIN_TIMEOUT :: 6 * time.Second
+	} else {
+		REFUSED_ORIGIN_TIMEOUT :: 2 * time.Second
+	}
+	_ = trans.connection_set_recv_timeout(refused, REFUSED_ORIGIN_TIMEOUT)
 	_ = trans.connection_write(refused, body[:1])
 	buf: [32]u8
 	_, rerr := trans.connection_read(refused, buf[:])
-	trans.connection_destroy(refused)
+	connect_test_connection_destroy(refused)
 	testing.expectf(t, rerr != .Timeout, "refused origin left the local client open (%v)", rerr)
 
 	logged := dial_log_text()
@@ -2016,7 +2075,7 @@ connect_agent_death_case :: proc(t: ^testing.T, reset_first: bool, use_tls: bool
 	}
 	held_open := true
 	defer if held_open {
-		trans.connection_destroy(held)
+		connect_test_connection_destroy(held)
 	}
 	stream_up := false
 	up_start := time.now()
@@ -2035,10 +2094,13 @@ connect_agent_death_case :: proc(t: ^testing.T, reset_first: bool, use_tls: bool
 	// Hold only after CONNECT_OK. Holding earlier queues OPEN behind the
 	// writer and the dial itself never returns.
 	brk.outbox_set_writer_hold(box, true)
-	if ctl.caller != nil && ctl.caller.conn != nil {
-		_ = net.set_option(ctl.caller.conn.socket, .Send_Buffer_Size, 16 * 1024)
+	when ODIN_OS != .Windows {
+		// On Windows explicit SO_SNDBUF let 1 GiB through; defaults stall at ~0.5 MiB.
+		if ctl.caller != nil && ctl.caller.conn != nil {
+			_ = net.set_option(ctl.caller.conn.socket, .Send_Buffer_Size, 16 * 1024)
+		}
+		_ = net.set_option(held.socket, .Send_Buffer_Size, 16 * 1024)
 	}
-	_ = net.set_option(held.socket, .Send_Buffer_Size, 16 * 1024)
 	// Backstop so a wedge fails the assertion instead of hanging the
 	// process. The pass condition is the write finishing after the agent
 	// session dies, not this timeout.
@@ -2100,7 +2162,13 @@ connect_agent_death_case :: proc(t: ^testing.T, reset_first: bool, use_tls: bool
 	sync.atomic_store(&fx.up.drop, true)
 
 	testing.expect(t, wait_agent_down(&fx, 3 * time.Second), "agent session did not drop")
-	testing.expect(t, wait_upload_finished(&up, 1 * time.Second), "caller DATA write still blocked after agent session died")
+	// After the reset the bridge discards the rest of the upload, and the
+	// pump kicks the local socket after LOCAL_LINGER. So the write ends
+	// either when the upload_block_cap bytes are drained or at the linger
+	// kick. On Windows (no /proc, 65 MiB cap) the drain took over 1 s, so a 1 s
+	// bound failed there; a wedge still fails here, far below the 20 s
+	// send-timeout backstop.
+	testing.expect(t, wait_upload_finished(&up, LOCAL_LINGER + time.Second), "caller DATA write still blocked after agent session died")
 	// While the agent is down, a new client must not hang. Reconnect is
 	// fast on loopback, so either a clean close or a completed echo is
 	// acceptable; a read/write timeout is the field wedge.
@@ -2109,7 +2177,7 @@ connect_agent_death_case :: proc(t: ^testing.T, reset_first: bool, use_tls: bool
 	testing.expect(t, connect_probe(&ctl, 2 * time.Second, true), "probe did not complete after agent re-registered")
 
 	if held_open {
-		trans.connection_destroy(held)
+		connect_test_connection_destroy(held)
 		held_open = false
 	}
 	testing.expect(t, wait_bridges_zero(&ctl, 3 * time.Second), "bridge left open after agent restart")
@@ -2163,7 +2231,7 @@ test_connect_blocked_upload_does_not_hold_connect :: proc(t: ^testing.T) {
 	}
 	held_open := true
 	defer if held_open {
-		trans.connection_destroy(held)
+		connect_test_connection_destroy(held)
 	}
 	_ = trans.connection_set_recv_timeout(held, 5 * time.Second)
 	ping := transmute([]u8)string("Eping")
@@ -2190,10 +2258,13 @@ test_connect_blocked_upload_does_not_hold_connect :: proc(t: ^testing.T) {
 	}
 	defer brk.outbox_release(box)
 	brk.outbox_set_writer_hold(box, true)
-	if ctl.caller != nil && ctl.caller.conn != nil {
-		_ = net.set_option(ctl.caller.conn.socket, .Send_Buffer_Size, 16 * 1024)
+	when ODIN_OS != .Windows {
+		// On Windows explicit SO_SNDBUF let 1 GiB through; defaults stall at ~0.5 MiB.
+		if ctl.caller != nil && ctl.caller.conn != nil {
+			_ = net.set_option(ctl.caller.conn.socket, .Send_Buffer_Size, 16 * 1024)
+		}
+		_ = net.set_option(held.socket, .Send_Buffer_Size, 16 * 1024)
 	}
-	_ = net.set_option(held.socket, .Send_Buffer_Size, 16 * 1024)
 	_ = trans.connection_set_send_timeout(held, 8 * time.Second)
 
 	up := Upload {
@@ -2362,7 +2433,7 @@ connect_probe :: proc(ctl: ^RunControl, limit: time.Duration, need_echo: bool) -
 	if err != .None || conn == nil {
 		return false
 	}
-	defer trans.connection_destroy(conn)
+	defer connect_test_connection_destroy(conn)
 	_ = trans.connection_set_send_timeout(conn, limit)
 	_ = trans.connection_set_recv_timeout(conn, limit)
 	payload := transmute([]u8)string("Eping")

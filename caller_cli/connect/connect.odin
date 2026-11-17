@@ -55,6 +55,7 @@ RunControl :: struct {
 usage :: proc() {
 	fmt.eprintf(
 		"usage: thirp-connect [--version] --broker HOST:PORT (--token TOKEN | --token-file PATH) --service SERVICE_ID --listen HOST:PORT\n" +
+		"       thirp-connect --caller-conf PATH\n" +
 		"       [--tls-ca PATH] [--tls-server-name NAME | --insecure]\n" +
 		"       [--stream-stall-timeout SECONDS]   (default 30; 0 = never; bounds writes to a local client)\n" +
 		"       [--max-stream-buffer-mib N]        (1..1048576, default 8; a download further behind is reset)\n",
@@ -75,6 +76,8 @@ connect_main :: proc(args: []string, ctl: ^RunControl = nil) -> int {
 	broker := ""
 	token := ""
 	token_file := ""
+	caller_conf := ""
+	legacy_flags := false
 	service := ""
 	listen := ""
 	insecure := false
@@ -85,6 +88,17 @@ connect_main :: proc(args: []string, ctl: ^RunControl = nil) -> int {
 
 	for i := 0; i < len(args); i += 1 {
 		switch args[i] {
+		case "--broker", "--token", "--token-file", "--service", "--listen":
+			legacy_flags = true
+		}
+		switch args[i] {
+		case "--caller-conf":
+			if i + 1 >= len(args) || len(args[i + 1]) == 0 {
+				fmt.eprintf("--caller-conf requires PATH\n")
+				return 1
+			}
+			i += 1
+			caller_conf = args[i]
 		case "--insecure":
 			insecure = true
 		case "--tls-ca":
@@ -184,6 +198,13 @@ connect_main :: proc(args: []string, ctl: ^RunControl = nil) -> int {
 		}
 	}
 
+	if len(caller_conf) > 0 {
+		if legacy_flags || insecure || len(tls_ca) > 0 || len(tls_server_name) > 0 {
+			fmt.eprintf("--caller-conf cannot be mixed with broker, token, service, listen or TLS flags\n")
+			return 1
+		}
+		return enrollment_main(caller_conf, time.Duration(stall_secs)*time.Second, buffer_mib*1024*1024, ctl)
+	}
 	if insecure && (len(tls_ca) > 0 || len(tls_server_name) > 0) {
 		fmt.eprintf("--insecure cannot be combined with --tls-ca or --tls-server-name\n")
 		return 1

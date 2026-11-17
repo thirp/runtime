@@ -2,6 +2,11 @@
 
 Project version is independent of the wire protocol version. This tree speaks protocol 1.0. See [COMPATIBILITY.md](COMPATIBILITY.md).
 
+## 0.16.10
+
+- `thirp-connect --caller-conf PATH` serves every enrolled caller link in one process, renews per-grant broker credentials, and rotates the enrollment token through verified HTTPS. Platforms regrants automatically; Support stops accepting at grant end and polls for human approval. Token rotation uses a synced atomic 0600 rewrite. Existing `--token` / `--token-file` behavior and protocol 1.0 are unchanged.
+- Windows caller conf/state files are written with an owner-only protected DACL (single SYSTEM ACE under LocalSystem). The temp file is created by `CreateFileW` with share mode 0 and that descriptor, and its DACL is verified before the token is written. Reads refuse inherited ACEs and any allow ACE for another principal beyond metadata rights (read- or write-class).
+
 ## 0.16.9
 
 - Bump runtime version to 0.16.9. `CallerConfig.dial_timeout` now bounds the entire broker session setup (TCP, TLS, Hello/HelloAck and Authenticate) with one deadline, both at initialization and reconnect. Setup expiry returns the existing retryable `CallerError.Timeout` and logs `broker_setup_timeout` with `phase=tcp|tls|handshake`. Zero preserves the previous behavior. The deadline waiter is cancelled and joined before normal session reads/writes. Protocol 1.0, broker behavior, and the C ABI configuration are unchanged.
