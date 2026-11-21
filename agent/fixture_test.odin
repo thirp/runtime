@@ -35,14 +35,14 @@ AgentRunArg :: struct {
 	agent: ^Agent,
 }
 
-start_test_broker :: proc(t: ^testing.T, fx: ^TestBroker, loc := #caller_location) {
+start_test_broker :: proc(t: ^testing.T, fx: ^TestBroker, loc := #caller_location, heartbeat := 30 * time.Second) {
 	testing.expect_value(t, brk.registry_init(&fx.reg), brk.RegistryError.None, loc)
 	testing.expect_value(t, auth.auth_init(&fx.store), auth.AuthError.None, loc)
 	testing.expect_value(t, auth.auth_add_token(&fx.store, TEST_TOKEN_HOST, TEST_PRINCIPAL_HOST), auth.AuthError.None, loc)
 	testing.expect_value(t, auth.auth_add_token(&fx.store, TEST_TOKEN_CALLER, TEST_PRINCIPAL_CALLER), auth.AuthError.None, loc)
 	brk.server_init(&fx.server, &fx.reg, auth.static_token_authenticator(&fx.store))
 	brk.server_disable_test_hardening(&fx.server)
-	fx.server.heartbeat_interval = 30 * time.Second
+	fx.server.heartbeat_interval = heartbeat
 	fx.server.session_timeout = 30 * time.Second
 	testing.expect_value(t, brk.server_listen(&fx.server, trans.loopback_endpoint(0)), trans.TransportError.None, loc)
 	brk.server_start(&fx.server)

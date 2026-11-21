@@ -3,8 +3,11 @@ package web_ingress
 import cl "../caller"
 import trans "../transport"
 import "core:fmt"
+import "core:time"
 
 HTTP_ERROR_CONTENT_TYPE :: "text/plain; charset=utf-8"
+HTTP_ERROR_DRAIN_TIMEOUT :: 250 * time.Millisecond
+HTTP_ERROR_DRAIN_BYTES :: 64 * 1024
 
 HttpErrorStatus :: struct {
 	code:   int,
@@ -83,10 +86,13 @@ write_http_error :: proc(conn: ^trans.Connection, status: HttpErrorStatus) -> tr
 	text := format_http_error(status)
 	defer delete(text)
 	err := trans.connection_write(conn, transmute([]u8)text)
-	if err == .None {
-		// Request bytes are still in the socket. close() with unread data is RST
-		// and the peer can lose the error response. SHUT_RDWR discards them.
-		trans.connection_shutdown_both(conn)
+	if err != .None {
+		return err
 	}
-	return err
+	// Deliver the response and FIN before disposing of the request. Winsock
+	// resets a socket shut down for receive with unread or arriving data.
+	if trans.connection_shutdown_write(conn) == .None {
+		trans.connection_drain_input(conn, HTTP_ERROR_DRAIN_BYTES, HTTP_ERROR_DRAIN_TIMEOUT)
+	}
+	return .None
 }

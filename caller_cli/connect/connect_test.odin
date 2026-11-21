@@ -123,15 +123,22 @@ SLOW_TICK :: 50 * time.Millisecond
 // what loopback socket buffers absorb, so the release fails it; the field
 // repro is -define:THIRP_REPLAY_UPLOAD_MB=50 (~160 s).
 REPLAY_UPLOAD_MB :: #config(THIRP_REPLAY_UPLOAD_MB, 8)
+// Native diagnosis of the historical slow-upload reset. Leave the real
+// sockets and heartbeat clock alone while restoring the old Ping condition.
+REPLAY_LEGACY_AGENT_HEARTBEAT :: #config(THIRP_REPLAY_LEGACY_AGENT_HEARTBEAT, false)
 
 RESPONSE_403 :: "HTTP/1.1 403 Forbidden\r\nContent-Length: 9\r\nConnection: close\r\n\r\nforbidden"
 
-fixture_start :: proc(t: ^testing.T, fx: ^Fixture, agent_cfg: ag.AgentConfig = {}, use_tls := false) -> bool {
+fixture_start :: proc(t: ^testing.T, fx: ^Fixture, agent_cfg: ag.AgentConfig = {}, use_tls := false, broker_logger: ^log.Logger = nil) -> bool {
 	testing.expect_value(t, brk.registry_init(&fx.reg), brk.RegistryError.None)
 	testing.expect_value(t, auth.auth_init(&fx.store), auth.AuthError.None)
 	testing.expect_value(t, auth.auth_add_token(&fx.store, T_TOKEN_HOST, "host-a"), auth.AuthError.None)
 	testing.expect_value(t, auth.auth_add_token(&fx.store, T_TOKEN_CALLER, "client-a"), auth.AuthError.None)
 	brk.server_init(&fx.server, &fx.reg, auth.static_token_authenticator(&fx.store))
+	fx.server.logger = broker_logger
+	when ODIN_TEST {
+		fx.server.test_trace_agent_session = agent_cfg.test_trace_broker_session
+	}
 	brk.server_disable_test_hardening(&fx.server)
 	if use_tls && !fixture_enable_tls(t, fx) {
 		brk.server_destroy(&fx.server)
@@ -1051,6 +1058,22 @@ report_stray :: proc(who: string, want: int, got: []u8) {
 	fmt.eprintf("%s: want %d bytes, got %d; first byte 0x%02x = %s\n", who, want, len(got), got[0], fill_source(got[0]))
 }
 
+slow_upload_agent_log :: proc(msg: string) {
+	fmt.eprintf("slow upload agent %s", msg)
+}
+
+slow_upload_broker_log :: proc(msg: string) {
+	fmt.eprintf("slow upload broker %s", msg)
+}
+
+legacy_slow_upload_agent_log :: proc(msg: string) {
+	fmt.eprintf("legacy slow upload agent %s", msg)
+}
+
+legacy_slow_upload_broker_log :: proc(msg: string) {
+	fmt.eprintf("legacy slow upload broker %s", msg)
+}
+
 // Theo's replay: a large upload to a server reading ~320 KB/s used to hold
 // the agent's one relay reader in a blocking local write (and the broker's
 // caller-session reader at conn.odin:1119 behind it), so three requests
@@ -1059,11 +1082,39 @@ report_stray :: proc(who: string, want: int, got: []u8) {
 // the default 30 s no-progress stall (a slow but steady reader survives).
 @(test)
 test_connect_slow_upload_does_not_block_other_streams :: proc(t: ^testing.T) {
+	slow_upload_replay(t, legacy = false, allow_agent_gone = false)
+}
+
+// Run the old scheduling once on each native gate with the real transport.
+// A matching reset is evidence. An unrelated failure still fails the test.
+@(test)
+test_connect_slow_upload_legacy_heartbeat_trace :: proc(t: ^testing.T) {
+	slow_upload_replay(t, legacy = true, allow_agent_gone = !REPLAY_LEGACY_AGENT_HEARTBEAT)
+}
+
+slow_upload_replay :: proc(t: ^testing.T, legacy, allow_agent_gone: bool) {
 	fx: Fixture
-	if !fixture_start(t, &fx) {
+	agent_logger, broker_logger: log.Logger
+	log.logger_init(&agent_logger, .Debug, legacy_slow_upload_agent_log if legacy else slow_upload_agent_log)
+	log.logger_init(&broker_logger, .Info, legacy_slow_upload_broker_log if legacy else slow_upload_broker_log)
+	agent_cfg := ag.AgentConfig{logger = &agent_logger}
+	when ODIN_TEST {
+		agent_cfg.test_legacy_heartbeat = legacy
+		agent_cfg.test_trace_broker_session = legacy
+	}
+	if !fixture_start(t, &fx, agent_cfg, broker_logger = &broker_logger) {
 		return
 	}
 	defer fixture_stop(&fx)
+	sync.mutex_lock(&fx.agent.mutex)
+	session := fx.agent.live_conn
+	held := trans.connection_acquire(session)
+	sync.mutex_unlock(&fx.agent.mutex)
+	if !testing.expect(t, held, "agent session missing before upload") {
+		return
+	}
+	defer trans.connection_release(session)
+
 	ctl: RunControl
 	args := []string{"--broker", fx.broker, "--insecure", "--token", T_TOKEN_CALLER, "--service", T_SERVICE, "--listen", "127.0.0.1:0"}
 	r := RunArg{args = args, ctl = &ctl}
@@ -1086,6 +1137,7 @@ test_connect_slow_upload_does_not_block_other_streams :: proc(t: ^testing.T) {
 	_ = trans.connection_set_recv_timeout(conn, expected * 2 + 30 * time.Second)
 	up := SlowUpload{conn = conn, size = size}
 	upload_start := time.now()
+	fmt.eprintf("slow upload start unix_ns=%d bytes=%d legacy_heartbeat=%v\n", time.time_to_unix_nano(upload_start), size, legacy)
 	wth := thread.create_and_start_with_poly_data(&up, slow_upload_writer)
 
 	// Let the upload get ahead of the slow server first.
@@ -1108,18 +1160,29 @@ test_connect_slow_upload_does_not_block_other_streams :: proc(t: ^testing.T) {
 	defer delete(got)
 	buf: [64]u8
 	want := fmt.tprintf("got %d", size)
+	read_err: trans.TransportError
 	for len(got) < len(want) {
 		n, rerr := trans.connection_read(conn, buf[:])
 		if rerr != .None {
+			read_err = rerr
 			break
 		}
 		append(&got, ..buf[:n])
 	}
 	thread.join(wth)
 	thread.destroy(wth)
+	sync.mutex_lock(&fx.agent.mutex)
+	same_session := fx.agent.connected && fx.agent.live_conn == session && !sync.atomic_load(&session.closed)
+	sync.mutex_unlock(&fx.agent.mutex)
+	if allow_agent_gone && !same_session && len(got) == 0 && brk.metrics_snapshot(&fx.server).resets[.AgentGone] > 0 {
+		fmt.eprintf("legacy slow upload reproduced agent_gone: elapsed=%v, read=%v, upload=%v\n", time.since(upload_start), read_err, up.err)
+		return
+	}
 	testing.expect_value(t, up.err, trans.TransportError.None)
 	testing.expect_value(t, string(got[:]), want)
-	fmt.printf("replay: %d MB upload at ~%.0f KB/s finished in %v (ideal %v)\n", REPLAY_UPLOAD_MB, rate / 1000, time.since(upload_start), expected)
+	testing.expect(t, same_session, "agent session disconnected during the slow upload")
+	fmt.printf("replay: %d MB upload at ~%.0f KB/s finished in %v (ideal %v), read=%v same_agent_session=%v legacy_heartbeat=%v\n",
+		REPLAY_UPLOAD_MB, rate / 1000, time.since(upload_start), expected, read_err, same_session, legacy)
 }
 
 @(test)
@@ -1600,116 +1663,10 @@ dial_log_text :: proc() -> string {
 	return strings.clone(string(dial_logs.text[:]))
 }
 
-// Sockets this process holds whose local or remote TCP port is `port`.
-// CLOSE-WAIT still has an fd; TIME_WAIT does not. -1 off Linux.
-tcp_port_socket_count :: proc(port: int) -> int {
-	when ODIN_OS != .Linux {
+when ODIN_OS != .Linux {
+	tcp_port_socket_count :: proc(port: int) -> int {
 		return -1
 	}
-	inodes := self_socket_inodes()
-	defer delete(inodes)
-	return tcp_table_port_count("/proc/net/tcp", port, &inodes) + tcp_table_port_count("/proc/net/tcp6", port, &inodes)
-}
-
-self_socket_inodes :: proc() -> map[int]struct{} {
-	inodes := make(map[int]struct{})
-	when ODIN_OS != .Linux {
-		return inodes
-	}
-	dir, err := os.open("/proc/self/fd")
-	if err != nil {
-		return inodes
-	}
-	defer os.close(dir)
-	infos, rerr := os.read_directory(dir, -1, context.allocator)
-	if rerr != nil {
-		return inodes
-	}
-	defer os.file_info_slice_delete(infos, context.allocator)
-	for info in infos {
-		path := fmt.tprintf("/proc/self/fd/%s", info.name)
-		link, lerr := os.read_link(path, context.temp_allocator)
-		if lerr != nil {
-			continue
-		}
-		prefix := "socket:["
-		if !strings.has_prefix(link, prefix) || !strings.has_suffix(link, "]") {
-			continue
-		}
-		num := link[len(prefix) : len(link) - 1]
-		inode, ok := strconv.parse_int(num)
-		if ok && inode > 0 {
-			inodes[inode] = {}
-		}
-	}
-	return inodes
-}
-
-tcp_table_port_count :: proc(path: string, port: int, inodes: ^map[int]struct{}) -> int {
-	data, err := os.read_entire_file(path, context.allocator)
-	if err != nil {
-		return 0
-	}
-	defer delete(data)
-	n := 0
-	rest := string(data)
-	header := true
-	for len(rest) > 0 {
-		line := rest
-		if i := strings.index(rest, "\n"); i >= 0 {
-			line = rest[:i]
-			rest = rest[i + 1 :]
-		} else {
-			rest = ""
-		}
-		if header {
-			header = false
-			continue
-		}
-		fields: [12]string
-		nf := 0
-		i := 0
-		for i < len(line) && nf < len(fields) {
-			for i < len(line) && (line[i] == ' ' || line[i] == '\t') {
-				i += 1
-			}
-			if i >= len(line) {
-				break
-			}
-			start := i
-			for i < len(line) && line[i] != ' ' && line[i] != '\t' {
-				i += 1
-			}
-			fields[nf] = line[start:i]
-			nf += 1
-		}
-		if nf < 10 {
-			continue
-		}
-		inode, iok := strconv.parse_int(fields[9])
-		if !iok {
-			continue
-		}
-		if _, ours := inodes[inode]; !ours {
-			continue
-		}
-		if hex_port(fields[1]) == port || hex_port(fields[2]) == port {
-			n += 1
-		}
-	}
-	return n
-}
-
-hex_port :: proc(addr: string) -> int {
-	colon := strings.last_index(addr, ":")
-	if colon < 0 || colon + 1 >= len(addr) {
-		return -1
-	}
-	v, ok := strconv.parse_uint(addr[colon + 1 :], 16)
-	if !ok {
-		return -1
-	}
-	return int(v)
 }
 
 storm_read_ok :: proc(t: ^testing.T, conn: ^trans.Connection, up: ^Upstream, loc := #caller_location) -> bool {
@@ -1786,6 +1743,10 @@ test_post_storm_fds_and_streams_return_to_baseline :: proc(t: ^testing.T) {
 	listen_port := ctl.bound.port
 	base_up := tcp_port_socket_count(up_port)
 	base_listen := tcp_port_socket_count(listen_port)
+	when ODIN_OS == .Linux {
+		testing.expect_value(t, base_up, 1)
+		testing.expect_value(t, base_listen, 1)
+	}
 	base_resets := brk.metrics_snapshot(&fx.server).resets[.StreamNotFound]
 
 	body := make([]u8, 1 + POST_BODY)
@@ -2060,7 +2021,10 @@ connect_agent_death_case :: proc(t: ^testing.T, reset_first: bool, use_tls: bool
 		testing.expect(t, false, "not ready")
 		return
 	}
-	base_listen := wait_port_fds_at_least(ctl.bound.port, 1, 500 * time.Millisecond)
+	base_listen := tcp_port_socket_count(ctl.bound.port)
+	when ODIN_OS == .Linux {
+		testing.expect_value(t, base_listen, 1)
+	}
 
 	box := connect_agent_outbox(&fx.server)
 	testing.expect(t, box != nil, "agent outbox")
@@ -2356,18 +2320,6 @@ wait_upload_stalled :: proc(u: ^Upload, limit: time.Duration) -> bool {
 		time.sleep(10 * time.Millisecond)
 	}
 	return !sync.atomic_load(&u.done)
-}
-
-// tcp_port_socket_count reads /proc once. A parallel test or a close that
-// has not shown up yet makes a single sample lie (listen fds 1, baseline 0).
-wait_port_fds_at_least :: proc(port: int, n: int, limit: time.Duration) -> int {
-	start := time.now()
-	last := tcp_port_socket_count(port)
-	for last < n && time.since(start) < limit {
-		time.sleep(5 * time.Millisecond)
-		last = tcp_port_socket_count(port)
-	}
-	return last
 }
 
 wait_port_fds :: proc(port: int, want: int, limit: time.Duration) -> int {

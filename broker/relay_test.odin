@@ -3,7 +3,7 @@ package broker
 import auth "../auth"
 import proto "../protocol"
 import trans "../transport"
-import "core:net"
+import "core:fmt"
 import "core:sync"
 import "core:testing"
 import "core:thread"
@@ -324,11 +324,17 @@ test_relay_agent_disconnect_resets_stream_and_drops_registration :: proc(t: ^tes
 // is still stuck after the session is gone is the caller wedge: this
 // broker never came back to read, so a later CONNECT stays in the kernel.
 BLOCKED_CHUNK :: 4 * 1024
-BLOCKED_TOTAL :: 1024 * 1024
+
+blocked_caller_reads: int // atomic, incremented by the broker-side caller socket's read hook
+
+count_blocked_caller_read :: proc(_: ^trans.Connection) {
+	sync.atomic_add(&blocked_caller_reads, 1)
+}
 
 BlockedWrite :: struct {
 	conn:      ^trans.Connection,
 	stream_id: proto.StreamId,
+	stop:      bool, // atomic; finish the in-flight write and send no more DATA
 	done:      bool, // atomic
 	sent:      int, // atomic
 	terr:      trans.TransportError,
@@ -336,16 +342,13 @@ BlockedWrite :: struct {
 }
 
 blocked_write_proc :: proc(w: ^BlockedWrite) {
-	chunk := make([]u8, BLOCKED_CHUNK)
-	defer delete(chunk)
-	sent := 0
-	for sent < BLOCKED_TOTAL {
-		w.terr, w.perr = trans.write_frame(w.conn, .Data, chunk, w.stream_id)
+	chunk: [BLOCKED_CHUNK]u8
+	for !sync.atomic_load(&w.stop) {
+		w.terr, w.perr = trans.write_frame(w.conn, .Data, chunk[:], w.stream_id)
 		if w.terr != .None || w.perr != .None {
 			break
 		}
-		sent += BLOCKED_CHUNK
-		sync.atomic_store(&w.sent, sent)
+		sync.atomic_add(&w.sent, BLOCKED_CHUNK)
 	}
 	sync.atomic_store(&w.done, true)
 }
@@ -375,11 +378,12 @@ test_blocked_caller_write_unblocks_when_agent_session_dies :: proc(t: ^testing.T
 	defer proto.decoder_destroy(&caller_dec)
 
 	sid := open_test_stream(t, agent, &agent_dec, caller, &caller_dec)
-	stream, found := relay_lookup_stream(&server, sid)
+	broker_caller, stream, found := relay_acquire_peer(&server, sid, .Caller)
 	testing.expect(t, found, "stream")
 	if !found {
 		return
 	}
+	defer trans.connection_release(broker_caller)
 	box := server_lookup_outbox(&server, stream.agent_conn)
 	testing.expect(t, box != nil, "agent outbox")
 	if box == nil {
@@ -388,15 +392,16 @@ test_blocked_caller_write_unblocks_when_agent_session_dies :: proc(t: ^testing.T
 	defer outbox_release(box)
 	outbox_set_writer_hold(box, true)
 	defer outbox_set_writer_hold(box, false)
+	sync.atomic_store(&blocked_caller_reads, 0)
+	sync.atomic_store(&broker_caller.read_hook, rawptr(count_blocked_caller_read))
+	defer sync.atomic_store(&broker_caller.read_hook, nil)
 
 	w := BlockedWrite {
 		conn = caller,
 		stream_id = sid,
 	}
-	// Loopback send buffers are megabytes. Shrink this one so the write
-	// stops in the kernel once the broker stops reading, which is the same
-	// state a full production buffer reaches.
-	testing.expect_value(t, net.set_option(caller.socket, .Send_Buffer_Size, 16 * 1024), net.Socket_Option_Error.None)
+	// Use the default TCP buffer. An explicit small SO_SNDBUF on Winsock
+	// loopback let writes keep completing with the broker reader stalled.
 	// Backstop so a real wedge fails the assertion instead of hanging the
 	// process. The pass condition is the write finishing within 1s of the
 	// agent session dying, not this timeout.
@@ -407,36 +412,51 @@ test_blocked_caller_write_unblocks_when_agent_session_dies :: proc(t: ^testing.T
 		return
 	}
 	defer {
+		sync.atomic_store(&w.stop, true)
+		if !sync.atomic_load(&w.done) {
+			trans.connection_close(caller)
+		}
 		thread.join(th)
 		thread.destroy(th)
 	}
 	start := time.now()
+	progress := start
+	last_sent := 0
+	last_reads := 0
 	blocked := false
 	for time.since(start) < 2 * time.Second {
 		if sync.atomic_load(&w.done) {
 			break
 		}
-		if outbox_queued(box, sid) >= 1 {
-			time.sleep(50 * time.Millisecond)
-			blocked = !sync.atomic_load(&w.done)
+		sent := sync.atomic_load(&w.sent)
+		reads := sync.atomic_load(&blocked_caller_reads)
+		if sent != last_sent || reads != last_reads || outbox_queued(box, sid) == 0 {
+			last_sent = sent
+			last_reads = reads
+			progress = time.now()
+		} else if sent >= 2 * BLOCKED_CHUNK && reads > 0 && time.since(progress) >= 50 * time.Millisecond {
+			blocked = true
 			break
 		}
 		time.sleep(5 * time.Millisecond)
 	}
-	testing.expectf(
-		t,
-		blocked,
-		"DATA write did not block (done=%v sent=%d terr=%v perr=%v queued=%d)",
-		sync.atomic_load(&w.done),
-		sync.atomic_load(&w.sent),
-		w.terr,
-		w.perr,
-		outbox_queued(box, sid),
-	)
 	if !blocked {
+		testing.expectf(
+			t,
+			false,
+			"DATA write did not block (done=%v sent=%d queued=%d broker_reads=%d)",
+			sync.atomic_load(&w.done),
+			sync.atomic_load(&w.sent),
+			outbox_queued(box, sid),
+			sync.atomic_load(&blocked_caller_reads),
+		)
 		return
 	}
+	fmt.printfln("backpressure: sent=%d queued=%d broker_reads=%d (unchanged during stall)", last_sent, outbox_queued(box, sid), last_reads)
 
+	// Send until actual backpressure, regardless of how much this host's
+	// loopback buffers. Agent loss only has to finish the write in flight.
+	sync.atomic_store(&w.stop, true)
 	trans.connection_destroy(agent)
 	agent_open = false
 
@@ -447,9 +467,13 @@ test_blocked_caller_write_unblocks_when_agent_session_dies :: proc(t: ^testing.T
 		}
 		time.sleep(5 * time.Millisecond)
 	}
-	testing.expect(t, sync.atomic_load(&w.done), "caller DATA write still blocked after agent session died")
+	if !testing.expect(t, sync.atomic_load(&w.done), "caller DATA write still blocked after agent session died") {
+		return
+	}
 	testing.expect_value(t, w.terr, trans.TransportError.None)
 	testing.expect_value(t, w.perr, proto.ProtocolError.None)
+	testing.expect(t, sync.atomic_load(&w.sent) > last_sent, "the blocked write made no progress after agent loss")
+	testing.expect(t, sync.atomic_load(&blocked_caller_reads) > last_reads, "the broker did not resume reading after agent loss")
 
 	// Closing the agent outbox fails the caller thread's outbox_wait, which
 	// resets InternalError, unless cleanup already sent AgentUnavailable.

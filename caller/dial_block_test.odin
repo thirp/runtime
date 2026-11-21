@@ -6,8 +6,6 @@ import log "../logging"
 import proto "../protocol"
 import trans "../transport"
 import "core:net"
-import "core:os"
-import "core:strconv"
 import "core:strings"
 import "core:sync"
 import "core:testing"
@@ -17,9 +15,10 @@ import "core:time"
 // Upload DATA that blocks in the kernel, holding the session write lock.
 BlockedUpload :: struct {
 	conn:   ^Conn,
+	stop:   bool, // atomic; stop after the in-flight frame
 	done:   bool,
 	sent:   int,
-	err:    ConnError,
+	err:    ConnError, // atomic
 	limit:  int,
 	// Nanoseconds to sleep after each chunk. Zero sends as fast as the socket allows.
 	gap_ns: int,
@@ -28,17 +27,12 @@ BlockedUpload :: struct {
 blocked_upload_proc :: proc(u: ^BlockedUpload) {
 	chunk := make([]u8, 8 * 1024)
 	defer delete(chunk)
-	// Past one socket pair's autotune ceiling, so the write cannot finish
-	// into the kernel and skip the blocked-CONNECT check. A test that
-	// sets limit wants a shorter upload than that ceiling.
-	limit := u.limit
-	if limit <= 0 {
-		limit = blocked_upload_cap()
-	}
-	for sync.atomic_load(&u.sent) < limit {
+	// Stall tests write until they observe backpressure. A paced test
+	// can set a finite limit to measure progress through a known upload.
+	for !sync.atomic_load(&u.stop) && (u.limit <= 0 || sync.atomic_load(&u.sent) < u.limit) {
 		n, werr := conn_write(u.conn, chunk)
 		if werr != .None || n != len(chunk) {
-			u.err = werr
+			sync.atomic_store(&u.err, werr)
 			break
 		}
 		sync.atomic_add(&u.sent, n)
@@ -48,44 +42,6 @@ blocked_upload_proc :: proc(u: ^BlockedUpload) {
 		}
 	}
 	sync.atomic_store(&u.done, true)
-}
-
-proc_mem_max :: proc(path: string) -> int {
-	data, rerr := os.read_entire_file(path, context.temp_allocator)
-	if rerr != nil || len(data) == 0 {
-		return 0
-	}
-	s := string(data)
-	end := len(s)
-	for end > 0 && (s[end - 1] == '\n' || s[end - 1] == '\r' || s[end - 1] == ' ' || s[end - 1] == '\t') {
-		end -= 1
-	}
-	start := end
-	for start > 0 && s[start - 1] >= '0' && s[start - 1] <= '9' {
-		start -= 1
-	}
-	if start == end {
-		return 0
-	}
-	n, pok := strconv.parse_int(s[start:end])
-	if !pok || n <= 0 {
-		return 0
-	}
-	return n
-}
-
-// Caller to broker only. The write blocks in that socket once the broker
-// stops reading; the cap has to exceed tcp_wmem max + tcp_rmem max.
-blocked_upload_cap :: proc() -> int {
-	r := proc_mem_max("/proc/sys/net/ipv4/tcp_rmem")
-	w := proc_mem_max("/proc/sys/net/ipv4/tcp_wmem")
-	if r <= 0 {
-		r = 16 * 1024 * 1024
-	}
-	if w <= 0 {
-		w = 16 * 1024 * 1024
-	}
-	return r + w + 1024 * 1024
 }
 
 DialAttempt :: struct {
@@ -160,8 +116,7 @@ test_dial_behind_blocked_data_times_out_and_recovers :: proc(t: ^testing.T) {
 
 	// Stop the broker draining this agent's outbox. The stream cap then fills
 	// and the broker stops reading the caller, so conn_write blocks in the
-	// kernel and holds the session write lock. Socket buffers are too big
-	// to rely on for a 1 MiB upload.
+	// kernel and holds the session write lock.
 	box := test_agent_outbox(&fx.server)
 	testing.expect(t, box != nil, "agent outbox")
 	if box == nil {
@@ -169,10 +124,9 @@ test_dial_behind_blocked_data_times_out_and_recovers :: proc(t: ^testing.T) {
 	}
 	defer brk.outbox_release(box)
 	brk.outbox_set_writer_hold(box, true)
-	if c.conn != nil {
-		_ = net.set_option(c.conn.socket, .Send_Buffer_Size, 16 * 1024)
-		_ = trans.connection_set_send_timeout(c.conn, 8 * time.Second)
-	}
+	// Keep the default buffer. A small explicit SO_SNDBUF on Winsock
+	// loopback lets sends keep completing even with the broker stalled.
+	_ = trans.connection_set_send_timeout(c.conn, 8 * time.Second)
 
 	up := BlockedUpload{conn = up_conn}
 	uth := thread.create_and_start_with_poly_data(&up, blocked_upload_proc)
@@ -181,6 +135,7 @@ test_dial_behind_blocked_data_times_out_and_recovers :: proc(t: ^testing.T) {
 		return
 	}
 	defer {
+		sync.atomic_store(&up.stop, true)
 		brk.outbox_set_writer_hold(box, false)
 		thread.join(uth)
 		thread.destroy(uth)
@@ -198,7 +153,7 @@ test_dial_behind_blocked_data_times_out_and_recovers :: proc(t: ^testing.T) {
 		if sent != last {
 			last = sent
 			changed = time.now()
-		} else if time.since(changed) >= 200 * time.Millisecond {
+		} else if sent > 0 && time.since(changed) >= 200 * time.Millisecond {
 			blocked = true
 			break
 		}
@@ -210,7 +165,7 @@ test_dial_behind_blocked_data_times_out_and_recovers :: proc(t: ^testing.T) {
 		"DATA write did not block (done=%v sent=%d err=%v)",
 		sync.atomic_load(&up.done),
 		sync.atomic_load(&up.sent),
-		up.err,
+		sync.atomic_load(&up.err),
 	)
 	if !blocked {
 		return
@@ -255,12 +210,13 @@ test_dial_behind_blocked_data_times_out_and_recovers :: proc(t: ^testing.T) {
 	gen := caller_conn_gen(&c)
 
 	released := sync.atomic_load(&up.sent)
+	sync.atomic_store(&up.stop, true)
 	brk.outbox_set_writer_hold(box, false)
 	progress := time.now()
 	for sync.atomic_load(&up.sent) <= released && !sync.atomic_load(&up.done) && time.since(progress) < 2 * time.Second {
 		time.sleep(5 * time.Millisecond)
 	}
-	// The echo of a full-cap upload can fill the inbound cap and reset the
+	// The echo of a buffered upload can fill the inbound cap and reset the
 	// stream. Survival is more bytes sent on the same session, not err None.
 	testing.expectf(
 		t,
@@ -269,7 +225,7 @@ test_dial_behind_blocked_data_times_out_and_recovers :: proc(t: ^testing.T) {
 		sync.atomic_load(&up.sent),
 		released,
 		sync.atomic_load(&up.done),
-		up.err,
+		sync.atomic_load(&up.err),
 		caller_conn_gen(&c) == gen,
 		caller_is_connected(&c),
 	)
@@ -361,21 +317,17 @@ test_stuck_socket_restarts_session_and_dials_timeout :: proc(t: ^testing.T) {
 	}
 	defer brk.outbox_release(box)
 	brk.outbox_set_writer_hold(box, true)
-	if c.conn != nil {
-		_ = net.set_option(c.conn.socket, .Send_Buffer_Size, 16 * 1024)
-		_ = trans.connection_set_send_timeout(c.conn, 8 * time.Second)
-	}
+	// Use the default TCP buffer just as in the blocked-dial test above.
+	_ = trans.connection_set_send_timeout(c.conn, 8 * time.Second)
 
-	up := BlockedUpload {
-		conn  = up_conn,
-		limit = blocked_upload_cap(),
-	}
+	up := BlockedUpload{conn = up_conn}
 	uth := thread.create_and_start_with_poly_data(&up, blocked_upload_proc)
 	testing.expect(t, uth != nil, "upload thread")
 	if uth == nil {
 		return
 	}
 	defer {
+		sync.atomic_store(&up.stop, true)
 		brk.outbox_set_writer_hold(box, false)
 		thread.join(uth)
 		thread.destroy(uth)
@@ -405,7 +357,7 @@ test_stuck_socket_restarts_session_and_dials_timeout :: proc(t: ^testing.T) {
 		"DATA write did not block (done=%v sent=%d err=%v)",
 		sync.atomic_load(&up.done),
 		sync.atomic_load(&up.sent),
-		up.err,
+		sync.atomic_load(&up.err),
 	)
 	if !blocked {
 		return
@@ -584,7 +536,7 @@ test_slow_upload_connect_succeeds_and_upload_survives :: proc(t: ^testing.T) {
 		"upload was not still running (done=%v sent=%d err=%v)",
 		sync.atomic_load(&up.done),
 		sync.atomic_load(&up.sent),
-		up.err,
+		sync.atomic_load(&up.err),
 	)
 	if !moving || sync.atomic_load(&up.done) {
 		return
@@ -630,12 +582,12 @@ test_slow_upload_connect_succeeds_and_upload_survives :: proc(t: ^testing.T) {
 	}
 	testing.expectf(
 		t,
-		sync.atomic_load(&up.done) && up.err == .None && sync.atomic_load(&up.sent) > sent_at_dial,
+	sync.atomic_load(&up.done) && sync.atomic_load(&up.err) == .None && sync.atomic_load(&up.sent) > sent_at_dial,
 		"upload did not survive (done=%v sent=%d at_dial=%d err=%v)",
 		sync.atomic_load(&up.done),
 		sync.atomic_load(&up.sent),
 		sent_at_dial,
-		up.err,
+		sync.atomic_load(&up.err),
 	)
 	payload := []u8{'h', 'i'}
 	n, werr := conn_write(again, payload)

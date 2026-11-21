@@ -4,6 +4,7 @@ import auth "../auth"
 import log "../logging"
 import proto "../protocol"
 import trans "../transport"
+import "base:runtime"
 import "core:mem"
 import "core:net"
 import "core:sync"
@@ -15,6 +16,14 @@ DEFAULT_SESSION_TIMEOUT :: 45 * time.Second
 DEFAULT_SHUTDOWN_GRACE :: 10 * time.Second
 ACCEPT_POLL_INTERVAL :: 50 * time.Millisecond
 BROKER_IMPLEMENTATION :: "thirp-broker"
+
+when ODIN_TEST {
+	ServerTestTrace :: struct {
+		test_trace_agent_session: bool,
+	}
+} else {
+	ServerTestTrace :: struct {}
+}
 
 Server :: struct {
 	allocator:                 mem.Allocator,
@@ -77,6 +86,7 @@ Server :: struct {
 	// Tests hold the handler after a terminal HALF_CLOSE is applied and
 	// before the row is removed. Production leaves it unarmed.
 	half_close_pause:          HalfClosePause,
+	using _: ServerTestTrace,
 }
 
 server_init :: proc(
@@ -178,16 +188,25 @@ server_serve :: proc(server: ^Server) {
 			continue
 		}
 		handler, aerr := new(ConnHandler, server.allocator)
-		if aerr != .None {
-			metrics_inc_limit(&server.metrics, .FileDescriptors)
-			server_log(server, .Warn, LOG_EVENT_ACCEPT_FAILED, log.LogFields{reason = limit_kind_label(.FileDescriptors)})
-			server_release_connection_slot(server, ip_key_from_endpoint(conn.remote))
-			trans.connection_destroy(conn, server.allocator)
-			continue
+		if aerr == .None {
+			handler.server = server
+			handler.conn = conn
+			{
+				// Odin frees a detached Thread after conn_thread_proc returns.
+				// Its descriptor must outlive the server's allocator.
+				context.allocator = runtime.heap_allocator()
+				worker := thread.create_and_start_with_poly_data(handler, conn_thread_proc, self_cleanup = true)
+				if worker != nil {
+					continue
+				}
+			}
+			free(handler, server.allocator)
 		}
-		handler.server = server
-		handler.conn = conn
-		thread.run_with_poly_data(handler, conn_thread_proc)
+		ip := ip_key_from_endpoint(conn.remote)
+		trans.connection_destroy(conn, server.allocator)
+		metrics_inc_limit(&server.metrics, .FileDescriptors)
+		server_log(server, .Warn, LOG_EVENT_ACCEPT_FAILED, log.LogFields{reason = limit_kind_label(.FileDescriptors)})
+		server_release_connection_slot(server, ip)
 	}
 }
 
@@ -463,14 +482,14 @@ server_acquire_connection_slot :: proc(server: ^Server, conn: ^trans.Connection)
 
 server_release_connection_slot :: proc(server: ^Server, key: IpKey) {
 	sync.mutex_lock(&server.limits_mutex)
-	defer sync.mutex_unlock(&server.limits_mutex)
 	count := server.ip_conns[key]
 	if count <= 1 {
 		delete_key(&server.ip_conns, key)
 	} else {
 		server.ip_conns[key] = count - 1
 	}
-	if sync.atomic_load(&server.active_conns) > 0 {
-		sync.atomic_sub(&server.active_conns, 1)
-	}
+	sync.mutex_unlock(&server.limits_mutex)
+	// The waiter can destroy the server after the last decrement. Publish
+	// it only after releasing the lock and finishing all server accesses.
+	sync.atomic_sub(&server.active_conns, 1)
 }

@@ -287,13 +287,13 @@ ingress_conn_begin :: proc(server: ^IngressServer) {
 
 ingress_conn_end :: proc(server: ^IngressServer, key: IngressIpKey) {
 	ingress_release_connection_slot(server, key)
+	metrics_add_active(&server.metrics, -1)
 	sync.mutex_lock(&server.conn_mutex)
 	if server.active_conns > 0 {
 		server.active_conns -= 1
 	}
 	sync.cond_signal(&server.conn_cond)
 	sync.mutex_unlock(&server.conn_mutex)
-	metrics_add_active(&server.metrics, -1)
 }
 
 ingress_live_add :: proc(server: ^IngressServer, live: ^IngressLiveConn) {

@@ -289,6 +289,8 @@ The public hostname is a locator, not a secret. Anyone who can complete TLS to t
 
 A process with only `tls_passthrough` routes does not need an ingress certificate. Mixed `http` and `tls_passthrough` routes do. Passthrough failures before the Origin completes TLS close the TCP connection; they do not write an HTTP error with the ingress certificate. See the commented passthrough route in [examples/production/web-ingress.conf](../examples/production/web-ingress.conf).
 
+For a terminated HTTP route, an absent Service or unavailable local target returns `503`. After sending an HTTP error, Web Ingress half-closes its write side and drains up to 64 KiB or 250 ms of remaining request data so the browser can receive the response.
+
 Copy [examples/production/web-ingress.conf](../examples/production/web-ingress.conf) and [examples/production/web-ingress.token.example](../examples/production/web-ingress.token.example). Use a dedicated Ingress Principal (`ConnectService` only). The production Broker example grants `web-ingress-a` exactly `acme/site-17/portfolio-ui`.
 
 ```text

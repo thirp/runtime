@@ -15,7 +15,7 @@ tls_wait_socket_impl :: proc(conn: ^Connection, want_write: bool, timeout: time.
 		return .Timeout
 	}
 	if n == win.SOCKET_ERROR {
-		return .Network
+		return .WouldBlock if win.WSAGetLastError() == win.WSAEINTR else .Network
 	}
 	if pfd.revents & i16(win.POLLNVAL) != 0 {
 		conn.closed = true

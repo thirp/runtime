@@ -74,14 +74,15 @@ sdk_walk_allowed_packages() {
 	local allowed="$2"
 	local label="$3"
 	shift 3
-	local -A seen=()
+	local -a seen=()
 	local -a queue=("$@")
-	local pkg file path dep item
+	local cursor pkg file path dep item
 
-	while [[ ${#queue[@]} -gt 0 ]]; do
-		pkg="${queue[0]}"
-		queue=("${queue[@]:1}")
-		if [[ -n "${seen[$pkg]:-}" ]]; then
+	# macOS ships Bash 3.2. Use indexed arrays and expand an empty seen list
+	# safely under nounset. The queue retains its entries as the cursor advances.
+	for ((cursor = 0; cursor < ${#queue[@]}; cursor++)); do
+		pkg="${queue[cursor]}"
+		if sdk_list_contains "$pkg" ${seen[@]+"${seen[@]}"}; then
 			continue
 		fi
 		if ! sdk_list_contains "$pkg" $allowed; then
@@ -92,7 +93,7 @@ sdk_walk_allowed_packages() {
 			echo "sdk: missing package directory: ${pkg}" >&2
 			return 1
 		fi
-		seen["$pkg"]=1
+		seen+=("$pkg")
 		for file in "${root}/${pkg}"/*.odin; do
 			if [[ ! -f "$file" ]]; then
 				continue
@@ -109,7 +110,7 @@ sdk_walk_allowed_packages() {
 				if [[ -z "$dep" ]]; then
 					continue
 				fi
-				if [[ -z "${seen[$dep]:-}" ]]; then
+				if ! sdk_list_contains "$dep" "${queue[@]}"; then
 					queue+=("$dep")
 				fi
 			done < <(sdk_extract_import_paths "$file")
@@ -117,7 +118,7 @@ sdk_walk_allowed_packages() {
 	done
 
 	for item in $allowed; do
-		if [[ -z "${seen[$item]:-}" ]]; then
+		if ! sdk_list_contains "$item" ${seen[@]+"${seen[@]}"}; then
 			echo "sdk: expected package missing from import walk: ${item}" >&2
 			return 1
 		fi

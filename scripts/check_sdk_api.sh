@@ -61,11 +61,9 @@ echo "check_sdk_api: examples use collection imports"
 for src in \
 	"${ROOT}/examples/sdk/odin/ephemeral_host/main.odin" \
 	"${ROOT}/examples/sdk/odin/join_code_client/main.odin"; do
-	if ! grep -q 'import .* "thirp:agent"\|import .* "thirp:caller"' "$src"; then
-		if ! grep -q '"thirp:agent"\|"thirp:caller"' "$src"; then
-			echo "check_sdk_api: ${src} does not import thirp:agent or thirp:caller" >&2
-			exit 1
-		fi
+	if ! grep -qE '"thirp:(agent|caller)"' "$src"; then
+		echo "check_sdk_api: ${src} does not import thirp:agent or thirp:caller" >&2
+		exit 1
 	fi
 	if grep -E 'import .*"\.\./' "$src"; then
 		echo "check_sdk_api: ${src} uses a relative import" >&2

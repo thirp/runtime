@@ -1061,6 +1061,7 @@ caller_fail_all :: proc(c: ^Caller, err: CallerError) {
 	c.dropped_streams = len(c.streams)
 	if c.pending != nil {
 		c.pending_err = err
+		c.pending.dial_stalled = err == .Transport && c.disconnect_reason == LOG_REASON_STALL
 		c.pending = nil
 	}
 	c.pending_tombstone = false

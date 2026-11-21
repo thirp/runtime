@@ -3,6 +3,7 @@ package agent
 import proto "../protocol"
 import trans "../transport"
 import log "../logging"
+import "core:fmt"
 import "core:net"
 import "core:sync"
 import "core:thread"
@@ -353,6 +354,17 @@ agent_open_failed_done :: proc(relay: ^AgentRelay) {
 	sync.atomic_sub(&relay.live_pumps, 1)
 }
 
+@(private)
+agent_dial_local :: proc(relay: ^AgentRelay, endpoint: net.Endpoint) -> (^trans.Connection, trans.TransportError) {
+	timeout := agent_local_dial_timeout(relay)
+	when ODIN_TEST {
+		if dial := relay.agent.config.test_local_dial; dial != nil {
+			return dial(endpoint, timeout)
+		}
+	}
+	return trans.connection_dial_timeout(endpoint, timeout)
+}
+
 agent_open_worker :: proc(arg: ^AgentOpenArg) {
 	relay := arg.relay
 	stream_id := arg.stream_id
@@ -372,7 +384,7 @@ agent_open_worker :: proc(arg: ^AgentOpenArg) {
 		return
 	}
 
-	local, derr := trans.connection_dial_timeout(target.address, agent_local_dial_timeout(relay))
+	local, derr := agent_dial_local(relay, target.address)
 	if derr != .None {
 		agent_log_local_dial_failed(relay, stream_id, target.address, derr)
 		_ = agent_write_failure(
@@ -654,18 +666,128 @@ agent_read_idle_limit :: proc(agent: ^Agent) -> time.Duration {
 	return READ_IDLE_TIMEOUT
 }
 
-agent_relay_loop :: proc(relay: ^AgentRelay, decoder: ^proto.FrameDecoder) -> (reason: string) {
-	reason = "disconnected"
+AgentKeepalive :: struct {
+	relay: ^AgentRelay,
+	stop:  sync.Sema,
+}
+
+agent_keepalive :: proc(ka: ^AgentKeepalive) {
+	relay := ka.relay
+	next := HEARTBEAT_INTERVAL
 	nonce: u64
-	last_ping := time.now()
-	last_recv := last_ping
-	for {
+	for !sync.sema_wait_with_timeout(&ka.stop, next) {
 		if sync.atomic_load(&relay.agent.stop) {
-			agent_shutdown_session(relay, decoder)
 			return
 		}
-		// Check before any Ping write: a successful outbound write into a
-		// half-open socket's send queue is not evidence the broker is live.
+		nonce += 1
+		delay, keep_running := agent_keepalive_probe(relay.agent, relay.broker, nonce)
+		if !keep_running {
+			return
+		}
+		next = delay
+	}
+}
+
+agent_keepalive_probe :: proc(agent: ^Agent, conn: ^trans.Connection, nonce: u64, idle := HEARTBEAT_INTERVAL) -> (time.Duration, bool) {
+	payload, perr := proto.encode_ping(proto.Ping{nonce = nonce})
+	if perr != .None {
+		agent_keepalive_failed(agent, conn, .None, perr)
+		return 0, false
+	}
+	frame, ferr := proto.encode_frame(proto.FrameHeader {
+		version   = proto.PROTOCOL_MAJOR,
+		opcode    = .Ping,
+		stream_id = proto.CONNECTION_STREAM_ID,
+	}, payload)
+	delete(payload)
+	if ferr != .None {
+		agent_keepalive_failed(agent, conn, .None, ferr)
+		return 0, false
+	}
+	delay, terr := trans.connection_write_if_idle(conn, frame, idle, HEARTBEAT_WRITE_TIMEOUT)
+	delete(frame)
+	if terr == .WouldBlock {
+		return HEARTBEAT_WRITE_TIMEOUT, true
+	}
+	if terr != .None {
+		agent_keepalive_failed(agent, conn, terr, .None)
+		return 0, false
+	}
+	return delay, true
+}
+
+agent_keepalive_failed :: proc(agent: ^Agent, conn: ^trans.Connection, terr: trans.TransportError, perr: proto.ProtocolError) {
+	agent_log(agent, .Debug, LOG_EVENT_RELAY_IO_FAILED, log.LogFields {
+		phase = LOG_PHASE_PING_WRITE,
+		error_code = fmt.tprintf("%v/%v", terr, perr),
+	})
+	// The socket may contain only part of a frame after a write error.
+	trans.connection_close(conn)
+}
+
+when ODIN_TEST {
+	// The native replay runs this path with the original synchronous
+	// scheduling and with no injected error.
+	agent_legacy_ping :: proc(relay: ^AgentRelay, last_ping: ^time.Time, nonce: ^u64, now: time.Time, inject_timeout: bool) -> bool {
+		if time.diff(last_ping^, now) < HEARTBEAT_INTERVAL {
+			return true
+		}
+		nonce^ += 1
+		payload, perr := proto.encode_ping(proto.Ping{nonce = nonce^})
+		defer delete(payload)
+		terr: trans.TransportError
+		if inject_timeout {
+			relay.agent.config.test_heartbeat_probe.fault_observed = true
+			terr = .Timeout
+		} else if perr == .None {
+			terr, perr = trans.write_frame(relay.broker, .Ping, payload)
+		}
+		if terr != .None || perr != .None {
+			agent_log(relay.agent, .Debug, LOG_EVENT_RELAY_IO_FAILED, log.LogFields {
+				phase = LOG_PHASE_PING_WRITE,
+				error_code = fmt.tprintf("%v/%v", terr, perr),
+			})
+			return false
+		}
+		last_ping^ = time.now()
+		return true
+	}
+}
+
+agent_relay_loop :: proc(relay: ^AgentRelay, decoder: ^proto.FrameDecoder) -> (reason: string) {
+	reason = "disconnected"
+	last_recv := time.now()
+	keepalive := AgentKeepalive{relay = relay}
+	legacy := false
+	when ODIN_TEST {
+		legacy = relay.agent.config.test_legacy_heartbeat
+		last_ping := last_recv
+		nonce: u64
+	}
+	graceful_stop := false
+	defer if graceful_stop {
+		agent_shutdown_session(relay, decoder)
+	}
+	worker: ^thread.Thread
+	if !legacy {
+		// Regular DATA writes retain their blocking TCP/TLS send behavior.
+		_ = trans.connection_set_send_timeout(relay.broker, 0)
+		worker = thread.create_and_start_with_poly_data(&keepalive, agent_keepalive)
+		if worker == nil {
+			return
+		}
+	}
+	defer if worker != nil {
+		sync.sema_post(&keepalive.stop)
+		thread.join(worker)
+		thread.destroy(worker)
+	}
+	for {
+		if sync.atomic_load(&relay.agent.stop) {
+			graceful_stop = true
+			return
+		}
+		// Only an inbound frame can satisfy the read-idle watchdog.
 		if time.since(last_recv) >= agent_read_idle_limit(relay.agent) {
 			reason = LOG_REASON_IDLE
 			agent_log(relay.agent, .Info, "disconnected", log.LogFields{reason = reason})
@@ -681,27 +803,36 @@ agent_relay_loop :: proc(relay: ^AgentRelay, decoder: ^proto.FrameDecoder) -> (r
 			}
 		}
 		_ = trans.connection_set_recv_timeout(relay.broker, 50 * time.Millisecond)
-		// Force DATA writes to block on peer window instead of inheriting the
-		// 50ms read-poll timeout (which turned backpressure into RESET storms).
-		_ = trans.connection_set_send_timeout(relay.broker, 0)
+		when ODIN_TEST {
+			if legacy {
+				_ = trans.connection_set_send_timeout(relay.broker, 0)
+			}
+		}
 		frame, terr, perr := trans.read_frame(relay.broker, decoder)
 		if terr == .Timeout {
-			if time.since(last_ping) >= HEARTBEAT_INTERVAL {
-				nonce += 1
-				payload, eerr := proto.encode_ping(proto.Ping{nonce = nonce})
-				if eerr != .None {
+			when ODIN_TEST {
+				now := time.now()
+				probe := relay.agent.config.test_heartbeat_probe
+				probing := probe != nil && sync.atomic_exchange(&probe.armed, false)
+				if probing {
+					last_ping = time.time_add(now, -HEARTBEAT_INTERVAL)
+					probe.recent_frame = time.diff(last_recv, now) < HEARTBEAT_INTERVAL
+				}
+				keep_session := !legacy || agent_legacy_ping(relay, &last_ping, &nonce, now, probing)
+				if probing {
+					sync.sema_post(&probe.done)
+				}
+				if !keep_session {
 					return
 				}
-				ok := agent_write(relay.broker, .Ping, payload)
-				delete(payload)
-				if !ok {
-					return
-				}
-				last_ping = time.now()
 			}
 			continue
 		}
 		if terr != .None || perr != .None {
+			agent_log(relay.agent, .Debug, LOG_EVENT_RELAY_IO_FAILED, log.LogFields {
+				phase = LOG_PHASE_FRAME_READ,
+				error_code = fmt.tprintf("%v/%v", terr, perr),
+			})
 			return
 		}
 		last_recv = time.now()

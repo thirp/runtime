@@ -7,6 +7,27 @@ import "core:sync"
 import "core:testing"
 import "core:time"
 
+when ODIN_TEST {
+	@(test)
+	test_keepalive_defers_when_readiness_poll_is_interrupted :: proc(t: ^testing.T) {
+		conn := Connection{refs = 1, test_interrupt_poll = true}
+		probe_budget := 50 * time.Millisecond
+		delay, err := connection_write_if_idle(&conn, []u8{'p'}, 15 * time.Second, probe_budget)
+		testing.expect_value(t, err, TransportError.WouldBlock)
+		testing.expect_value(t, delay, time.Duration(0))
+		testing.expect(t, !conn.closed && !conn.close_started, "interrupted probe closed the session")
+		testing.expect(t, conn.last_write == {}, "interrupted probe recorded an outbound write")
+		testing.expect_value(t, conn.io_inflight, 0)
+		if testing.expect(t, sync.mutex_try_lock(&conn.write_mutex), "interrupted probe held the writer") {
+			sync.mutex_unlock(&conn.write_mutex)
+		}
+		// An interruption during an ordinary TLS write must still be reported
+		// as a failure since a partial frame may already be on the wire.
+		conn.test_interrupt_poll = true
+		testing.expect_value(t, tls_poll(&conn, true, probe_budget), TransportError.Network)
+	}
+}
+
 @(test)
 test_listen_dial_loopback_exchanges_bytes :: proc(t: ^testing.T) {
 	ln, lerr := listener_listen(loopback_endpoint(0))

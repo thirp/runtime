@@ -247,7 +247,13 @@ agent_run :: proc(agent: ^Agent) -> AgentError {
 
 agent_dial :: proc(agent: ^Agent) -> (^trans.Connection, trans.TransportError) {
 	if agent.config.insecure {
-		return trans.connection_dial(agent.config.broker)
+		conn, err := trans.connection_dial(agent.config.broker)
+		when ODIN_TEST {
+			if conn != nil && agent.config.test_trace_broker_session {
+				trans.connection_trace_tcp(conn, .Agent)
+			}
+		}
+		return conn, err
 	}
 	name := agent.config.tls_server_name
 	if len(name) == 0 {

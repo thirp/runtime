@@ -197,9 +197,9 @@ connection_read :: proc(conn: ^Connection, dst: []u8) -> (n: int, err: Transport
 	if hook := sync.atomic_load(&conn.read_hook); hook != nil {
 		(IoHook)(hook)(conn)
 	}
-	bytes_read, recv_err := net.recv_tcp(sock, dst)
+	bytes_read, recv_err := tcp_recv(conn, sock, dst)
 	for recv_err == .Interrupted && bytes_read == 0 && !conn_closing(conn) {
-		bytes_read, recv_err = net.recv_tcp(sock, dst)
+		bytes_read, recv_err = tcp_recv(conn, sock, dst)
 	}
 	when ODIN_OS == .Linux {
 		// SO_RCVTIMEO is EAGAIN (.Would_Block) and stays a poll timeout.
@@ -262,8 +262,53 @@ connection_write :: proc(conn: ^Connection, src: []u8) -> TransportError {
 	defer conn_io_exit(conn)
 	sync.mutex_lock(&conn.write_mutex)
 	defer sync.mutex_unlock(&conn.write_mutex)
+	return connection_write_locked(conn, src)
+}
+
+// A keepalive may use the writer only after outbound inactivity. A busy
+// writer or socket is reported before sending any bytes. An error after
+// writing starts can leave a partial frame, so the caller must close.
+connection_write_if_idle :: proc(conn: ^Connection, src: []u8, idle, timeout: time.Duration) -> (next: time.Duration, err: TransportError) {
+	if conn == nil || !conn_io_enter(conn) {
+		return 0, .Closed
+	}
+	defer conn_io_exit(conn)
+	if !sync.mutex_try_lock(&conn.write_mutex) {
+		return 0, .WouldBlock
+	}
+	defer sync.mutex_unlock(&conn.write_mutex)
+	if conn.closed || conn_closing(conn) {
+		return 0, .Closed
+	}
+	if conn.last_write != {} {
+		if left := idle - time.tick_since(conn.last_write); left > 0 {
+			return left, .None
+		}
+	}
+	if ready := tls_wait_socket(conn, true, timeout, defer_on_interrupt = true); ready != .None {
+		return 0, .WouldBlock if ready == .Timeout else ready
+	}
+
+	previous := conn.send_timeout
+	if conn.tls == nil && net.set_option(conn.socket, .Send_Timeout, timeout) != .None {
+		return 0, .Network
+	}
+	conn.send_timeout = timeout
+	err = connection_write_locked(conn, src)
+	conn.send_timeout = previous
+	if conn.tls == nil && net.set_option(conn.socket, .Send_Timeout, previous) != .None && err == .None {
+		err = .Network
+	}
+	return idle, err
+}
+
+@(private)
+connection_write_locked :: proc(conn: ^Connection, src: []u8) -> (err: TransportError) {
 	if conn.closed || conn_closing(conn) {
 		return .Closed
+	}
+	defer if err == .None && len(src) > 0 {
+		conn.last_write = time.tick_now()
 	}
 	if conn.tls != nil {
 		return tls_connection_write(conn, src)
@@ -278,7 +323,7 @@ connection_write :: proc(conn: ^Connection, src: []u8) -> TransportError {
 	send_err: net.TCP_Send_Error
 	for {
 		sent: int
-		sent, send_err = net.send_tcp(sock, src[off:])
+		sent, send_err = tcp_send(conn, sock, src[off:])
 		off += sent
 		if send_err != .Interrupted || off >= len(src) || conn_closing(conn) {
 			break
@@ -287,7 +332,7 @@ connection_write :: proc(conn: ^Connection, src: []u8) -> TransportError {
 	if send_err == .Interrupted {
 		send_err = .None
 	}
-	err := map_send_error(send_err)
+	err = map_send_error(send_err)
 	if err == .Closed {
 		conn.closed = true
 	}
@@ -345,6 +390,9 @@ connection_close :: proc(conn: ^Connection) {
 	}
 	sync.atomic_add(&conn.io_inflight, 1) // keep the fd while we shut it down
 	if _, won := sync.atomic_compare_exchange_strong(&conn.close_started, false, true); won {
+		when ODIN_TEST {
+			tcp_trace_close(conn, "close")
+		}
 		// Only shut down when another thread is inside an operation; with
 		// none, the fd is closed right away exactly as before (same FIN/RST
 		// the peer always saw). Anyone entering from here on backs out.
@@ -371,6 +419,34 @@ connection_shutdown_write :: proc(conn: ^Connection) -> TransportError {
 	return .None
 }
 
+// Discard pending input after a final response and write-side shutdown.
+// The owner closes the connection next, so it can keep the socket nonblocking
+// and discard TLS bytes without waiting for another complete record.
+connection_drain_input :: proc(conn: ^Connection, limit: int, timeout: time.Duration) {
+	if limit <= 0 || timeout <= 0 || !conn_io_enter(conn) {
+		return
+	}
+	defer conn_io_exit(conn)
+	sock := conn.socket
+	if net.set_blocking(sock, false) != nil {
+		return
+	}
+	deadline := time.time_add(time.now(), timeout)
+	remaining := limit
+	buf: [READ_BUF_SIZE]u8
+	for remaining > 0 {
+		left := time.diff(time.now(), deadline)
+		if left <= 0 || tls_wait_socket(conn, false, left) != .None {
+			return
+		}
+		n, err := tcp_recv(conn, sock, buf[:min(remaining, len(buf))])
+		if err != .None || n == 0 {
+			return
+		}
+		remaining -= n
+	}
+}
+
 // Wait until a read would not block (data, EOF or error) or timeout passes.
 // Lets a reader poll a stop flag instead of relying on shutdown() from
 // another thread to wake a blocking recv, which Windows does not promise.
@@ -382,7 +458,7 @@ connection_wait_readable :: proc(conn: ^Connection, timeout: time.Duration) -> T
 		return .Closed
 	}
 	defer conn_io_exit(conn)
-	return tls_wait_socket_impl(conn, false, timeout)
+	return tls_wait_socket(conn, false, timeout)
 }
 
 // Wake a reader or poller on another thread. Does not free TLS or the fd;
@@ -396,7 +472,13 @@ connection_shutdown_both :: proc(conn: ^Connection) {
 		return
 	}
 	sync.atomic_store(&conn.closed, true)
+	when ODIN_TEST {
+		tcp_trace_close(conn, "shutdown_both")
+	}
 	_ = net.shutdown(conn.socket, .Both)
+	if sync.atomic_load(&conn.io_inflight) > 1 {
+		connection_abort_io_impl(conn)
+	}
 }
 
 connection_destroy :: proc(conn: ^Connection, allocator := context.allocator) {
@@ -454,7 +536,7 @@ listener_wait_acceptable :: proc(l: ^Listener, timeout: time.Duration) -> Transp
 		return .Closed
 	}
 	tmp := Connection{socket = l.socket}
-	return tls_wait_socket_impl(&tmp, false, timeout)
+	return tls_wait_socket(&tmp, false, timeout)
 }
 
 listener_accept :: proc(l: ^Listener, allocator := context.allocator) -> (^Connection, TransportError) {

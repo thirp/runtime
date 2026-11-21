@@ -2,6 +2,12 @@
 
 Project version is independent of the wire protocol version. This tree speaks protocol 1.0. See [COMPATIBILITY.md](COMPATIBILITY.md).
 
+## 0.16.11
+
+- The agent sends keepalive probes after 15 seconds without an outbound write. A separate worker sends the probes so one-way uploads keep their broker session alive while the relay reader continues receiving data. If a readiness poll is interrupted before any probe bytes are sent, the worker defers the probe and keeps the session open.
+- The broker forwards both `HALF_CLOSE` frames when the two ends finish at the same time. This lets an affected `thirp-connect` bridge release its local socket.
+- A timed caller dial waiting for a `CONNECT` reply now returns `Timeout` and logs `reason=session_lost` when the send-stall timer closes the session. This matches the result when the `CONNECT` write is still pending.
+
 ## 0.16.10
 
 - `thirp-connect --caller-conf PATH` serves every enrolled caller link in one process, renews per-grant broker credentials, and rotates the enrollment token through verified HTTPS. Platforms regrants automatically; Support stops accepting at grant end and polls for human approval. Token rotation uses a synced atomic 0600 rewrite. Existing `--token` / `--token-file` behavior and protocol 1.0 are unchanged.

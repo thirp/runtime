@@ -200,8 +200,8 @@ test_service_absent_returns_503 :: proc(t: ^testing.T) {
 	head, body, ok := read_http_message(client)
 	defer delete(head)
 	defer delete(body)
-	testing.expect(t, ok)
-	testing.expect(t, strings.has_prefix(head, "HTTP/1.1 503 Service Unavailable\r\n"))
+	testing.expect(t, ok, head)
+	testing.expect(t, strings.has_prefix(head, "HTTP/1.1 503 Service Unavailable\r\n"), head)
 }
 
 @(test)
@@ -241,8 +241,8 @@ test_local_target_unavailable_returns_503 :: proc(t: ^testing.T) {
 	head, body, ok := read_http_message(client)
 	defer delete(head)
 	defer delete(body)
-	testing.expect(t, ok)
-	testing.expect(t, strings.has_prefix(head, "HTTP/1.1 503 Service Unavailable\r\n"))
+	testing.expect(t, ok, head)
+	testing.expect(t, strings.has_prefix(head, "HTTP/1.1 503 Service Unavailable\r\n"), head)
 }
 
 @(test)

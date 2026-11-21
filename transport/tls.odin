@@ -344,8 +344,20 @@ tls_poll_timeout_ms :: proc(timeout: time.Duration) -> c.int {
 	return c.int(ms)
 }
 
-tls_wait_socket :: proc(conn: ^Connection, want_write: bool, timeout: time.Duration) -> TransportError {
-	return tls_wait_socket_impl(conn, want_write, timeout)
+tls_wait_socket :: proc(conn: ^Connection, want_write: bool, timeout: time.Duration, defer_on_interrupt := false) -> TransportError {
+	err: TransportError
+	when ODIN_TEST {
+		if conn != nil && sync.atomic_exchange(&conn.test_interrupt_poll, false) {
+			err = .WouldBlock
+		}
+	}
+	if err == .None {
+		err = tls_wait_socket_impl(conn, want_write, timeout)
+	}
+	// The native wait reports interruption as WouldBlock. A keepalive can
+	// defer because it has not started a write. Other callers keep the
+	// existing error handling, including during a partial frame write.
+	return .Network if err == .WouldBlock && !defer_on_interrupt else err
 }
 
 tls_poll :: proc(conn: ^Connection, want_write: bool, timeout: time.Duration) -> TransportError {

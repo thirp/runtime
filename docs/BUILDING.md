@@ -151,6 +151,9 @@ odin test . -all-packages -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true
 
 The full command runs the protocol, transport, authentication, Broker, Agent,
 Caller, configuration, logging, version, C ABI, and Web Ingress tests.
+The SDK package-boundary test uses system Bash on Linux and macOS, including
+macOS's Bash 3.2. On Windows it uses Git for Windows Bash from its default
+installation directory or `bash.exe` on `PATH` for a custom installation.
 
 Odin's test runner tracks allocations but, by default, only prints `+++ leak`
 and still exits 0 (`ODIN_TEST_FAIL_ON_BAD_MEMORY` defaults to false in

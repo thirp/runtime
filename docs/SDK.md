@@ -100,6 +100,8 @@ TLS: omit `tls_ca` to verify the Broker against the system CA bundle. Set `tls_s
 
 The library takes a token string. Read `--token-file` yourself (mode `0600`). Do not pass long-lived secrets on a command line.
 
+A refused local TCP dial reports `LocalServiceUnavailable` to the Caller. Bounded loopback dials on Windows request immediate refusal from Winsock. The Agent's `local_dial_timeout` still bounds targets that do not respond.
+
 ## Caller
 
 `caller_init` dials the Broker, authenticates as Caller, and starts the session reader. There is no `caller_stop`; `caller_destroy` is shutdown. `dial` and `dial_join_code` return a `Conn` with blocking `conn_read` / `conn_write`. `conn_half_close` stops writes. `conn_close` / `conn_destroy` finish the stream.
@@ -128,6 +130,11 @@ The Caller reconnects the Broker session after transient loss. In-flight `Conn` 
 Agent: `unregister_service` for names you still own (optional courtesy), then `agent_stop`, join the `agent_run` thread, then `agent_destroy`. Destroy is idempotent with stop.
 
 Caller: `conn_close` / `conn_destroy` for live streams, then `caller_destroy`.
+
+Embedded Broker: call `server_stop` to stop accepting connections and signal
+connection handlers. After `server_wait_idle` returns `true`, the handlers
+have released their server-owned allocations. Call `server_destroy` before
+releasing the server's allocator or connection observer state.
 
 ## C ABI
 

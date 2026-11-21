@@ -16,7 +16,7 @@ tls_wait_socket_impl :: proc(conn: ^Connection, want_write: bool, timeout: time.
 		return .Timeout
 	}
 	if n < 0 {
-		return .Network
+		return .WouldBlock if posix.get_errno() == .EINTR else .Network
 	}
 	if .NVAL in pfd.revents {
 		conn.closed = true

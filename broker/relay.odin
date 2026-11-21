@@ -339,17 +339,22 @@ relay_add_stream_bytes :: proc(server: ^Server, stream_id: proto.StreamId, from:
 	server.streams[stream_id] = stream
 }
 
+// If requested, the destination is returned with a reference the caller releases.
 relay_apply :: proc(
 	server: ^Server,
 	stream_id: proto.StreamId,
 	event: StreamEvent,
 	from: StreamPeer,
+	peer_out: ^^trans.Connection = nil,
 ) -> (
 	RelayStream,
 	StreamError,
 ) {
 	sync.mutex_lock(&server.routing_mutex)
 	defer sync.mutex_unlock(&server.routing_mutex)
+	if peer_out != nil {
+		peer_out^ = nil
+	}
 	stream, found := server.streams[stream_id]
 	if !found {
 		return {}, .NotFound
@@ -367,6 +372,14 @@ relay_apply :: proc(
 		stream.last_activity = time.now()
 	}
 	server.streams[stream_id] = stream
+	if peer_out != nil {
+		// The opposite HALF_CLOSE can remove this row as soon as we
+		// unlock. Keep the destination alive so this EOF still reaches it.
+		peer := stream.caller_conn if from == .Agent else stream.agent_conn
+		if trans.connection_acquire(peer) {
+			peer_out^ = peer
+		}
+	}
 	return stream, .None
 }
 

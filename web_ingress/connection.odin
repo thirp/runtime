@@ -40,6 +40,7 @@ ingress_caller_dial :: proc(
 ingress_connection_proc :: proc(arg: ^IngressConnArg) {
 	server := arg.server
 	alloc := server.allocator
+	ip_key := arg.ip_key
 	defer {
 		ingress_live_remove(server, arg.live)
 		if arg.live != nil {
@@ -47,7 +48,7 @@ ingress_connection_proc :: proc(arg: ^IngressConnArg) {
 		}
 		trans.connection_destroy(arg.browser)
 		free(arg, alloc)
-		ingress_conn_end(server, arg.ip_key)
+		ingress_conn_end(server, ip_key)
 	}
 	ingress_handle_connection(server, arg.browser, arg.live, arg.conn_id)
 }

@@ -13,6 +13,20 @@ import "core:thread"
 import "core:time"
 
 when ODIN_TEST {
+// The dead endpoint stays pending for the agent's real local dial budget.
+// A loopback listen backlog does not drop SYNs consistently across kernels.
+// Healthy dials still go through the real TCP transport.
+DEAD_BACKEND_PORT :: 1
+
+liveness_local_dial :: proc(endpoint: net.Endpoint, timeout: time.Duration) -> (^trans.Connection, trans.TransportError) {
+	if endpoint.port != DEAD_BACKEND_PORT {
+		return trans.connection_dial_timeout(endpoint, timeout)
+	}
+	never_signaled: sync.Sema
+	_ = sync.sema_wait_with_timeout(&never_signaled, timeout)
+	return nil, .Timeout
+}
+
 // One dead backend must not take the caller's other services down with it.
 // The agent bounds the local dial, so the caller hears CONNECT_FAILED. If a
 // tombstone still outlives its cap while streams are open, new dials move
@@ -27,12 +41,11 @@ test_unreachable_backend_keeps_healthy_stream :: proc(t: ^testing.T) {
 	echo_ep := start_echo(t, &echo)
 	defer stop_echo(&echo)
 
-	sink := syn_sink_start(t)
-	defer syn_sink_stop(&sink)
-
 	agent: ag.Agent
 	run: AgentRunArg
-	ath := start_two_service_agent(t, &fx, &agent, &run, echo_ep, sink.ep)
+	ath := start_two_service_agent(
+		t, &fx, &agent, &run, echo_ep, trans.loopback_endpoint(DEAD_BACKEND_PORT), {test_local_dial = liveness_local_dial},
+	)
 	defer stop_agent(&agent, ath)
 
 	c: Caller
@@ -567,12 +580,11 @@ short_dial_dead_backend :: proc(t: ^testing.T, dt: time.Duration) {
 	echo_ep := start_echo(t, &echo)
 	defer stop_echo(&echo)
 
-	sink := syn_sink_start(t)
-	defer syn_sink_stop(&sink)
-
 	agent: ag.Agent
 	run: AgentRunArg
-	ath := start_two_service_agent(t, &fx, &agent, &run, echo_ep, sink.ep)
+	ath := start_two_service_agent(
+		t, &fx, &agent, &run, echo_ep, trans.loopback_endpoint(DEAD_BACKEND_PORT), {test_local_dial = liveness_local_dial},
+	)
 	defer stop_agent(&agent, ath)
 
 	c: Caller

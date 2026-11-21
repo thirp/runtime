@@ -89,13 +89,15 @@ conn_stop_outbox :: proc(h: ^ConnHandler) {
 }
 
 conn_thread_proc :: proc(h: ^ConnHandler) {
-	context.allocator = h.server.allocator
+	server := h.server
+	context.allocator = server.allocator
 	ip := ip_key_from_endpoint(h.conn.remote)
 	defer {
 		conn_stop_outbox(h)
 		conn_cleanup(h)
-		server_release_connection_slot(h.server, ip)
-		free(h, h.server.allocator)
+		free(h, server.allocator)
+		// Publish idle only after the handler has returned its last allocation.
+		server_release_connection_slot(server, ip)
 	}
 	if h.server.tls_ctx != nil {
 		if trans.connection_tls_accept(h.conn, h.server.tls_ctx) != .None {
@@ -345,6 +347,11 @@ conn_handle_hello :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 	}
 	h.implementation = msg.implementation
 	h.role = msg.role
+	when ODIN_TEST {
+		if h.role == .Agent && h.server.test_trace_agent_session {
+			trans.connection_trace_tcp(h.conn, .Broker)
+		}
+	}
 	ack := proto.HelloAck {
 		major            = proto.PROTOCOL_MAJOR,
 		minor            = proto.PROTOCOL_MINOR,
@@ -1018,27 +1025,28 @@ conn_handle_open_failed :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 }
 
 // Test hook. Production leaves pause and watch_close false, so both
-// procedures return without waiting. The race test arms pause so the
-// handler that applies the second HALF_CLOSE stops before it drops the
-// row. watch_close lets that test wait until a CLOSE has finished.
+// procedures return without waiting. Tests can stop a handler after it
+// applies the first or second HALF_CLOSE and before it forwards the frame.
+// watch_close lets a test wait until a CLOSE has finished.
 HalfClosePause :: struct {
 	mutex:       sync.Mutex,
 	cond:        sync.Cond,
 	pause:       bool,
+	terminal:    bool,
 	paused:      bool,
 	release:     bool,
 	watch_close: bool,
 	close_done:  bool,
 }
 
-half_close_terminal_pause :: proc(server: ^Server) {
+half_close_before_forward :: proc(server: ^Server, terminal: bool) {
 	if server == nil {
 		return
 	}
 	p := &server.half_close_pause
 	sync.mutex_lock(&p.mutex)
 	defer sync.mutex_unlock(&p.mutex)
-	if !p.pause {
+	if !p.pause || p.terminal != terminal {
 		return
 	}
 	p.paused = true
@@ -1096,7 +1104,8 @@ conn_handle_stream_frame :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 		return true
 	}
 
-	stream, err := relay_apply(h.server, frame.header.stream_id, event, from)
+	peer: ^trans.Connection
+	stream, err := relay_apply(h.server, frame.header.stream_id, event, from, &peer if event == .HalfClose else nil)
 	if err == .NotFound {
 		// The second HALF_CLOSE already ended this stream and recorded
 		// closed. A following CLOSE from the same connection is the old
@@ -1131,8 +1140,6 @@ conn_handle_stream_frame :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 		server_emit_connection(h.server, connection_event_from_stream(.Reset, stream, LABEL_PEER))
 	}
 
-	dest := stream_peer_opposite(from)
-	peer, _, ok := relay_acquire_peer(h.server, stream.id, dest)
 	// Terminal CLOSE/RESET must reach the peer. PR #3 called
 	// drop_stream_queues after enqueue, which deleted the frame that tells
 	// the agent to finish_stream — origin fds stayed open (N=256 → ~258
@@ -1148,21 +1155,21 @@ conn_handle_stream_frame :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 	// STREAM_NOT_FOUND for whatever frame followed the drop. Leave those
 	// frames queued and append this HALF_CLOSE after them.
 	terminal := stream_state_is_terminal(stream.state)
-	// State is already terminal and the row is still in the table. The
-	// race test parks this thread here so the other side's CLOSE is
-	// applied before the row is removed. Unarmed, this returns at once.
-	if terminal && event == .HalfClose {
-		half_close_terminal_pause(h.server)
+	if event == .HalfClose {
+		when ODIN_TEST {
+			half_close_before_forward(h.server, terminal)
+		}
+	} else {
+		peer, _, _ = relay_acquire_peer(h.server, stream.id, stream_peer_opposite(from))
 	}
 	if terminal && event != .HalfClose {
 		server_drop_stream_queues(h.server, stream)
 	}
-	if ok {
+	if peer != nil {
+		defer trans.connection_release(peer)
 		if !conn_enqueue_stream(h, peer, frame.header.opcode, frame.payload, frame.header.stream_id, from) {
-			trans.connection_release(peer)
 			return false
 		}
-		trans.connection_release(peer)
 	}
 	if terminal {
 		if event == .Close || event == .HalfClose {

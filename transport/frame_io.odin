@@ -9,6 +9,11 @@ write_frame :: proc(
 	stream_id: proto.StreamId = proto.CONNECTION_STREAM_ID,
 	allocator := context.allocator,
 ) -> (terr: TransportError, perr: proto.ProtocolError) {
+	when ODIN_TEST {
+		defer if opcode == .Ping && conn != nil {
+			tcp_trace_ping(conn, terr, perr)
+		}
+	}
 	header := proto.FrameHeader {
 		version   = proto.PROTOCOL_MAJOR,
 		opcode    = opcode,

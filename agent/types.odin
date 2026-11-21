@@ -7,6 +7,17 @@ import "core:net"
 import "core:sync"
 import "core:time"
 
+when ODIN_TEST {
+	Agent_Test_Config :: struct {
+		test_local_dial:           proc(net.Endpoint, time.Duration) -> (^trans.Connection, trans.TransportError),
+		test_legacy_heartbeat:     bool,
+		test_trace_broker_session: bool,
+		test_heartbeat_probe:      ^HeartbeatProbe,
+	}
+} else {
+	Agent_Test_Config :: struct {}
+}
+
 AgentError :: enum {
 	None,
 	InvalidConfig,
@@ -79,6 +90,7 @@ AgentConfig :: struct {
 	// 0 = DEFAULT_LOCAL_DIAL_TIMEOUT. Negative = block until the OS gives
 	// up. Odin-only: no agent CLI flag and no C field.
 	local_dial_timeout: time.Duration,
+	using test_config:  Agent_Test_Config,
 }
 
 LocalTarget :: struct {

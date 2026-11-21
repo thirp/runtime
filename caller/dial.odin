@@ -140,7 +140,12 @@ dial :: proc(c: ^Caller, service_id: proto.ServiceId) -> (^Conn, CallerError) {
 		if err == .None {
 			err = .Transport
 		}
+		stalled := stream.dial_stalled
 		sync.mutex_unlock(&c.mutex)
+		if stalled && timeout > 0 {
+			caller_log_connect_timeout(c, service_id, LOG_REASON_SESSION_LOST)
+			err = .Timeout
+		}
 		conn_release(stream)
 		return nil, err
 	}

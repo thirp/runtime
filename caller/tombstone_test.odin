@@ -573,13 +573,19 @@ start_two_service_agent :: proc(
 	agent: ^ag.Agent,
 	run: ^AgentRunArg,
 	ep_a, ep_b: net.Endpoint,
+	test_config: ag.Agent_Test_Config = {},
 	loc := #caller_location,
 ) -> ^thread.Thread {
 	testing.expect_value(
 		t,
 		ag.agent_init(
 			agent,
-			ag.AgentConfig{broker = broker_endpoint(t, fx, loc), token = TEST_TOKEN_HOST, insecure = true},
+			ag.AgentConfig {
+				broker = broker_endpoint(t, fx, loc),
+				token = TEST_TOKEN_HOST,
+				insecure = true,
+				test_config = test_config,
+			},
 		),
 		ag.AgentError.None,
 		loc,

@@ -118,6 +118,9 @@ Conn :: struct {
 	// Set when CONNECT_OK binds this stream. A dial whose slot was cleared
 	// and then reused must not treat pending_err == None as success.
 	accepted:     bool,
+	// Set under caller.mutex before a stalled session clears this dial's
+	// pending slot. The reader can consume disconnect_reason before dial wakes.
+	dial_stalled: bool,
 	// The owner holds one reference (conn_destroy drops it); the session
 	// reader takes one while it uses the stream, so the owner cannot free
 	// it under the reader.

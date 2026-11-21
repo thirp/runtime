@@ -7,6 +7,7 @@ import "core:bytes"
 import "core:fmt"
 import "core:sync"
 import "core:testing"
+import "core:thread"
 import "core:time"
 
 // The second HALF_CLOSE ends the stream. Frames already accepted for it
@@ -208,15 +209,15 @@ test_request_half_close_delivers_full_response :: proc(t: ^testing.T) {
 // STREAM_NOT_FOUND.
 @(test)
 test_half_close_then_close_records_closed_once :: proc(t: ^testing.T) {
+	clog: ConnectionLog
+	connection_log_init(&clog)
+	defer connection_log_destroy(&clog)
+
 	reg: Registry
 	store: auth.StaticTokenAuth
 	server: Server
 	quiet_test_server(t, &server, &reg, &store)
 	defer stop_test_server(&server, &store, &reg)
-
-	clog: ConnectionLog
-	connection_log_init(&clog)
-	defer connection_log_destroy(&clog)
 	server.connection_observer_ctx = &clog
 	server.connection_observer = observe_connection
 
@@ -494,15 +495,80 @@ test_agent_half_close_first_then_close :: proc(t: ^testing.T) {
 // wakes on the cond; it does not wait this long.
 HALF_CLOSE_PAUSE_FAIL :: 2 * time.Second
 
-arm_half_close_pause :: proc(server: ^Server) {
+arm_half_close_pause :: proc(server: ^Server, terminal := true) {
 	p := &server.half_close_pause
 	sync.mutex_lock(&p.mutex)
 	p.pause = true
+	p.terminal = terminal
 	p.paused = false
 	p.release = false
 	p.watch_close = true
 	p.close_done = false
 	sync.mutex_unlock(&p.mutex)
+}
+
+// Force the first HALF_CLOSE to resume forwarding only after the second
+// handler has removed the relay row. Each peer must still get its EOF.
+@(test)
+test_crossed_half_closes_reach_both_peers :: proc(t: ^testing.T) {
+	server: Server
+	server_init(&server, nil, {})
+	defer server_destroy(&server)
+
+	// One reference belongs to each connection owner and one to the row.
+	caller := trans.Connection{refs = 2}
+	agent := trans.Connection{refs = 2}
+	server.streams[SID_A] = RelayStream{id = SID_A, state = .Open, caller_conn = &caller, agent_conn = &agent}
+	caller_box := new(ConnOutbox)
+	outbox_init(caller_box, &caller, &server)
+	defer outbox_release(caller_box)
+	server_register_outbox(&server, &caller, caller_box)
+	agent_box := new(ConnOutbox)
+	outbox_init(agent_box, &agent, &server)
+	defer outbox_release(agent_box)
+	server_register_outbox(&server, &agent, agent_box)
+
+	caller_handler := ConnHandler{server = &server, conn = &caller, role = .Caller}
+	agent_handler := ConnHandler{server = &server, conn = &agent, role = .Agent}
+	half := proto.Frame{header = {opcode = .HalfClose, stream_id = SID_A}}
+	FirstHalfClose :: struct {
+		handler: ^ConnHandler,
+		frame: proto.Frame,
+	}
+	first := FirstHalfClose{handler = &agent_handler, frame = half}
+	{
+		arm_half_close_pause(&server, terminal = false)
+		th := thread.create_and_start_with_poly_data(&first, proc(arg: ^FirstHalfClose) {
+			_ = conn_handle_stream_frame(arg.handler, arg.frame)
+		})
+		defer {
+			release_half_close_pause(&server)
+			if th != nil {
+				thread.join(th)
+				thread.destroy(th)
+			}
+		}
+		if !testing.expect(t, th != nil, "agent handler thread") {
+			return
+		}
+		if !testing.expect(t, wait_half_close_flag(&server, true), "first HALF_CLOSE did not pause") {
+			return
+		}
+		_ = conn_handle_stream_frame(&caller_handler, half)
+		testing.expect_value(t, relay_stream_count(&server), 0)
+		testing.expect_value(t, outbox_queued(caller_box, SID_A), 0)
+	}
+
+	boxes := [2]^ConnOutbox{caller_box, agent_box}
+	for box in boxes {
+		frame, ok := outbox_take_next(box)
+		testing.expect(t, ok, "peer is missing its HALF_CLOSE")
+		testing.expect_value(t, frame.opcode, proto.Opcode.HalfClose)
+		testing.expect_value(t, frame.stream_id, SID_A)
+		delete(frame.payload)
+	}
+	testing.expect_value(t, caller.refs, 1)
+	testing.expect_value(t, agent.refs, 1)
 }
 
 arm_half_close_watch :: proc(server: ^Server) {

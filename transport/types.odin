@@ -8,6 +8,7 @@ import "core:time"
 Connection :: struct {
 	socket:        net.TCP_Socket,
 	write_mutex:   sync.Mutex,
+	last_write:    time.Tick, // last successful nonempty write, under write_mutex
 	closed:        bool,
 	refs:          int,
 	// Close/IO lifetime (all atomic). Every operation that touches socket or
@@ -32,9 +33,19 @@ Connection :: struct {
 	// production.
 	write_hook:    rawptr,
 	read_hook:     rawptr,
+	using _: ConnectionTestState,
 	// Set when the kernel aborts the socket with ETIMEDOUT (TCP_USER_TIMEOUT).
 	// A read-idle poll timeout does not set this.
 	user_timed_out: bool,
+}
+
+when ODIN_TEST {
+	ConnectionTestState :: struct {
+		test_tcp_trace:      TcpTraceSide,
+		test_interrupt_poll: bool, // atomic; consumed by the next readiness poll
+	}
+} else {
+	ConnectionTestState :: struct {}
 }
 
 TlsReadHook :: proc(conn: ^Connection)
