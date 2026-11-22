@@ -81,191 +81,184 @@ when ODIN_TEST {
 		stream, found := relay.streams[stream_id]
 		testing.expect(t, found && !stream.closed && stream.local == &origin && !origin.closed, "stream closed")
 	}
-}
 
-HeartbeatProbe :: struct {
-	armed:          bool, // atomic, set after the origin receives upload data
-	done:           sync.Sema,
-	recent_frame:   bool,
-	fault_observed: bool,
-}
-
-// The injected error affects only the legacy reader's Ping write.
-// The agent owns its real TCP session and must perform any disconnect;
-// nothing in the fixture closes that session to force the broker's RESET.
-@(test)
-test_agent_slow_upload_survives_heartbeat_write_fault :: proc(t: ^testing.T) {
-	slow_upload_heartbeat_case(t, true)
-	slow_upload_heartbeat_case(t, false)
-}
-
-@(test)
-test_agent_one_way_upload_keeps_outbound_session_alive :: proc(t: ^testing.T) {
-	testing.set_fail_timeout(t, 60 * time.Second)
-	slow_upload_heartbeat_case(t, false, paced = true)
-}
-
-slow_upload_heartbeat_case :: proc(t: ^testing.T, legacy: bool, paced := false) {
-	origin_listener, lerr := trans.listener_listen(trans.loopback_endpoint(0))
-	if !testing.expect_value(t, lerr, trans.TransportError.None) {
-		return
+	// The injected error affects only the legacy reader's Ping write.
+	// The agent owns its real TCP session and must perform any disconnect;
+	// nothing in the fixture closes that session to force the broker's RESET.
+	@(test)
+	test_agent_slow_upload_survives_heartbeat_write_fault :: proc(t: ^testing.T) {
+		slow_upload_heartbeat_case(t, true)
+		slow_upload_heartbeat_case(t, false)
 	}
-	defer trans.listener_close(&origin_listener)
-	origin_ep, eerr := trans.listener_endpoint(origin_listener)
-	if !testing.expect_value(t, eerr, trans.TransportError.None) {
-		return
+
+	@(test)
+	test_agent_one_way_upload_keeps_outbound_session_alive :: proc(t: ^testing.T) {
+		testing.set_fail_timeout(t, 60 * time.Second)
+		slow_upload_heartbeat_case(t, false, paced = true)
 	}
-	fx: TestBroker
-	start_test_broker(t, &fx, heartbeat = 60 * time.Second if paced else 30 * time.Second)
-	defer stop_test_broker(&fx)
-	probe: HeartbeatProbe
-	agent: Agent
-	logger: log.Logger
-	log.logger_init(&logger, .Debug)
-	cfg := AgentConfig {
-		broker   = broker_endpoint(t, &fx),
-		token    = TEST_TOKEN_HOST,
-		insecure = true,
-		logger   = &logger,
-	}
-	when ODIN_TEST {
-		cfg.test_legacy_heartbeat = legacy
+
+	slow_upload_heartbeat_case :: proc(t: ^testing.T, legacy: bool, paced := false) {
+		origin_listener, lerr := trans.listener_listen(trans.loopback_endpoint(0))
+		if !testing.expect_value(t, lerr, trans.TransportError.None) {
+			return
+		}
+		defer trans.listener_close(&origin_listener)
+		origin_ep, eerr := trans.listener_endpoint(origin_listener)
+		if !testing.expect_value(t, eerr, trans.TransportError.None) {
+			return
+		}
+		fx: TestBroker
+		start_test_broker(t, &fx, heartbeat = 60 * time.Second if paced else 30 * time.Second)
+		defer stop_test_broker(&fx)
+		probe: HeartbeatProbe
+		agent: Agent
+		logger: log.Logger
+		log.logger_init(&logger, .Debug)
+		cfg := AgentConfig {
+			broker   = broker_endpoint(t, &fx),
+			token    = TEST_TOKEN_HOST,
+			insecure = true,
+			logger   = &logger,
+		}
+		when ODIN_TEST {
+			cfg.test_legacy_heartbeat = legacy
+			if !paced {
+				cfg.test_heartbeat_probe = &probe
+			}
+		}
+		err := agent_init(&agent, cfg)
+		if !testing.expect_value(t, err, AgentError.None) {
+			return
+		}
+		defer agent_destroy(&agent)
+		service := must_service(t, TEST_SERVICE)
+		testing.expect_value(t, register_service(&agent, service, LocalTarget{address = origin_ep}), AgentError.None)
+		run := AgentRunArg{agent = &agent}
+		th := thread.create_and_start_with_poly_data(&run, agent_run_proc)
+		if !testing.expect(t, th != nil, "agent thread") {
+			return
+		}
+		defer {
+			agent_stop(&agent)
+			thread.join(th)
+			thread.destroy(th)
+		}
+		wait_agent_connected(t, &agent)
+		sync.mutex_lock(&agent.mutex)
+		session := agent.live_conn
+		held := trans.connection_acquire(session)
+		sync.mutex_unlock(&agent.mutex)
+		if !testing.expect(t, held, "no original agent session") {
+			return
+		}
+		defer trans.connection_release(session)
+
+		caller := dial_broker(t, &fx)
+		if caller == nil {
+			return
+		}
+		defer trans.connection_destroy(caller)
+		dec: proto.FrameDecoder
+		handshake_caller(t, caller, &dec)
+		defer proto.decoder_destroy(&dec)
+		stream := caller_connect_ok(t, caller, &dec, TEST_SERVICE)
+		if !testing.expect(t, stream != proto.CONNECTION_STREAM_ID, "upload stream did not open") {
+			return
+		}
+		if !testing.expect_value(t, trans.listener_wait_acceptable(&origin_listener, 2 * time.Second), trans.TransportError.None) {
+			return
+		}
+		origin, aerr := trans.listener_accept(&origin_listener)
+		if !testing.expect_value(t, aerr, trans.TransportError.None) {
+			return
+		}
+		defer trans.connection_destroy(origin)
+		_ = trans.connection_set_recv_timeout(origin, 2 * time.Second)
+		// Read the first upload byte, then hold the origin before the body.
+		// This also proves the relay handled genuine inbound DATA before the
+		// test advances the heartbeat schedule at its next normal read timeout.
+		must_write(t, caller, .Data, []u8{'S'}, stream)
+		first: [1]u8
+		n, rerr := trans.connection_read(origin, first[:])
+		if !testing.expect(t, rerr == .None && n == 1 && first[0] == 'S', "origin did not start the upload") {
+			return
+		}
+		when ODIN_TEST {
+			if !legacy && !paced {
+				// Drive one worker iteration on the live session. The same
+				// stream and origin socket must still carry the body and reply.
+				sync.atomic_store(&session.test_interrupt_poll, true)
+				next, keep_running := agent_keepalive_probe(&agent, session, 1, idle = 0)
+				consumed := !sync.atomic_exchange(&session.test_interrupt_poll, false)
+				if !testing.expect(t, consumed && keep_running && next == HEARTBEAT_WRITE_TIMEOUT, "agent did not defer the interrupted probe") {
+					return
+				}
+			}
+		}
+		if paced {
+			// The origin sends nothing for longer than the broker's 30 s
+			// session timeout. Check the next byte each second so replacing the
+			// session or losing the stream cannot pass by reconnecting.
+			for tick in 0 ..< 33 {
+				time.sleep(time.Second)
+				b := u8(tick)
+				must_write(t, caller, .Data, []u8{b}, stream)
+				n, rerr = trans.connection_read(origin, first[:])
+				if !testing.expectf(t, rerr == .None && n == 1 && first[0] == b, "upload lost at second %d (%v)", tick + 1, rerr) {
+					return
+				}
+			}
+		}
+		body: [16 * 1024]u8
+		for &b in body {
+			b = 'x'
+		}
+		must_write(t, caller, .Data, body[:], stream)
 		if !paced {
-			cfg.test_heartbeat_probe = &probe
-		}
-	}
-	err := agent_init(&agent, cfg)
-	if !testing.expect_value(t, err, AgentError.None) {
-		return
-	}
-	defer agent_destroy(&agent)
-	service := must_service(t, TEST_SERVICE)
-	testing.expect_value(t, register_service(&agent, service, LocalTarget{address = origin_ep}), AgentError.None)
-	run := AgentRunArg{agent = &agent}
-	th := thread.create_and_start_with_poly_data(&run, agent_run_proc)
-	if !testing.expect(t, th != nil, "agent thread") {
-		return
-	}
-	defer {
-		agent_stop(&agent)
-		thread.join(th)
-		thread.destroy(th)
-	}
-	wait_agent_connected(t, &agent)
-	sync.mutex_lock(&agent.mutex)
-	session := agent.live_conn
-	held := trans.connection_acquire(session)
-	sync.mutex_unlock(&agent.mutex)
-	if !testing.expect(t, held, "no original agent session") {
-		return
-	}
-	defer trans.connection_release(session)
-
-	caller := dial_broker(t, &fx)
-	if caller == nil {
-		return
-	}
-	defer trans.connection_destroy(caller)
-	dec: proto.FrameDecoder
-	handshake_caller(t, caller, &dec)
-	defer proto.decoder_destroy(&dec)
-	stream := caller_connect_ok(t, caller, &dec, TEST_SERVICE)
-	if !testing.expect(t, stream != proto.CONNECTION_STREAM_ID, "upload stream did not open") {
-		return
-	}
-	if !testing.expect_value(t, trans.listener_wait_acceptable(&origin_listener, 2 * time.Second), trans.TransportError.None) {
-		return
-	}
-	origin, aerr := trans.listener_accept(&origin_listener)
-	if !testing.expect_value(t, aerr, trans.TransportError.None) {
-		return
-	}
-	defer trans.connection_destroy(origin)
-	_ = trans.connection_set_recv_timeout(origin, 2 * time.Second)
-	// Read the first upload byte, then hold the origin before the body.
-	// This also proves the relay handled genuine inbound DATA before the
-	// test advances the heartbeat schedule at its next normal read timeout.
-	must_write(t, caller, .Data, []u8{'S'}, stream)
-	first: [1]u8
-	n, rerr := trans.connection_read(origin, first[:])
-	if !testing.expect(t, rerr == .None && n == 1 && first[0] == 'S', "origin did not start the upload") {
-		return
-	}
-	when ODIN_TEST {
-		if !legacy && !paced {
-			// Drive one worker iteration on the live session. The same
-			// stream and origin socket must still carry the body and reply.
-			sync.atomic_store(&session.test_interrupt_poll, true)
-			next, keep_running := agent_keepalive_probe(&agent, session, 1, idle = 0)
-			consumed := !sync.atomic_exchange(&session.test_interrupt_poll, false)
-			if !testing.expect(t, consumed && keep_running && next == HEARTBEAT_WRITE_TIMEOUT, "agent did not defer the interrupted probe") {
+			sync.atomic_store(&probe.armed, true)
+			if !testing.expect(t, sync.sema_wait_with_timeout(&probe.done, 2 * time.Second), "no relay read timeout during upload") {
 				return
 			}
+			testing.expect(t, probe.recent_frame, "probe ran without recent inbound traffic")
+			testing.expect_value(t, probe.fault_observed, legacy)
 		}
-	}
-	if paced {
-		// The origin sends nothing for longer than the broker's 30 s
-		// session timeout. Check the next byte each second so replacing the
-		// session or losing the stream cannot pass by reconnecting.
-		for tick in 0 ..< 33 {
-			time.sleep(time.Second)
-			b := u8(tick)
-			must_write(t, caller, .Data, []u8{b}, stream)
-			n, rerr = trans.connection_read(origin, first[:])
-			if !testing.expectf(t, rerr == .None && n == 1 && first[0] == b, "upload lost at second %d (%v)", tick + 1, rerr) {
+		if legacy {
+			reset := must_read_opcode(t, caller, &dec, .Reset)
+			defer proto.frame_destroy(&reset)
+			testing.expect_value(t, reset.header.stream_id, stream)
+			failure, ferr := proto.decode_wire_failure(reset.payload)
+			defer delete(failure.diagnostic)
+			testing.expect_value(t, ferr, proto.ProtocolError.None)
+			code, _ := proto.wire_error_from_u16(failure.code)
+			testing.expect_value(t, code, proto.WireError.AgentUnavailable)
+			testing.expect(t, sync.atomic_load(&session.closed), "agent left the failed session open")
+			fmt.printf("slow upload heartbeat old condition: injected Ping write Timeout=%v, caller received %s\n", probe.fault_observed, proto.wire_error_name(code))
+			return
+		}
+		got: [len(body)]u8
+		for total := 0; total < len(got); {
+			count, read_err := trans.connection_read(origin, got[total:])
+			if !testing.expect_value(t, read_err, trans.TransportError.None) {
 				return
 			}
+			total += count
 		}
+		testing.expect_value(t, string(got[:]), string(body[:]))
+		must_write(t, caller, .HalfClose, nil, stream)
+		_, eof := trans.connection_read(origin, first[:])
+		testing.expect_value(t, eof, trans.TransportError.Closed)
+		response := "received"
+		testing.expect_value(t, trans.connection_write(origin, transmute([]u8)response), trans.TransportError.None)
+		reply := must_read_opcode(t, caller, &dec, .Data)
+		defer proto.frame_destroy(&reply)
+		testing.expect_value(t, reply.header.stream_id, stream)
+		testing.expect_value(t, string(reply.payload), response)
+		sync.mutex_lock(&agent.mutex)
+		same := agent.connected && agent.live_conn == session && !sync.atomic_load(&session.closed)
+		sync.mutex_unlock(&agent.mutex)
+		testing.expect(t, same, "agent session changed during the upload")
+		fmt.printf("slow upload heartbeat current condition: %d body bytes, origin reply %q, same agent session=%v\n", len(body), string(reply.payload), same)
 	}
-	body: [16 * 1024]u8
-	for &b in body {
-		b = 'x'
-	}
-	must_write(t, caller, .Data, body[:], stream)
-	if !paced {
-		sync.atomic_store(&probe.armed, true)
-		if !testing.expect(t, sync.sema_wait_with_timeout(&probe.done, 2 * time.Second), "no relay read timeout during upload") {
-			return
-		}
-		testing.expect(t, probe.recent_frame, "probe ran without recent inbound traffic")
-		testing.expect_value(t, probe.fault_observed, legacy)
-	}
-	if legacy {
-		reset := must_read_opcode(t, caller, &dec, .Reset)
-		defer proto.frame_destroy(&reset)
-		testing.expect_value(t, reset.header.stream_id, stream)
-		failure, ferr := proto.decode_wire_failure(reset.payload)
-		defer delete(failure.diagnostic)
-		testing.expect_value(t, ferr, proto.ProtocolError.None)
-		code, _ := proto.wire_error_from_u16(failure.code)
-		testing.expect_value(t, code, proto.WireError.AgentUnavailable)
-		testing.expect(t, sync.atomic_load(&session.closed), "agent left the failed session open")
-		fmt.printf("slow upload heartbeat old condition: injected Ping write Timeout=%v, caller received %s\n", probe.fault_observed, proto.wire_error_name(code))
-		return
-	}
-	got: [len(body)]u8
-	for total := 0; total < len(got); {
-		count, read_err := trans.connection_read(origin, got[total:])
-		if !testing.expect_value(t, read_err, trans.TransportError.None) {
-			return
-		}
-		total += count
-	}
-	testing.expect_value(t, string(got[:]), string(body[:]))
-	must_write(t, caller, .HalfClose, nil, stream)
-	_, eof := trans.connection_read(origin, first[:])
-	testing.expect_value(t, eof, trans.TransportError.Closed)
-	response := "received"
-	testing.expect_value(t, trans.connection_write(origin, transmute([]u8)response), trans.TransportError.None)
-	reply := must_read_opcode(t, caller, &dec, .Data)
-	defer proto.frame_destroy(&reply)
-	testing.expect_value(t, reply.header.stream_id, stream)
-	testing.expect_value(t, string(reply.payload), response)
-	sync.mutex_lock(&agent.mutex)
-	same := agent.connected && agent.live_conn == session && !sync.atomic_load(&session.closed)
-	sync.mutex_unlock(&agent.mutex)
-	testing.expect(t, same, "agent session changed during the upload")
-	fmt.printf("slow upload heartbeat current condition: %d body bytes, origin reply %q, same agent session=%v\n", len(body), string(reply.payload), same)
 }
 
 // Exercise the production 45s watchdog. Existing proxy splices stay open

@@ -2,6 +2,11 @@
 
 Project version is independent of the wire protocol version. This tree speaks protocol 1.0. See [COMPATIBILITY.md](COMPATIBILITY.md).
 
+## 0.16.12
+
+- The broker closes and frees a connection if accept succeeds during shutdown, fixing the socket and memory leak (#42).
+- Dependent packages can build their Odin tests against Runtime without including Runtime's test files. The agent's test configuration can now resolve `HeartbeatProbe` in that build.
+
 ## 0.16.11
 
 - The agent sends keepalive probes after 15 seconds without an outbound write. A separate worker sends the probes so one-way uploads keep their broker session alive while the relay reader continues receiving data. If a readiness poll is interrupted before any probe bytes are sent, the worker defers the probe and keeps the session open.

@@ -8,6 +8,13 @@ import "core:sync"
 import "core:time"
 
 when ODIN_TEST {
+	HeartbeatProbe :: struct {
+		armed:          bool, // atomic, set after the origin receives upload data
+		done:           sync.Sema,
+		recent_frame:   bool,
+		fault_observed: bool,
+	}
+
 	Agent_Test_Config :: struct {
 		test_local_dial:           proc(net.Endpoint, time.Duration) -> (^trans.Connection, trans.TransportError),
 		test_legacy_heartbeat:     bool,

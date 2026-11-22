@@ -337,27 +337,42 @@ test_open_during_register_backoff_keeps_session :: proc(t: ^testing.T) {
 		return
 	}
 
-	live_i := -1
+	live_service: proto.ServiceId
+	live_session := brk.INVALID_SESSION_ID
 	for i in 0 ..< N {
 		name := fmt.tprintf("demo/open%02d", i)
-		if _, found := brk.lookup_service_for_environment(&fx.reg, "", must_service(t, name), "org/dev"); found {
-			live_i = i
+		id := must_service(t, name)
+		if registration, found := brk.lookup_service_for_environment(&fx.reg, "", id, "org/dev"); found {
+			live_service = id
+			live_session = registration.agent_session
 			break
 		}
 	}
-	testing.expect(t, live_i >= 0)
-	if live_i < 0 {
+	if !testing.expect(t, live_session != brk.INVALID_SESSION_ID) {
 		return
 	}
 	testing.expect(t, !agent_is_connected(&agent))
-	expect_connect_failed(t, &fx, fmt.tprintf("demo/open%02d", live_i), proto.WireError.LocalServiceUnavailable)
+	expect_connect_failed(t, &fx, string(live_service), proto.WireError.LocalServiceUnavailable)
 
-	start = time.now()
-	for time.since(start) < 15 * time.Second && brk.service_count(&fx.reg) < N {
-		time.sleep(20 * time.Millisecond)
+	// The broker updates its registry before sending the final RegisterOk.
+	// Wait for the agent to consume that reply and publish connected.
+	deadline := time.tick_add(time.tick_now(), 15 * time.Second)
+	sync.mutex_lock(&agent.mutex)
+	for !agent.connected {
+		remaining := time.tick_diff(time.tick_now(), deadline)
+		if !sync.cond_wait_with_timeout(&agent.cond, &agent.mutex, remaining) {
+			break
+		}
 	}
+	connected := agent.connected
+	sync.mutex_unlock(&agent.mutex)
+
 	testing.expect_value(t, brk.service_count(&fx.reg), N)
-	testing.expect(t, agent_is_connected(&agent))
+	testing.expect(t, connected, "agent did not complete registration")
+	registration, found := brk.lookup_service_for_environment(&fx.reg, "", live_service, "org/dev")
+	if testing.expect(t, found, "original service is missing after registration") {
+		testing.expect_value(t, registration.agent_session, live_session)
+	}
 	_, sessions, _ := brk.registry_metrics(&fx.reg)
 	testing.expect_value(t, sessions, 1)
 }

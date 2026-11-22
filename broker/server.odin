@@ -20,6 +20,8 @@ BROKER_IMPLEMENTATION :: "thirp-broker"
 when ODIN_TEST {
 	ServerTestTrace :: struct {
 		test_trace_agent_session: bool,
+		test_accept:              proc(server: ^Server, data: rawptr) -> (^trans.Connection, trans.TransportError),
+		test_accept_data:         rawptr,
 	}
 } else {
 	ServerTestTrace :: struct {}
@@ -145,26 +147,37 @@ server_start :: proc(server: ^Server) {
 	server.serve_thread = thread.create_and_start_with_poly_data(server, server_serve)
 }
 
+@(private)
+server_accept :: proc(server: ^Server) -> (^trans.Connection, trans.TransportError) {
+	when ODIN_TEST {
+		if server.test_accept != nil {
+			return server.test_accept(server, server.test_accept_data)
+		}
+	}
+	return trans.listener_accept(&server.listener, server.allocator)
+}
+
 server_serve :: proc(server: ^Server) {
 	context.allocator = server.allocator
 	for {
 		if server.stop {
 			return
 		}
-		conn, err := trans.listener_accept(&server.listener, server.allocator)
-		if err == .Timeout {
-			continue
-		}
-		if server_accept_error_is_fatal(server, err) {
-			return
-		}
+		conn, err := server_accept(server)
 		if err != .None {
+			if err == .Timeout {
+				continue
+			}
+			if server_accept_error_is_fatal(server, err) {
+				return
+			}
 			metrics_inc_limit(&server.metrics, .FileDescriptors)
 			server_log(server, .Warn, LOG_EVENT_ACCEPT_FAILED, log.LogFields{reason = limit_kind_label(.FileDescriptors)})
 			time.sleep(ACCEPT_POLL_INTERVAL)
 			continue
 		}
 		if server.stop {
+			// The accept loop still owns the connection until it starts a handler.
 			trans.connection_destroy(conn, server.allocator)
 			return
 		}
