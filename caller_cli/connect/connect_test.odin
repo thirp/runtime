@@ -55,7 +55,7 @@ Upstream :: struct {
 	ln:          trans.Listener,
 	th:          ^thread.Thread,
 	live:        int,
-	stopped:     bool, // atomic: accept loop has returned
+	stop_accept: bool, // atomic: request the accept loop to exit
 	closed_seen: int, // atomic
 	waiting:     int, // atomic
 	release:     bool, // atomic
@@ -179,9 +179,12 @@ fixture_start :: proc(t: ^testing.T, fx: ^Fixture, agent_cfg: ag.AgentConfig = {
 	fx.broker = strings.clone(net.endpoint_to_string(bep, context.temp_allocator))
 
 	lerr: trans.TransportError
-	fx.up.ln, lerr = trans.listener_listen(trans.loopback_endpoint(0))
-	testing.expect_value(t, lerr, trans.TransportError.None)
-	_ = trans.listener_set_recv_timeout(&fx.up.ln, 50 * time.Millisecond)
+	fx.up.ln, lerr = trans.test_listener_listen(trans.loopback_endpoint(0))
+	if !testing.expect_value(t, lerr, trans.TransportError.None) ||
+	   !testing.expect_value(t, net.set_blocking(fx.up.ln.socket, false), net.Set_Blocking_Error.None) {
+		fixture_stop(fx)
+		return false
+	}
 	// Small upstream receive buffers (inherited by accepted sockets) so the
 	// slow-sink replay is not absorbed by loopback socket buffering. Not on
 	// Windows: there an explicit small SO_RCVBUF on a loopback receiver lets
@@ -277,11 +280,7 @@ fixture_stop :: proc(fx: ^Fixture) {
 		thread.destroy(fx.agent_th)
 	}
 	ag.agent_destroy(&fx.agent)
-	trans.listener_close(&fx.up.ln)
-	if fx.up.th != nil {
-		thread.join(fx.up.th)
-		thread.destroy(fx.up.th)
-	}
+	upstream_stop_accept(&fx.up)
 	for sync.atomic_load(&fx.up.live) != 0 {
 		time.sleep(1 * time.Millisecond)
 	}
@@ -309,13 +308,25 @@ UpConnArg :: struct {
 }
 
 upstream_accept :: proc(up: ^Upstream) {
-	defer sync.atomic_store(&up.stopped, true)
-	for {
+	for !sync.atomic_load(&up.stop_accept) {
+		ready := trans.listener_wait_acceptable(&up.ln, ACCEPT_POLL)
+		if ready == .Timeout {
+			continue
+		}
+		if ready != .None || sync.atomic_load(&up.stop_accept) {
+			return
+		}
+		// The listener is nonblocking in case readiness goes away before
+		// accept. Accepted sockets still serve blocking upstream traffic.
 		conn, err := trans.listener_accept(&up.ln)
 		if err == .Timeout {
 			continue
 		}
 		if err != .None {
+			return
+		}
+		if net.set_blocking(conn.socket, true) != .None {
+			trans.connection_destroy(conn)
 			return
 		}
 		_ = trans.connection_set_recv_timeout(conn, 0)
@@ -324,6 +335,18 @@ upstream_accept :: proc(up: ^Upstream) {
 		arg.conn = conn
 		sync.atomic_add(&up.live, 1)
 		thread.run_with_poly_data(arg, upstream_conn)
+	}
+}
+
+upstream_stop_accept :: proc(up: ^Upstream) {
+	sync.atomic_store(&up.stop_accept, true)
+	if up.th != nil {
+		thread.join(up.th)
+		thread.destroy(up.th)
+		up.th = nil
+	}
+	if up.ln.socket != 0 {
+		trans.listener_close(&up.ln)
 	}
 }
 
@@ -456,6 +479,8 @@ upstream_conn :: proc(arg: ^UpConnArg) {
 		}
 		reply := fmt.tprintf("got %d", total)
 		_ = trans.connection_write(conn, transmute([]u8)reply)
+		// Send FIN even if a parallel test's child inherited the origin socket.
+		_ = trans.connection_shutdown_write(conn)
 	case 'B':
 		for {
 			_, rerr := trans.connection_read(conn, buf[:])
@@ -1832,14 +1857,10 @@ test_post_storm_fds_and_streams_return_to_baseline :: proc(t: ^testing.T) {
 	// and the error class, and close the local socket. A stuck bridge would
 	// leave this read on its timeout. Wait until the accept thread has
 	// left, so a connection cannot still land in its in-flight accept.
-	trans.listener_close(&fx.up.ln)
-	stopped_at := time.now()
-	for !sync.atomic_load(&fx.up.stopped) {
-		if time.since(stopped_at) > 2 * time.Second {
-			testing.expect(t, false, "upstream accept did not stop")
-			return
-		}
-		time.sleep(1 * time.Millisecond)
+	stop_started := time.tick_now()
+	upstream_stop_accept(&fx.up)
+	if !testing.expect(t, time.tick_since(stop_started) <= 2 * time.Second, "upstream accept did not stop within 2s") {
+		return
 	}
 	target := net.endpoint_to_string(up_ep, context.temp_allocator)
 	refused := storm_dial(t, &ctl)
@@ -1852,15 +1873,28 @@ test_post_storm_fds_and_streams_return_to_baseline :: proc(t: ^testing.T) {
 	} else {
 		REFUSED_ORIGIN_TIMEOUT :: 2 * time.Second
 	}
-	_ = trans.connection_set_recv_timeout(refused, REFUSED_ORIGIN_TIMEOUT)
+	if !testing.expect_value(t, trans.connection_set_recv_timeout(refused, REFUSED_ORIGIN_TIMEOUT), trans.TransportError.None) {
+		connect_test_connection_destroy(refused)
+		return
+	}
 	_ = trans.connection_write(refused, body[:1])
 	buf: [32]u8
+	read_started := time.tick_now()
 	_, rerr := trans.connection_read(refused, buf[:])
+	read_elapsed := time.tick_since(read_started)
 	connect_test_connection_destroy(refused)
-	testing.expectf(t, rerr != .Timeout, "refused origin left the local client open (%v)", rerr)
-
 	logged := dial_log_text()
 	defer delete(logged)
+	if !testing.expectf(t, rerr != .Timeout, "refused origin left the local client open (%v after %v)", rerr, read_elapsed) {
+		streams, pumps, caller_streams, bridges, up_live, _, _ := storm_load(&fx, &ctl, up_port, listen_port)
+		direct, direct_err := trans.connection_dial_timeout(up_ep, REFUSED_ORIGIN_TIMEOUT)
+		trans.connection_destroy(direct)
+		fmt.printfln(
+			"refused origin %s: agent connected=%t streams=%d pumps=%d caller streams=%d bridges=%d upstream=%d direct dial=%v",
+			target, ag.agent_is_connected(&fx.agent), streams, pumps, caller_streams, bridges, up_live, direct_err,
+		)
+	}
+
 	want_event := fmt.tprintf("\"event\":\"%s\"", ag.LOG_EVENT_LOCAL_DIAL_FAILED)
 	want_class := fmt.tprintf("\"error_code\":\"%s\"", ag.ERROR_CLASS_NETWORK)
 	testing.expect(t, strings.contains(logged, want_event), "no local_dial_failed log")

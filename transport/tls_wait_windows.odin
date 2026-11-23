@@ -18,6 +18,7 @@ tls_wait_socket_impl :: proc(conn: ^Connection, want_write: bool, timeout: time.
 		return .WouldBlock if win.WSAGetLastError() == win.WSAEINTR else .Network
 	}
 	if pfd.revents & i16(win.POLLNVAL) != 0 {
+		connection_note_close(conn, .NetworkError)
 		conn.closed = true
 		return .Closed
 	}
@@ -25,9 +26,11 @@ tls_wait_socket_impl :: proc(conn: ^Connection, want_write: bool, timeout: time.
 	if ready {
 		return .None
 	}
-	if pfd.revents & i16(win.POLLHUP) != 0 || pfd.revents & i16(win.POLLERR) != 0 {
+	socket_error := pfd.revents & i16(win.POLLERR) != 0
+	if pfd.revents & i16(win.POLLHUP) != 0 || socket_error {
 		// HUP is the peer's FIN with nothing left to read. ERR is a dead socket.
-		if pfd.revents & i16(win.POLLERR) != 0 {
+		connection_note_close(conn, socket_pending_error_cause(conn, .NetworkError if socket_error else .PeerEOF))
+		if socket_error {
 			conn.closed = true
 		}
 		return .Closed

@@ -675,7 +675,12 @@ main :: proc() {
 	logger: log.Logger
 	log.logger_init(&logger, level)
 	server.logger = &logger
+	tls_reload: broker.TlsReloadWatcher
 	if !insecure {
+		if !broker.tls_reload_watcher_init(&tls_reload, &server, tls_cert, tls_key) {
+			fmt.eprintf("failed to initialize TLS reload\n")
+			os.exit(1)
+		}
 		ctx, terr := trans.tls_server_context_init(tls_cert, tls_key)
 		if terr != .None {
 			fmt.eprintf("failed to load TLS certificate or key\n")
@@ -719,7 +724,12 @@ main :: proc() {
 	}
 
 	broker_setup_interrupt(&server)
+	if !insecure && !broker.tls_reload_watcher_start(&tls_reload) {
+		fmt.eprintf("failed to start TLS reload watcher\n")
+		os.exit(1)
+	}
 	broker.server_serve(&server)
+	broker.tls_reload_watcher_destroy(&tls_reload)
 	broker.server_drain(&server, server.shutdown_grace)
 	_ = broker.server_wait_idle(&server, server.shutdown_grace + 2 * time.Second)
 	broker.server_destroy(&server)

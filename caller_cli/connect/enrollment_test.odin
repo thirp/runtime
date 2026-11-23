@@ -9,6 +9,27 @@ import "core:time"
 import log "../../logging"
 import private_file "private_file"
 
+@(test)
+test_enrollment_failure_log_limits_each_source_and_reason :: proc(t: ^testing.T) {
+	f: EnrollmentFixture
+	context.user_ptr = &f
+	enrollment_fixture_init(t, &f)
+	defer enrollment_fixture_destroy(&f)
+	start := time.tick_now()
+	for i in 0..<100 {
+		enrollment_failure(&f.e, "api", "tls_verify", at = time.tick_add(start, time.Duration(i)*time.Millisecond))
+	}
+	before_limit := time.tick_add(start, 10*time.Second-time.Nanosecond)
+	enrollment_failure(&f.e, "api", "tls_verify", at = before_limit)
+	enrollment_failure(&f.e, "broker", "tls_verify", at = before_limit)
+	enrollment_failure(&f.e, "api", "unauthorized_or_revoked", at = before_limit)
+	testing.expect_value(t, strings.count(string(f.logs[:]), `"reason":"tls_verify","phase":"api"`), 1)
+	testing.expect_value(t, strings.count(string(f.logs[:]), `"reason":"tls_verify","phase":"broker"`), 1)
+	testing.expect_value(t, strings.count(string(f.logs[:]), `"reason":"unauthorized_or_revoked","phase":"api"`), 1)
+	enrollment_failure(&f.e, "api", "tls_verify", at = time.tick_add(start, 10*time.Second))
+	testing.expect_value(t, strings.count(string(f.logs[:]), `"reason":"tls_verify","phase":"api"`), 2)
+}
+
 ENROLLMENT_TEST_CONF :: `api = https://api.example.test
 org = org-a
 environment =
@@ -52,22 +73,22 @@ enrollment_test_http :: proc(user: rawptr, _: ^EnrollmentConfig, req: Enrollment
 	append(&f.requests, EnrollmentTestRequest{strings.clone(req.method), strings.clone(req.path), strings.clone(req.bearer), strings.clone(req.body)})
 	if f.unavailable {return {}, .Retry}
 	ROOT :: ENROLLMENT_ORGS+"org-a"
-	if req.bearer != f.active_token && !(req.bearer == ENROLLMENT_TEST_TOKEN && f.at._nsec < f.overlap_end._nsec) {return {401, strings.clone(`{}`)}, .None}
+	if req.bearer != f.active_token && !(req.bearer == ENROLLMENT_TEST_TOKEN && f.at._nsec < f.overlap_end._nsec) {return {status = 401, body = strings.clone(`{}`)}, .None}
 	if req.path == ROOT+ENROLLMENT_SELF {
-		if f.deny_self {return {401, strings.clone(`{}`)}, .None}
-		return {200, fmt.aprintf(`{{"id":"enrollment-a","state":"active","expires_at":%q}}`, enrollment_test_stamp(f.expiry))}, .None
+		if f.deny_self {return {status = 401, body = strings.clone(`{}`)}, .None}
+		return {status = 200, body = fmt.aprintf(`{{"id":"enrollment-a","state":"active","expires_at":%q}}`, enrollment_test_stamp(f.expiry))}, .None
 	}
 	if req.path == ROOT+ENROLLMENT_SELF+ENROLLMENT_ROTATE {
 		f.rotated += 1
 		f.overlap_end = time.time_add(f.at, 24*time.Hour)
 		f.expiry = time.time_add(f.at, 90*24*time.Hour)
 		f.active_token = ENROLLMENT_TEST_NEW_TOKEN
-		return {200, fmt.aprintf(`{{"token":%q,"credential_id":"enrollment-credential-b","expires_at":%q,"previous_expires_at":%q}}`, f.active_token, enrollment_test_stamp(f.expiry), enrollment_test_stamp(f.overlap_end))}, .None
+		return {status = 200, body = fmt.aprintf(`{{"token":%q,"credential_id":"enrollment-credential-b","expires_at":%q,"previous_expires_at":%q}}`, f.active_token, enrollment_test_stamp(f.expiry), enrollment_test_stamp(f.overlap_end))}, .None
 	}
-	if f.deny_grant {return {403, strings.clone(`{}`)}, .None}
-	if req.path == ROOT {return {200, strings.clone(`{"plan_id":"platforms"}`)}, .None}
+	if f.deny_grant {return {status = 403, body = strings.clone(`{}`)}, .None}
+	if req.path == ROOT {return {status = 200, body = strings.clone(`{"plan_id":"platforms"}`)}, .None}
 	if strings.has_prefix(req.path, ROOT+ENROLLMENT_GRANTS) && req.method == ENROLLMENT_GET {
-		if f.paginate && !strings.contains(req.path, "cursor=") {return {200, strings.clone(`{"items":[],"next_cursor":"page /+2"}`)}, .None}
+		if f.paginate && !strings.contains(req.path, "cursor=") {return {status = 200, body = strings.clone(`{"items":[],"next_cursor":"page /+2"}`)}, .None}
 		parts: [dynamic]string
 		defer {for part in parts {delete(part)}; delete(parts)}
 		for g in f.grants {
@@ -75,17 +96,17 @@ enrollment_test_http :: proc(user: rawptr, _: ^EnrollmentConfig, req: Enrollment
 		}
 		joined := strings.join(parts[:], ",")
 		defer delete(joined)
-		return {200, fmt.aprintf(`{{"items":[%s]}}`, joined)}, .None
+		return {status = 200, body = fmt.aprintf(`{{"items":[%s]}}`, joined)}, .None
 	}
 	if req.path == ROOT+ENROLLMENT_REQUESTS {
 		f.created += 1
-		return {201, strings.clone(`{"id":"request-a"}`)}, .None
+		return {status = 201, body = strings.clone(`{"id":"request-a"}`)}, .None
 	}
 	if req.path == ROOT+ENROLLMENT_REQUESTS+"/request-a"+ENROLLMENT_APPROVE {
 		f.approved += 1
 		g := EnrollmentTestGrant{id = "grant-new", catalog = "svc-a", from = f.at, until = time.time_add(f.at, 8*time.Hour)}
 		append(&f.grants, g)
-		return {200, fmt.aprintf(`{{"grants":[{{"id":%q,"catalog_service_id":%q,"service_id":"demo/service","environment_id":"","state":"active","valid_from":%q,"valid_until":%q}}]}}`, g.id, g.catalog, enrollment_test_stamp(g.from), enrollment_test_stamp(g.until))}, .None
+		return {status = 200, body = fmt.aprintf(`{{"grants":[{{"id":%q,"catalog_service_id":%q,"service_id":"demo/service","environment_id":"","state":"active","valid_from":%q,"valid_until":%q}}]}}`, g.id, g.catalog, enrollment_test_stamp(g.from), enrollment_test_stamp(g.until))}, .None
 	}
 	for g in f.grants {
 		base := fmt.tprintf("%s%s/%s%s", ROOT, ENROLLMENT_GRANTS, g.id, ENROLLMENT_CREDENTIALS)
@@ -93,16 +114,16 @@ enrollment_test_http :: proc(user: rawptr, _: ^EnrollmentConfig, req: Enrollment
 			f.minted += 1
 			exp := time.time_add(f.at, 15*time.Minute)
 			if exp._nsec > g.until._nsec {exp = g.until}
-			return {201, fmt.aprintf(`{{"token":%q,"credential_id":"credential-a","expires_at":%q}}`, ENROLLMENT_TEST_GRANT_TOKEN, enrollment_test_stamp(exp))}, .None
+			return {status = 201, body = fmt.aprintf(`{{"token":%q,"credential_id":"credential-a","expires_at":%q}}`, ENROLLMENT_TEST_GRANT_TOKEN, enrollment_test_stamp(exp))}, .None
 		}
 		if req.path == fmt.tprintf("%s/credential-a%s", base, ENROLLMENT_RENEW) {
 			f.renewed += 1
 			exp := time.time_add(f.at, 15*time.Minute)
 			if exp._nsec > g.until._nsec {exp = g.until}
-			return {200, fmt.aprintf(`{{"credential_id":"credential-a","expires_at":%q}}`, enrollment_test_stamp(exp))}, .None
+			return {status = 200, body = fmt.aprintf(`{{"credential_id":"credential-a","expires_at":%q}}`, enrollment_test_stamp(exp))}, .None
 		}
 	}
-	return {404, strings.clone(`{}`)}, .None
+	return {status = 404, body = strings.clone(`{}`)}, .None
 }
 
 enrollment_fixture_init :: proc(t: ^testing.T, f: ^EnrollmentFixture, support := false) {
@@ -136,7 +157,7 @@ enrollment_fixture_destroy :: proc(f: ^EnrollmentFixture) {
 		enrollment_reap(&f.e, &l)
 		delete(l.retired)
 	}
-	delete(f.e.links); delete(f.e.token); delete(f.e.pending_token)
+	delete(f.e.links); delete(f.e.token); delete(f.e.pending_token); delete(f.e.failure_next)
 	for r in f.requests {delete(r.method); delete(r.path); delete(r.bearer); delete(r.body)}
 	delete(f.requests); delete(f.grants); delete(f.logs)
 	if len(f.dir) > 0 {

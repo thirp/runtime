@@ -8,6 +8,15 @@ import "core:sync"
 import "core:time"
 
 dial :: proc(c: ^Caller, service_id: proto.ServiceId) -> (^Conn, CallerError) {
+	return caller_dial(c, service_id, true)
+}
+
+// Open a stream on the admitted session. Never queue a client for reconnect.
+dial_on_session :: proc(c: ^Caller, service_id: proto.ServiceId) -> (^Conn, CallerError) {
+	return caller_dial(c, service_id, false)
+}
+
+caller_dial :: proc(c: ^Caller, service_id: proto.ServiceId, wait_for_session: bool) -> (^Conn, CallerError) {
 	if c == nil {
 		return nil, .InvalidConfig
 	}
@@ -23,7 +32,14 @@ dial :: proc(c: ^Caller, service_id: proto.ServiceId) -> (^Conn, CallerError) {
 	start := time.now()
 	timeout := c.config.dial_timeout
 	sync.mutex_lock(&c.mutex)
-	for (c.pending != nil || c.pending_tombstone || !c.connected) && !sync.atomic_load(&c.stop) {
+	gen := c.conn_gen
+	for !sync.atomic_load(&c.stop) {
+		if !wait_for_session && (!c.connected || c.conn == nil || c.conn_gen != gen) {
+			sync.mutex_unlock(&c.mutex)
+			conn_release(stream)
+			return nil, .Closed
+		}
+		if c.pending == nil && !c.pending_tombstone && c.connected {break}
 		if !dial_wait(c, start, timeout) {
 			reason := dial_failure_reason_locked(c, c.conn, 0, false)
 			sync.mutex_unlock(&c.mutex)
@@ -45,9 +61,9 @@ dial :: proc(c: ^Caller, service_id: proto.ServiceId) -> (^Conn, CallerError) {
 		return nil, .Timeout
 	}
 	c.pending = stream
-	c.pending_err = .None
+	c.idle_since = {}
 	broker := c.conn
-	gen := c.conn_gen
+	gen = c.conn_gen
 	recv_at := c.recv_gen
 	// The write below compares this pointer. Hold a reference so a new
 	// session cannot be allocated at the same address until the compare
@@ -83,11 +99,6 @@ dial :: proc(c: ^Caller, service_id: proto.ServiceId) -> (^Conn, CallerError) {
 			dial_arm_tombstone(c, stream)
 		} else if c.pending == stream {
 			c.pending = nil
-			if same {
-				c.pending_err = .Timeout
-			} else {
-				c.pending_err = .Transport
-			}
 			sync.cond_broadcast(&c.cond)
 		}
 		reason := dial_failure_reason_locked(c, broker, gen, true)
@@ -101,7 +112,9 @@ dial :: proc(c: ^Caller, service_id: proto.ServiceId) -> (^Conn, CallerError) {
 		if held {
 			trans.connection_release(broker)
 		}
-		conn_release(stream)
+		// A reply may have bound the stream before the write waiter noticed
+		// the session swap. Remove it from its owning session before freeing it.
+		conn_destroy(stream)
 		// A timed dial that never gets a CONNECT out fails on its own.
 		// The session stays up unless the socket itself has stopped making
 		// send progress (that timer is not this deadline).
@@ -116,10 +129,10 @@ dial :: proc(c: ^Caller, service_id: proto.ServiceId) -> (^Conn, CallerError) {
 
 	sync.mutex_lock(&c.mutex)
 	for c.pending == stream && !sync.atomic_load(&c.stop) {
-		if !dial_wait(c, start, timeout) {
-			if c.pending == stream {
-				dial_arm_tombstone(c, stream)
-			}
+		// A reply can take the slot while the timed wait reacquires the
+		// lock. Use that result if it won, even at the deadline.
+		if !dial_wait(c, start, timeout) && c.pending == stream {
+			dial_arm_tombstone(c, stream)
 			reason := dial_failure_reason_locked(c, broker, gen, true)
 			sync.mutex_unlock(&c.mutex)
 			caller_suspect_dead_peer(c, broker, gen, recv_at, time.since(start))
@@ -130,13 +143,12 @@ dial :: proc(c: ^Caller, service_id: proto.ServiceId) -> (^Conn, CallerError) {
 	}
 	if sync.atomic_load(&c.stop) {
 		sync.mutex_unlock(&c.mutex)
-		conn_release(stream)
+		conn_destroy(stream)
 		return nil, .Closed
 	}
-	// CONNECT_OK is the only path that sets accepted. A newer dial may have
-	// stored pending_err None for its own slot; that is not success for us.
+	// The slot may already hold another service's dial.
 	if !stream.accepted {
-		err := c.pending_err
+		err := stream.dial_error
 		if err == .None {
 			err = .Transport
 		}
@@ -217,7 +229,6 @@ dial_arm_tombstone :: proc(c: ^Caller, stream: ^Conn) {
 		return
 	}
 	c.pending = nil
-	c.pending_err = .Timeout
 	c.pending_tombstone = true
 	limit := c.config.dial_timeout
 	c.tombstone_capped = limit > 0
@@ -283,6 +294,7 @@ dial_failure_reason :: proc(
 }
 
 caller_log_connect_timeout :: proc(c: ^Caller, service_id: proto.ServiceId, reason: string) {
+	if c.config.setup_failure != nil {return}
 	caller_log(
 		c,
 		.Warn,

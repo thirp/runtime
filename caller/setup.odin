@@ -24,6 +24,7 @@ BrokerSetup :: struct {
 	waiter: ^thread.Thread,
 	cancelled: bool,
 	timed_out: bool,
+	tls_verify_failed: bool,
 	phase: string,
 }
 
@@ -49,7 +50,10 @@ broker_setup_begin :: proc(s: ^BrokerSetup, c: ^Caller) {
 }
 
 broker_setup_finish :: proc(s: ^BrokerSetup, c: ^Caller, err: CallerError) -> CallerError {
-	if s.deadline == {} {return err}
+	if s.deadline == {} {
+		broker_setup_report(s, c, err)
+		return err
+	}
 	sync.mutex_lock(&s.mutex)
 	s.cancelled = true
 	s.timed_out = s.timed_out || time.diff(time.now(), s.deadline) <= 0 || err == .Timeout
@@ -61,7 +65,10 @@ broker_setup_finish :: proc(s: ^BrokerSetup, c: ^Caller, err: CallerError) -> Ca
 		s.waiter = nil
 	}
 	if s.timed_out {
-		caller_log(c, .Info, LOG_BROKER_SETUP_TIMEOUT, log.LogFields{reason = LOG_BROKER_SETUP_TIMEOUT, phase = s.phase})
+		if c.config.setup_failure == nil {
+			caller_log(c, .Info, LOG_BROKER_SETUP_TIMEOUT, log.LogFields{reason = LOG_BROKER_SETUP_TIMEOUT, phase = s.phase})
+		}
+		broker_setup_report(s, c, .Timeout)
 		return .Timeout
 	}
 	if err == .None {
@@ -70,5 +77,25 @@ broker_setup_finish :: proc(s: ^BrokerSetup, c: ^Caller, err: CallerError) -> Ca
 		_ = trans.connection_set_recv_timeout(s.conn, 0)
 		_ = trans.connection_set_send_timeout(s.conn, 0)
 	}
+	broker_setup_report(s, c, err)
 	return err
+}
+
+broker_setup_report :: proc(s: ^BrokerSetup, c: ^Caller, err: CallerError) {
+	if err == .None || c.config.setup_failure == nil {return}
+	reason := "handshake"
+	#partial switch err {
+	case .AuthFailed: reason = "unauthorized_or_revoked"
+	case .RateLimited: reason = "rate_limited"
+	case .Timeout: reason = "timeout"
+	case .InvalidConfig: reason = "configuration"
+	case .Internal, .OutOfMemory: reason = "internal"
+	case .Transport:
+		switch s.phase {
+		case SETUP_PHASE_TCP: reason = "connect"
+		case SETUP_PHASE_TLS: reason = s.tls_verify_failed ? "tls_verify" : "tls_handshake"
+		}
+	case:
+	}
+	c.config.setup_failure(c.config.setup_failure_user, s.phase, reason)
 }

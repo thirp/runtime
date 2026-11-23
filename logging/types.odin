@@ -21,6 +21,7 @@ LogFields :: struct {
 	remote_address:    string,
 	error_code:        string,
 	reason:            string,
+	close_cause:       string,
 	phase:             string,
 	// stream_id is omitted when zero unless stream_id_set. streams is omitted
 	// unless streams_set, so a session drop can report that it killed none.
@@ -31,6 +32,7 @@ LogFields :: struct {
 	// stay the same shape. The short dial-timeout warning sets both.
 	dial_timeout_ms:   int,
 	cap_floor_ms:      int,
+	suppressed:        u64,
 }
 
 LogSink :: proc(text: string)

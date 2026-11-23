@@ -37,7 +37,7 @@ STOP_GRACE :: 2 * time.Second
 // Test hook. Production passes nil and the accept loop runs until it fails.
 RunControl :: struct {
 	stop:                 bool, // atomic: end the accept loop
-	ready:                bool, // atomic: listening and logged in
+	ready:                bool, // atomic: listeners are ready, legacy mode is also logged in
 	bound:                net.Endpoint,
 	live_bridges:         int, // atomic
 	// Overrides --stream-stall-timeout when non-zero; negative = never.
@@ -50,6 +50,7 @@ RunControl :: struct {
 	caller:               ^cl.Caller,
 	// Overrides the 10s CONNECT write bound when non-zero.
 	dial_timeout:         time.Duration,
+	enrollment_log_sink:  log.LogSink,
 }
 
 usage :: proc() {
@@ -70,6 +71,8 @@ Run :: struct {
 	bridges:    [dynamic]^BridgeArg,
 	live:       int, // atomic; bridges not yet finished (also counted in ctl)
 	stall:      time.Duration, // per-stream no-progress limit; 0 = never
+	enrollment: ^Enrollment,
+	catalog_service: string,
 }
 
 connect_main :: proc(args: []string, ctl: ^RunControl = nil) -> int {
@@ -543,9 +546,16 @@ bridge_local :: proc(arg: ^BridgeArg) {
 		free(arg)
 		run_bridge_done(run)
 	}
-	stream, derr := cl.dial(&run.c, run.service_id)
+	dial := run.enrollment == nil ? cl.dial : cl.dial_on_session
+	stream, derr := dial(&run.c, run.service_id)
 	if derr != .None {
-		fmt.eprintf("connect failed\n")
+		if run.enrollment != nil {
+			enrollment_stream_failure(run, derr)
+		} else if derr == .LocalServiceUnavailable {
+			fmt.eprintf("thirp-connect: %s target unavailable\n", string(run.service_id))
+		} else {
+			fmt.eprintf("connect failed\n")
+		}
 		return
 	}
 	if !bridge_set_stream(arg, stream) {

@@ -2,6 +2,7 @@ package transport
 
 import "core:net"
 import "core:sync"
+import win "core:sys/windows"
 import "core:time"
 
 READ_BUF_SIZE :: 4096
@@ -197,28 +198,74 @@ connection_read :: proc(conn: ^Connection, dst: []u8) -> (n: int, err: Transport
 	if hook := sync.atomic_load(&conn.read_hook); hook != nil {
 		(IoHook)(hook)(conn)
 	}
-	bytes_read, recv_err := tcp_recv(conn, sock, dst)
-	for recv_err == .Interrupted && bytes_read == 0 && !conn_closing(conn) {
-		bytes_read, recv_err = tcp_recv(conn, sock, dst)
+	when ODIN_OS == .Windows {
+		if len(dst) > 0 && conn.recv_timeout > 0 {
+			if ready := tcp_wait_readable(conn); ready != .None {
+				return 0, ready
+			}
+		}
 	}
-	when ODIN_OS == .Linux {
+	bytes_read, recv_err, code := tcp_recv(conn, sock, dst)
+	for recv_err == .Interrupted && bytes_read == 0 && !conn_closing(conn) {
+		bytes_read, recv_err, code = tcp_recv(conn, sock, dst)
+	}
+	when ODIN_OS == .Linux || ODIN_OS == .Darwin {
 		// SO_RCVTIMEO is EAGAIN (.Would_Block) and stays a poll timeout.
 		// .Timeout here is ETIMEDOUT: TCP_USER_TIMEOUT aborted an unacked
 		// transmit. Returning .Timeout would let the reader spin and then
 		// see the dead socket as a clean FIN.
 		if recv_err == .Timeout {
-			conn.user_timed_out = true
+			when ODIN_OS == .Linux {
+				conn.user_timed_out = true
+			}
+			connection_note_close(conn, .ReadDeadline)
+			conn.closed = true
+			return 0, .Network
+		}
+	}
+	when ODIN_OS == .Windows {
+		// With a configured readiness wait the socket has no SO_RCVTIMEO.
+		// A timeout reported by recv itself is a socket failure.
+		if recv_err == .Timeout && conn.recv_timeout > 0 {
+			connection_note_close(conn, socket_error_cause(code))
 			conn.closed = true
 			return 0, .Network
 		}
 	}
 	err = map_recv_error(bytes_read, recv_err)
+	if err == .Closed && recv_err == .None {
+		if len(dst) > 0 {
+			connection_note_close(conn, .PeerEOF)
+		}
+	} else if err == .Closed || err == .Network {
+		connection_note_close(conn, socket_error_cause(code))
+	}
 	// Clean EOF is the peer's FIN: this side can still write the response.
 	// A reset or a socket error is the whole connection.
 	if err == .Closed && recv_err != .None {
 		conn.closed = true
 	}
 	return bytes_read, err
+}
+
+when ODIN_OS == .Windows {
+	@(private)
+	tcp_wait_readable :: proc(conn: ^Connection) -> TransportError {
+		if conn.closed {
+			return .Closed
+		}
+		// Winsock select reports both FIN and reset as readable. Let recv
+		// distinguish them without consuming SO_ERROR in the readiness wait.
+		readable := win.fd_set{fd_count = 1}
+		readable.fd_array[0] = win.SOCKET(conn.socket)
+		ms := tls_poll_timeout_ms(conn.recv_timeout)
+		wait := win.timeval{tv_sec = ms / 1000, tv_usec = (ms % 1000) * 1000}
+		n := win.select(0, &readable, nil, nil, &wait)
+		if n == win.SOCKET_ERROR {
+			return .Timeout if win.WSAGetLastError() == win.WSAEINTR else .Network
+		}
+		return .Timeout if n == 0 else .None
+	}
 }
 
 // Peek unread TCP bytes without consuming them. Fails if TLS is already attached.
@@ -321,9 +368,10 @@ connection_write_locked :: proc(conn: ^Connection, src: []u8) -> (err: Transport
 	}
 	off := 0
 	send_err: net.TCP_Send_Error
+	code: i32
 	for {
 		sent: int
-		sent, send_err = tcp_send(conn, sock, src[off:])
+		sent, send_err, code = tcp_send(conn, sock, src[off:])
 		off += sent
 		if send_err != .Interrupted || off >= len(src) || conn_closing(conn) {
 			break
@@ -333,6 +381,9 @@ connection_write_locked :: proc(conn: ^Connection, src: []u8) -> (err: Transport
 		send_err = .None
 	}
 	err = map_send_error(send_err)
+	if err == .Closed || err == .Network {
+		connection_note_close(conn, socket_error_cause(code))
+	}
 	if err == .Closed {
 		conn.closed = true
 	}
@@ -340,6 +391,17 @@ connection_write_locked :: proc(conn: ^Connection, src: []u8) -> (err: Transport
 }
 
 connection_set_recv_timeout :: proc(conn: ^Connection, timeout: time.Duration) -> TransportError {
+	socket_timeout := timeout
+	when ODIN_OS == .Windows {
+		// Timed reads wait for readiness before recv. Clear any native
+		// timeout inherited from the listener or used in a TLS handshake.
+		socket_timeout = 0
+	}
+	return connection_set_recv_timeouts(conn, timeout, socket_timeout)
+}
+
+@(private)
+connection_set_recv_timeouts :: proc(conn: ^Connection, timeout, socket_timeout: time.Duration) -> TransportError {
 	if conn == nil || conn.closed {
 		return .Closed
 	}
@@ -348,7 +410,7 @@ connection_set_recv_timeout :: proc(conn: ^Connection, timeout: time.Duration) -
 	}
 	defer conn_io_exit(conn)
 	conn.recv_timeout = timeout
-	opt_err := net.set_option(conn.socket, .Receive_Timeout, timeout)
+	opt_err := net.set_option(conn.socket, .Receive_Timeout, socket_timeout)
 	if opt_err != .None {
 		return .Network
 	}
@@ -384,6 +446,7 @@ connection_close :: proc(conn: ^Connection) {
 	if conn == nil {
 		return
 	}
+	connection_note_close(conn, .LocalClose)
 	sync.atomic_store(&conn.closed, true)
 	if !connection_acquire(conn) {
 		return // already being freed; nothing left to close
@@ -439,7 +502,7 @@ connection_drain_input :: proc(conn: ^Connection, limit: int, timeout: time.Dura
 		if left <= 0 || tls_wait_socket(conn, false, left) != .None {
 			return
 		}
-		n, err := tcp_recv(conn, sock, buf[:min(remaining, len(buf))])
+		n, err, _ := tcp_recv(conn, sock, buf[:min(remaining, len(buf))])
 		if err != .None || n == 0 {
 			return
 		}
@@ -471,6 +534,7 @@ connection_shutdown_both :: proc(conn: ^Connection) {
 	if conn.socket == 0 {
 		return
 	}
+	connection_note_close(conn, .LocalClose)
 	sync.atomic_store(&conn.closed, true)
 	when ODIN_TEST {
 		tcp_trace_close(conn, "shutdown_both")
@@ -504,6 +568,12 @@ listener_listen :: proc(endpoint: net.Endpoint) -> (Listener, TransportError) {
 		return {}, .Network
 	}
 	return Listener{socket = sock}, .None
+}
+
+when !ODIN_TEST || ODIN_OS != .Windows {
+	test_listener_listen :: proc(endpoint: net.Endpoint) -> (Listener, TransportError) {
+		return listener_listen(endpoint)
+	}
 }
 
 listener_endpoint :: proc(l: Listener) -> (net.Endpoint, TransportError) {

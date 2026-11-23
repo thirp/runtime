@@ -15,7 +15,7 @@ import "core:time"
 SilentPeerLog :: struct {
 	mu:      sync.Mutex,
 	text:    [dynamic]u8,
-	idle_at: time.Time,
+	dead_at: time.Time,
 }
 
 // The agent logs from its own thread, whose context has no user_ptr, so the
@@ -30,8 +30,8 @@ silent_peer_log_sink :: proc(text: string) {
 	sync.mutex_lock(&cap.mu)
 	defer sync.mutex_unlock(&cap.mu)
 	if strings.contains(text, "\"event\":\"disconnected\"") &&
-	   strings.contains(text, "\"reason\":\"idle\"") {
-		cap.idle_at = time.now()
+	   strings.contains(text, "\"reason\":\"dead_peer\"") {
+		cap.dead_at = time.now()
 	}
 	append(&cap.text, ..transmute([]u8)text)
 }
@@ -62,6 +62,31 @@ test_agent_keepalive_yields_to_outbound_traffic :: proc(t: ^testing.T) {
 }
 
 when ODIN_TEST {
+	@(test)
+	test_agent_receive_deadline_while_writer_is_held :: proc(t: ^testing.T) {
+		session := trans.Connection{refs = 1}
+		agent := Agent{}
+		agent.config.test_heartbeat_interval = 10 * time.Millisecond
+		agent.config.test_dead_peer_timeout = 80 * time.Millisecond
+		relay := AgentRelay{agent = &agent, broker = &session}
+		keepalive := AgentKeepalive{relay = &relay, last_recv = time.tick_now()}
+		sync.mutex_lock(&session.write_mutex)
+		defer sync.mutex_unlock(&session.write_mutex)
+		th := thread.create_and_start_with_poly_data(&keepalive, agent_keepalive)
+		if !testing.expect(t, th != nil, "keepalive worker did not start") {
+			return
+		}
+		start := time.tick_now()
+		for !thread.is_done(th) && time.tick_since(start) < time.Second {
+			time.sleep(5 * time.Millisecond)
+		}
+		finished := thread.is_done(th)
+		agent_keepalive_stop(&keepalive)
+		thread.join(th)
+		thread.destroy(th)
+		testing.expect(t, finished && keepalive.dead, "a held writer deferred the receive deadline")
+	}
+
 	@(test)
 	test_agent_keepalive_interruption_preserves_session_and_streams :: proc(t: ^testing.T) {
 		session := trans.Connection{refs = 1, test_interrupt_poll = true}
@@ -261,25 +286,25 @@ when ODIN_TEST {
 	}
 }
 
-// Exercise the production 45s watchdog. Existing proxy splices stay open
-// and silent; the reconnect gets a new splice that forwards normally.
+// The proxy accepts TCP bytes without returning frames. Holding the session
+// writer simulates DATA backpressure while a real stream is open and active.
 @(test)
 test_agent_reconnect_after_silent_peer :: proc(t: ^testing.T) {
-	testing.set_fail_timeout(t, 75 * time.Second)
+	testing.set_fail_timeout(t, 12 * time.Second)
 	fx: TestBroker
 	start_test_broker(t, &fx)
 	defer stop_test_broker(&fx)
-	// Keep the fixture's 30s broker session_timeout. The paused proxy never
-	// forwards the broker's FIN, so the agent sees only silence. The broker
-	// drops the old registration before the 45s agent timer fires, as in the
-	// production hang (broker reported AGENT_UNAVAILABLE).
+	endpoint := broker_endpoint(t, &fx)
+	if endpoint.port == 0 {
+		return
+	}
 
 	echo: EchoFixture
 	ep := start_echo(t, &echo)
 	defer stop_echo(&echo)
 
 	proxy: ByteProxy
-	byte_proxy_start(t, &proxy, broker_endpoint(t, &fx))
+	byte_proxy_start(t, &proxy, endpoint)
 	defer byte_proxy_stop(&proxy)
 
 	cap: SilentPeerLog
@@ -291,23 +316,31 @@ test_agent_reconnect_after_silent_peer :: proc(t: ^testing.T) {
 	defer sync.atomic_store(&silent_peer_cap, nil)
 
 	agent: Agent
-	err := agent_init(&agent, AgentConfig {
+	config := AgentConfig {
 		broker = proxy.ep,
 		token = TEST_TOKEN_HOST,
 		insecure = true,
 		logger = &logger,
-	})
-	testing.expect_value(t, err, AgentError.None)
-	if err != .None {
+	}
+	data_write_started: sync.Sema
+	when ODIN_TEST {
+		config.test_heartbeat_interval = 100 * time.Millisecond
+		config.test_dead_peer_timeout = 750 * time.Millisecond
+		config.test_data_write_started = &data_write_started
+	}
+	err := agent_init(&agent, config)
+	if !testing.expect_value(t, err, AgentError.None) {
 		return
 	}
 	defer agent_destroy(&agent)
-	testing.expect_value(t, agent_read_idle_limit(&agent), READ_IDLE_TIMEOUT)
 	sid := must_service(t, TEST_SERVICE)
 	testing.expect_value(t, register_service(&agent, sid, LocalTarget{address = ep}), AgentError.None)
 
 	run := AgentRunArg{agent = &agent}
 	th := thread.create_and_start_with_poly_data(&run, agent_run_proc)
+	if !testing.expect(t, th != nil, "agent thread") {
+		return
+	}
 	defer {
 		agent_stop(&agent)
 		thread.join(th)
@@ -316,28 +349,55 @@ test_agent_reconnect_after_silent_peer :: proc(t: ^testing.T) {
 	wait_agent_connected(t, &agent)
 	before, found := brk.lookup_service_for_environment(&fx.reg, "", sid, "org/dev")
 	testing.expect(t, found, "initial registration missing")
-	silent_peer_echo(t, &fx, "before")
+
+	caller := dial_broker(t, &fx)
+	if caller == nil {
+		return
+	}
+	defer trans.connection_destroy(caller)
+	decoder: proto.FrameDecoder
+	handshake_caller(t, caller, &decoder)
+	defer proto.decoder_destroy(&decoder)
+	stream := caller_connect_ok(t, caller, &decoder, TEST_SERVICE)
+	must_write(t, caller, .Data, []u8{'e'}, stream)
+	got := must_read_opcode(t, caller, &decoder, .Data)
+	testing.expect_value(t, string(got.payload), "e")
+	proto.frame_destroy(&got)
+	if !testing.expect(t, sync.sema_wait_with_timeout(&data_write_started, time.Second), "first echo never reached the writer") {
+		return
+	}
 
 	// Keep the old Connection allocated so pointer reuse cannot fake a swap.
 	sync.mutex_lock(&agent.mutex)
 	old := agent.live_conn
 	held := old != nil && trans.connection_acquire(old)
 	sync.mutex_unlock(&agent.mutex)
-	testing.expect(t, held, "no live connection to blackhole")
-	if !held {
+	if !testing.expect(t, held, "no live connection to blackhole") {
 		return
 	}
 	defer trans.connection_release(old)
-	byte_proxy_blackhole(&proxy)
-	start := time.now()
-	dropped := false
-	replaced := false
-	drop_elapsed: time.Duration
-	for time.since(start) < 55 * time.Second {
-		if !dropped && sync.atomic_load(&old.closed) {
-			dropped = true
-			drop_elapsed = time.since(start)
+	start: time.Time
+	{
+		sync.mutex_lock(&old.write_mutex)
+		defer sync.mutex_unlock(&old.write_mutex)
+		must_write(t, caller, .Data, []u8{'b'}, stream)
+		if !testing.expect(t, sync.sema_wait_with_timeout(&data_write_started, 500 * time.Millisecond),
+			"second echo never reached the held writer") {
+			return
 		}
+		byte_proxy_blackhole(&proxy)
+		start = time.now()
+		for !sync.atomic_load(&old.closed) && time.since(start) < 1500 * time.Millisecond {
+			time.sleep(10 * time.Millisecond)
+		}
+		if !testing.expect(t, sync.atomic_load(&old.closed) && time.since(start) < 1500 * time.Millisecond,
+			"busy agent did not close the silent socket within 1.5s") {
+			return
+		}
+	}
+
+	replaced := false
+	for time.since(start) < 4 * time.Second {
 		sync.mutex_lock(&agent.mutex)
 		replaced = agent.connected && agent.live_conn != nil && agent.live_conn != old
 		sync.mutex_unlock(&agent.mutex)
@@ -346,30 +406,142 @@ test_agent_reconnect_after_silent_peer :: proc(t: ^testing.T) {
 			break
 		}
 		replaced = false
-		time.sleep(20 * time.Millisecond)
+		time.sleep(10 * time.Millisecond)
 	}
-	reconnect_elapsed := time.since(start)
-	testing.expect(t, dropped, "silent peer socket never dropped")
-	testing.expect(t, drop_elapsed >= 40 * time.Second, "idle detection fired before 40s")
-	testing.expect(t, drop_elapsed <= 50 * time.Second, "idle detection was later than 50s")
-	testing.expect(t, replaced, "silent peer never reconnected and re-registered")
-	if !replaced {
+	if !testing.expect(t, replaced, "silent peer never reconnected and re-registered within 4s") {
 		return
 	}
-	testing.expect(t, reconnect_elapsed - drop_elapsed <= 5 * time.Second, "reconnect took more than 5s after drop")
 	silent_peer_echo(t, &fx, "after")
 
 	sync.mutex_lock(&cap.mu)
 	text := strings.clone(string(cap.text[:]))
-	idle_elapsed := time.diff(start, cap.idle_at)
+	dead_elapsed := time.diff(start, cap.dead_at)
 	sync.mutex_unlock(&cap.mu)
 	defer delete(text)
-	testing.expect(t, idle_elapsed >= 40 * time.Second && idle_elapsed <= 50 * time.Second, "missing or mistimed reason=idle")
+	testing.expect(t, dead_elapsed >= 0 && dead_elapsed < 2 * time.Second, "missing or mistimed reason=dead_peer")
 	testing.expect_value(t, strings.count(text, "\"event\":\"disconnected\""), 1)
-	testing.expect_value(t, strings.count(text, "\"reason\":\"idle\""), 2)
-	testing.expect(t, strings.contains(text, "\"event\":\"reconnect_scheduled\""), "missing reconnect log")
+	testing.expect_value(t, strings.count(text, "\"reason\":\"dead_peer\""), 2)
 	testing.expect_value(t, strings.count(text, "\"event\":\"registered\""), 2)
-	fmt.printf("silent peer: drop=%v reconnect=%v\n%s", drop_elapsed, reconnect_elapsed, text)
+}
+
+@(test)
+test_agent_stays_connected_while_broker_waits_for_slow_caller :: proc(t: ^testing.T) {
+	fx: TestBroker
+	start_test_broker(t, &fx)
+	defer stop_test_broker(&fx)
+	endpoint := broker_endpoint(t, &fx)
+	if endpoint.port == 0 {
+		return
+	}
+	// Two one-byte echoes deterministically fill the slow caller's outbox
+	// and block the broker's reader for this agent on the second echo.
+	fx.server.max_stream_buffer = 1
+	echo: EchoFixture
+	origin := start_echo(t, &echo)
+	defer stop_echo(&echo)
+	deadline :: 3500 * time.Millisecond
+	agent: Agent
+	config := AgentConfig{broker = endpoint, token = TEST_TOKEN_HOST, insecure = true}
+	when ODIN_TEST {
+		config.test_heartbeat_interval = 100 * time.Millisecond
+		config.test_dead_peer_timeout = deadline
+	}
+	if !testing.expect_value(t, agent_init(&agent, config), AgentError.None) {
+		return
+	}
+	defer agent_destroy(&agent)
+	sid := must_service(t, TEST_SERVICE)
+	if !testing.expect_value(t, register_service(&agent, sid, LocalTarget{address = origin}), AgentError.None) {
+		return
+	}
+	run := AgentRunArg{agent = &agent}
+	th := thread.create_and_start_with_poly_data(&run, agent_run_proc)
+	if !testing.expect(t, th != nil, "agent thread") {
+		return
+	}
+	defer {
+		agent_stop(&agent)
+		thread.join(th)
+		thread.destroy(th)
+	}
+	wait_agent_connected(t, &agent)
+	caller := dial_broker(t, &fx)
+	if caller == nil {
+		return
+	}
+	defer trans.connection_destroy(caller)
+	decoder: proto.FrameDecoder
+	handshake_caller(t, caller, &decoder)
+	defer proto.decoder_destroy(&decoder)
+	stream := caller_connect_ok(t, caller, &decoder, TEST_SERVICE)
+	relay, found := brk.relay_lookup_stream(&fx.server, stream)
+	if !testing.expect(t, found, "broker stream missing") {
+		return
+	}
+	source := brk.server_lookup_outbox(&fx.server, relay.agent_conn)
+	dest := brk.server_lookup_outbox(&fx.server, relay.caller_conn)
+	defer brk.outbox_release(source)
+	defer brk.outbox_release(dest)
+	if !testing.expect(t, source != nil && dest != nil, "broker outbox missing") {
+		return
+	}
+	sync.mutex_lock(&agent.mutex)
+	socket := agent.live_conn
+	held := trans.connection_acquire(socket)
+	sync.mutex_unlock(&agent.mutex)
+	if !testing.expect(t, held, "agent session missing") {
+		return
+	}
+	defer trans.connection_release(socket)
+	brk.outbox_set_writer_hold(dest, true)
+	defer brk.outbox_set_writer_hold(dest, false)
+	must_write(t, caller, .Data, []u8{'a'}, stream)
+	start := time.tick_now()
+	for brk.outbox_queued(dest, stream) == 0 && time.tick_since(start) < time.Second {
+		time.sleep(5 * time.Millisecond)
+	}
+	if !testing.expect_value(t, brk.outbox_queued(dest, stream), 1) {
+		return
+	}
+	must_write(t, caller, .Data, []u8{'b'}, stream)
+	start = time.tick_now()
+	waiting := false
+	for time.tick_since(start) < time.Second {
+		sync.mutex_lock(&source.mutex)
+		waiting = source.waiting_on_stream
+		sync.mutex_unlock(&source.mutex)
+		if waiting {
+			break
+		}
+		time.sleep(5 * time.Millisecond)
+	}
+	if !testing.expect(t, waiting, "second echo never blocked on the caller outbox") {
+		return
+	}
+	{
+		// A full upstream TCP send buffer can also keep the agent's writer
+		// unavailable. Incoming broker Pings must still reach the watchdog.
+		sync.mutex_lock(&socket.write_mutex)
+		defer sync.mutex_unlock(&socket.write_mutex)
+		time.sleep(deadline + brk.BACKPRESSURE_PING_INTERVAL + 500 * time.Millisecond)
+		if !testing.expect(t, !sync.atomic_load(&socket.closed), "agent disconnected while the broker waited for stream space") {
+			return
+		}
+	}
+	brk.outbox_set_writer_hold(dest, false)
+	for want in ([2]u8{'a', 'b'}) {
+		frame := must_read_opcode(t, caller, &decoder, .Data)
+		defer proto.frame_destroy(&frame)
+		testing.expect(t, len(frame.payload) == 1 && frame.payload[0] == want, "queued echo did not resume in order")
+	}
+	must_write(t, caller, .Data, []u8{'c'}, stream)
+	frame := must_read_opcode(t, caller, &decoder, .Data)
+	defer proto.frame_destroy(&frame)
+	testing.expect_value(t, string(frame.payload), "c")
+	sync.mutex_lock(&agent.mutex)
+	same := agent.connected && agent.live_conn == socket
+	sync.mutex_unlock(&agent.mutex)
+	testing.expect(t, same, "agent changed sessions during the wait")
 }
 
 silent_peer_echo :: proc(t: ^testing.T, fx: ^TestBroker, want: string) {
@@ -385,10 +557,8 @@ silent_peer_echo :: proc(t: ^testing.T, fx: ^TestBroker, want: string) {
 	proto.frame_destroy(&got)
 }
 
-// A quiet but healthy session must stay up past 45s. The shared fixture
-// uses a 30s broker heartbeat and 30s session_timeout; this test sets
-// the production defaults (15s Ping, 45s session timeout) so the
-// broker's real ping behavior is what keeps last_recv fresh.
+// A quiet but healthy session must stay up across many production
+// keepalive intervals. Use the broker's production timers too.
 @(test)
 test_agent_stays_up_on_healthy_idle_session :: proc(t: ^testing.T) {
 	testing.set_fail_timeout(t, 180 * time.Second)
@@ -426,7 +596,7 @@ test_agent_stays_up_on_healthy_idle_session :: proc(t: ^testing.T) {
 		return
 	}
 	defer agent_destroy(&agent)
-	testing.expect_value(t, agent_read_idle_limit(&agent), READ_IDLE_TIMEOUT)
+	testing.expect_value(t, agent_dead_peer_limit(&agent), DEAD_PEER_TIMEOUT)
 	sid := must_service(t, TEST_SERVICE)
 	testing.expect_value(t, register_service(&agent, sid, LocalTarget{address = ep}), AgentError.None)
 
@@ -475,7 +645,7 @@ test_agent_stays_up_on_healthy_idle_session :: proc(t: ^testing.T) {
 	text := strings.clone(string(cap.text[:]))
 	sync.mutex_unlock(&cap.mu)
 	defer delete(text)
-	testing.expect_value(t, strings.count(text, "\"reason\":\"idle\""), 0)
+	testing.expect_value(t, strings.count(text, "\"reason\":\"dead_peer\""), 0)
 	testing.expect_value(t, strings.count(text, "\"event\":\"registered\""), 1)
 	silent_peer_echo(t, &fx, "healthy")
 
@@ -499,6 +669,7 @@ ProxyLink :: struct {
 	up:     ^trans.Connection,
 	pause:  bool,
 	stop:   bool,
+	reset:  bool,
 }
 
 byte_proxy_start :: proc(t: ^testing.T, p: ^ByteProxy, target: net.Endpoint, loc := #caller_location) {
@@ -578,7 +749,10 @@ byte_proxy_accept :: proc(p: ^ByteProxy) {
 			trans.connection_destroy(client)
 			return
 		}
-		up, derr := trans.connection_dial(p.target)
+		sync.mutex_lock(&p.mu)
+		target := p.target
+		sync.mutex_unlock(&p.mu)
+		up, derr := trans.connection_dial(target)
 		if derr != .None {
 			trans.connection_destroy(client)
 			continue
@@ -605,24 +779,27 @@ proxy_splice :: proc(link: ^ProxyLink) {
 	_ = trans.connection_set_recv_timeout(link.client, 20 * time.Millisecond)
 	_ = trans.connection_set_recv_timeout(link.up, 20 * time.Millisecond)
 	buf: [4096]u8
-	for !sync.atomic_load(&p.stop) && !sync.atomic_load(&link.stop) {
+	for !sync.atomic_load(&p.stop) && !sync.atomic_load(&link.stop) && !sync.atomic_load(&link.reset) {
 		if sync.atomic_load(&link.pause) {
-			time.sleep(5 * time.Millisecond)
+			_, err := trans.connection_read(link.client, buf[:])
+			if err != .None && err != .Timeout {
+				return
+			}
 			continue
 		}
-		if !proxy_copy(link.client, link.up, buf[:]) {
+		if !proxy_copy(link.client, link.up, buf[:], &link.pause) {
 			return
 		}
 		if sync.atomic_load(&link.pause) || sync.atomic_load(&link.stop) || sync.atomic_load(&p.stop) {
 			continue
 		}
-		if !proxy_copy(link.up, link.client, buf[:]) {
+		if !proxy_copy(link.up, link.client, buf[:], &link.pause) {
 			return
 		}
 	}
 }
 
-proxy_copy :: proc(from, to: ^trans.Connection, buf: []u8) -> bool {
+proxy_copy :: proc(from, to: ^trans.Connection, buf: []u8, paused: ^bool) -> bool {
 	n, err := trans.connection_read(from, buf)
 	if err == .Timeout {
 		return true
@@ -630,19 +807,19 @@ proxy_copy :: proc(from, to: ^trans.Connection, buf: []u8) -> bool {
 	if err != .None {
 		return false
 	}
-	return trans.connection_write(to, buf[:n]) == .None
+	return sync.atomic_load(paused) || trans.connection_write(to, buf[:n]) == .None
 }
 
 proxy_link_done :: proc(link: ^ProxyLink) {
 	p := link.proxy
 	sync.mutex_lock(&p.mu)
+	defer sync.mutex_unlock(&p.mu)
 	for i := 0; i < len(p.links); i += 1 {
 		if p.links[i] == link {
 			ordered_remove(&p.links, i)
 			break
 		}
 	}
-	sync.mutex_unlock(&p.mu)
 	if link.client != nil {
 		trans.connection_destroy(link.client)
 		link.client = nil

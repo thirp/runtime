@@ -2,6 +2,7 @@ package broker
 
 import log "../logging"
 import proto "../protocol"
+import trans "../transport"
 import "core:net"
 import "core:sync"
 import "core:time"
@@ -71,18 +72,39 @@ conn_log_stream_not_found :: proc(h: ^ConnHandler, stream_id: proto.StreamId) {
 	)
 }
 
-conn_close_reason_label :: proc(reason: ConnCloseReason) -> string {
-	switch reason {
-	case .None:
-		return ""
-	case .IdleTimeout:
-		return LABEL_IDLE_TIMEOUT
-	case .Protocol:
-		return LABEL_PROTOCOL_ERROR
-	case .Peer:
-		return LABEL_PEER
+SESSION_CLOSE_LOG_INTERVAL :: 10 * time.Second
+
+CloseLogWindow :: struct {
+	last:       time.Tick,
+	suppressed: u64,
+}
+
+close_log_take :: proc(server: ^Server, role: proto.PeerRole, cause: trans.CloseCause, now: time.Tick) -> (bool, u64) {
+	sync.mutex_lock(&server.close_log_mutex)
+	defer sync.mutex_unlock(&server.close_log_mutex)
+	window := &server.close_logs[role][cause]
+	if window.last != {} && time.tick_diff(window.last, now) < SESSION_CLOSE_LOG_INTERVAL {
+		window.suppressed += 1
+		return false, 0
 	}
-	return ""
+	suppressed := window.suppressed
+	window^ = {last = now}
+	return true, suppressed
+}
+
+conn_log_closed :: proc(h: ^ConnHandler) {
+	if h.server.logger == nil {
+		return
+	}
+	cause := h.close_reason
+	if cause == .None {
+		cause = trans.connection_close_cause(h.conn)
+	}
+	emit, suppressed := close_log_take(h.server, h.role, cause, time.tick_now())
+	if emit {
+		reason := LABEL_IDLE_TIMEOUT if cause == .ReadIdle else trans.close_cause_label(cause)
+		conn_log(h, .Info, LOG_EVENT_SESSION_CLOSED, log.LogFields{reason = reason, suppressed = suppressed})
+	}
 }
 
 peer_role_reason :: proc(role: proto.PeerRole) -> string {

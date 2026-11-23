@@ -20,6 +20,10 @@ when ODIN_TEST {
 		test_legacy_heartbeat:     bool,
 		test_trace_broker_session: bool,
 		test_heartbeat_probe:      ^HeartbeatProbe,
+		test_heartbeat_interval:  time.Duration,
+		test_dead_peer_timeout:   time.Duration,
+		test_data_write_started:  ^sync.Sema,
+		test_read_idle_timeout:   time.Duration,
 	}
 } else {
 	Agent_Test_Config :: struct {}

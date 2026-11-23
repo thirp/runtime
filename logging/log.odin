@@ -42,6 +42,10 @@ log_level_name :: proc(level: LogLevel) -> string {
 }
 
 log_event :: proc(logger: ^Logger, level: LogLevel, event: string, fields: LogFields = {}) {
+	log_event_at(logger, level, event, nil, fields)
+}
+
+log_event_at :: proc(logger: ^Logger, level: LogLevel, event: string, at: Maybe(time.Time), fields: LogFields = {}) {
 	if logger == nil || logger.sink == nil {
 		return
 	}
@@ -52,7 +56,7 @@ log_event :: proc(logger: ^Logger, level: LogLevel, event: string, fields: LogFi
 	buf: [dynamic]u8
 	defer delete(buf)
 	append_string(&buf, "{\"ts\":")
-	append_ts(&buf)
+	append_ts(&buf, at.? or_else time.now())
 	append_string(&buf, ",\"level\":")
 	append_json_string(&buf, log_level_name(level))
 	append_string(&buf, ",\"event\":")
@@ -74,7 +78,12 @@ log_event :: proc(logger: ^Logger, level: LogLevel, event: string, fields: LogFi
 	append_opt_string(&buf, "remote_address", fields.remote_address)
 	append_opt_string(&buf, "error_code", fields.error_code)
 	append_opt_string(&buf, "reason", fields.reason)
+	append_opt_string(&buf, "close_cause", fields.close_cause)
 	append_opt_string(&buf, "phase", fields.phase)
+	if fields.suppressed != 0 {
+		append_string(&buf, ",\"suppressed\":")
+		append_u64(&buf, fields.suppressed)
+	}
 	if fields.streams_set {
 		append_string(&buf, ",\"streams\":")
 		append_u64(&buf, u64(fields.streams))
@@ -116,8 +125,8 @@ append_u64 :: proc(buf: ^[dynamic]u8, n: u64) {
 	append_string(buf, fmt.tprintf("%d", n))
 }
 
-append_ts :: proc(buf: ^[dynamic]u8) {
-	nanos := time.time_to_unix_nano(time.now())
+append_ts :: proc(buf: ^[dynamic]u8, at: time.Time) {
+	nanos := time.time_to_unix_nano(at)
 	sec := nanos / 1_000_000_000
 	nsec := nanos % 1_000_000_000
 	if nsec < 0 {

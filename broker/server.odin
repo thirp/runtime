@@ -75,10 +75,14 @@ Server :: struct {
 	ip_conns:                  map[IpKey]int,
 	outbox_mutex:              sync.Mutex,
 	outboxes:                  map[^trans.Connection]^ConnOutbox,
-	tls_ctx:                   ^trans.TlsServerContext,
+	tls_ctx:                   ^trans.TlsServerContext, // Set before serving or through server_reload_tls.
+	tls_ctx_mutex:             sync.Mutex,
+	tls_reload_mutex:          sync.Mutex,
 	metrics:                   Metrics,
 	logger:                    ^log.Logger,
 	stream_not_found_log_at:   i64,
+	close_log_mutex:           sync.Mutex,
+	close_logs:                [proto.PeerRole][trans.CloseCause]CloseLogWindow,
 	draining:                  bool,
 	shutdown_grace:            time.Duration,
 	metrics_listener:          trans.Listener,
@@ -430,7 +434,9 @@ server_shutdown_handlers_matching :: proc(server: ^Server, credential_id: string
 		}
 	}
 	sync.mutex_unlock(&server.handlers_mutex)
+	cause: trans.CloseCause = .BrokerShutdown if len(credential_id) == 0 else .BrokerCredentialRevoked
 	for conn in conns {
+		trans.connection_note_close(conn, cause)
 		trans.connection_shutdown_both(conn)
 		trans.connection_release(conn)
 	}

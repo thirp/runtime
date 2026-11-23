@@ -291,88 +291,10 @@ test_no_dial_timeout_does_not_tombstone :: proc(t: ^testing.T) {
 	}
 }
 
-// The broker pings. A splice that stops forwarding leaves the caller with
-// no frames. The read-idle watchdog must drop that session in about 45s.
+// Verify the production deadline with a peer that still accepts TCP bytes.
 @(test)
-test_idle_blackhole_drops_session :: proc(t: ^testing.T) {
-	fx: TestBroker
-	start_test_broker(t, &fx)
-	defer stop_test_broker(&fx)
-
-	echo: EchoFixture
-	echo_ep := start_echo(t, &echo)
-	defer stop_echo(&echo)
-
-	agent: ag.Agent
-	run: AgentRunArg
-	ath := start_registered_agent(t, &fx, echo_ep, &agent, &run)
-	defer stop_agent(&agent, ath)
-
-	// The fixture closes a quiet session at 30s. That FIN would beat the
-	// caller's 45s read-idle and the reason would be peer_close.
-	fx.server.session_timeout = 3 * time.Minute
-
-	proxy: ByteProxy
-	byte_proxy_start(t, &proxy, broker_endpoint(t, &fx))
-	defer byte_proxy_stop(&proxy)
-
-	c: Caller
-	testing.expect_value(
-		t,
-		caller_init(
-			&c,
-			CallerConfig {
-				broker = proxy.ep,
-				token = TEST_TOKEN_CALLER,
-				insecure = true,
-				dial_timeout = 5 * time.Second,
-				send_stall_timeout = -1,
-			},
-		),
-		CallerError.None,
-	)
-	defer caller_destroy(&c)
-
-	sid := must_service(t, TEST_SERVICE)
-	probe, perr := dial(&c, sid)
-	testing.expect_value(t, perr, CallerError.None)
-	if probe == nil {
-		return
-	}
-	conn_destroy(probe)
-
-	gen := caller_conn_gen(&c)
-	byte_proxy_blackhole(&proxy)
-	start := time.now()
-	dropped := false
-	for time.since(start) < 55 * time.Second {
-		if caller_conn_gen(&c) != gen {
-			dropped = true
-			break
-		}
-		time.sleep(20 * time.Millisecond)
-	}
-	elapsed := time.since(start)
-	testing.expect(t, dropped, "idle blackhole did not drop the session")
-	testing.expect(t, elapsed <= 50 * time.Second, "idle detection was later than 50s")
-	testing.expect(t, elapsed >= 40 * time.Second, "idle detection fired early")
-	testing.expectf(
-		t,
-		caller_last_disconnect_reason(&c) == LOG_REASON_IDLE,
-		"disconnect reason %q",
-		caller_last_disconnect_reason(&c),
-	)
-
-	for !caller_is_connected(&c) && time.since(start) < 70 * time.Second {
-		time.sleep(20 * time.Millisecond)
-	}
-	testing.expect(t, caller_is_connected(&c), "caller did not reconnect")
-	again, aerr := dial(&c, sid)
-	testing.expect_value(t, aerr, CallerError.None)
-	if again != nil {
-		defer conn_destroy(again)
-		testing.expect(t, echo_one(again, 'i'), "dial after idle reconnect failed")
-	}
+test_silent_peer_uses_production_deadline :: proc(t: ^testing.T) {
+	reconnect_five_services(t, silent = true, cycles = 1, production_timers = true)
 }
 
 // A dial that gets no answer on a blackholed path must not leave the caller
@@ -437,8 +359,8 @@ test_blackhole_failed_dial_drops_session :: proc(t: ^testing.T) {
 	reason := caller_last_disconnect_reason(&c)
 	testing.expect(
 		t,
-		reason == LOG_REASON_IDLE || reason == LOG_REASON_DEAD_PEER || reason == LOG_REASON_TOMBSTONE,
-		"disconnect reason was not idle, dead_peer, or tombstone",
+		reason == LOG_REASON_DEAD_PEER,
+		"disconnect reason was not dead_peer",
 	)
 
 	for !caller_is_connected(&c) && time.since(start) < 60 * time.Second {
@@ -966,22 +888,27 @@ proxy_splice :: proc(link: ^ProxyLink) {
 	buf: [4096]u8
 	for !sync.atomic_load(&p.stop) && !sync.atomic_load(&link.stop) {
 		if sync.atomic_load(&link.pause) {
-			time.sleep(5 * time.Millisecond)
+			// Drain and discard client bytes so TCP ACKs them. A FIN from
+			// the client still tears down the old upstream session.
+			_, err := trans.connection_read(link.client, buf[:])
+			if err != .None && err != .Timeout {
+				return
+			}
 			continue
 		}
-		if !proxy_copy(link.client, link.up, buf[:]) {
+		if !proxy_copy(link.client, link.up, buf[:], &link.pause) {
 			return
 		}
 		if sync.atomic_load(&link.pause) || sync.atomic_load(&link.stop) || sync.atomic_load(&p.stop) {
 			continue
 		}
-		if !proxy_copy(link.up, link.client, buf[:]) {
+		if !proxy_copy(link.up, link.client, buf[:], &link.pause) {
 			return
 		}
 	}
 }
 
-proxy_copy :: proc(from, to: ^trans.Connection, buf: []u8) -> bool {
+proxy_copy :: proc(from, to: ^trans.Connection, buf: []u8, paused: ^bool) -> bool {
 	n, err := trans.connection_read(from, buf)
 	if err == .Timeout {
 		return true
@@ -989,7 +916,7 @@ proxy_copy :: proc(from, to: ^trans.Connection, buf: []u8) -> bool {
 	if err != .None {
 		return false
 	}
-	return trans.connection_write(to, buf[:n]) == .None
+	return sync.atomic_load(paused) || trans.connection_write(to, buf[:n]) == .None
 }
 
 proxy_link_done :: proc(link: ^ProxyLink) {

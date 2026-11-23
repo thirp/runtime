@@ -126,7 +126,6 @@ caller_drain_loop :: proc(d: ^CallerDrain) {
 			sync.mutex_unlock(&c.mutex)
 			return
 		}
-		idle := time.since(d.last_recv) >= caller_read_idle_limit(c)
 		last_recv := d.last_recv
 		conn := d.conn
 		gen := d.gen
@@ -135,13 +134,7 @@ caller_drain_loop :: proc(d: ^CallerDrain) {
 		if !held {
 			return
 		}
-		if idle {
-			// This socket only. The live session's disconnect reason stays.
-			trans.connection_shutdown_both(conn)
-			trans.connection_release(conn)
-			return
-		}
-		caller_maybe_ping(c, conn, last_recv, &d.last_ping)
+		caller_maybe_ping(c, conn, gen, last_recv, &d.last_ping)
 		_ = trans.connection_set_recv_timeout(conn, CALLER_POLL_INTERVAL)
 		frame, terr, perr := trans.read_frame(conn, &d.decoder)
 		if terr == .Timeout {
@@ -153,7 +146,7 @@ caller_drain_loop :: proc(d: ^CallerDrain) {
 			return
 		}
 		sync.mutex_lock(&c.mutex)
-		d.last_recv = time.now()
+		d.last_recv = time.tick_now()
 		sync.mutex_unlock(&c.mutex)
 		end := caller_handle_frame(c, &d.streams, conn, gen, d, frame)
 		proto.frame_destroy(&frame)

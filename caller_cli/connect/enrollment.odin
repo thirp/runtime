@@ -5,6 +5,7 @@ import private_file "private_file"
 import "core:encoding/json"
 import "core:fmt"
 import "core:strings"
+import "core:sync"
 import "core:time"
 
 CALLER_ENROLLMENT_ROTATE_WINDOW :: 30*24*time.Hour
@@ -32,6 +33,8 @@ Enrollment :: struct {
 	user: rawptr,
 	now: proc(rawptr) -> time.Time,
 	logger: log.Logger,
+	failure_mutex: sync.Mutex,
+	failure_next: map[EnrollmentFailureKey]time.Tick,
 	// Fake broker setup/destruction for the socket-free maintenance tests.
 	new_caller: proc(^Enrollment, ^EnrollmentLink) -> (^EnrollmentCaller, bool),
 	destroy_caller: proc(^EnrollmentCaller),
@@ -66,15 +69,31 @@ enrollment_call :: proc(e: ^Enrollment, method, suffix: string, body := "") -> (
 	defer delete(path)
 	r, err := fn(e.user, e.cfg, {method, path, e.token, body})
 	defer delete(r.body)
-	if err != .None {return {}, err}
-	if r.status == ENROLLMENT_STATUS_UNAUTHORIZED || r.status == ENROLLMENT_STATUS_FORBIDDEN {return {}, .Denied}
+	if err != .None {
+		reason := r.failure
+		if reason == "" {reason = err == .Config ? "configuration" : "invalid_response"}
+		enrollment_failure(e, "api", reason)
+		return {}, err
+	}
+	if r.status == ENROLLMENT_STATUS_UNAUTHORIZED || r.status == ENROLLMENT_STATUS_FORBIDDEN {
+		enrollment_failure(e, "api", "unauthorized_or_revoked", status = fmt.tprintf("%d", r.status))
+		return {}, .Denied
+	}
 	expected := ENROLLMENT_STATUS_OK
 	if method == ENROLLMENT_POST && (suffix == ENROLLMENT_REQUESTS || strings.has_suffix(suffix, ENROLLMENT_CREDENTIALS)) {expected = ENROLLMENT_STATUS_CREATED}
-	if r.status != expected {return {}, .Retry}
+	if r.status != expected {
+		enrollment_failure(e, "api", "http_status", status = fmt.tprintf("%d", r.status))
+		return {}, .Retry
+	}
 	v, jerr := json.parse(r.body, .JSON)
-	if jerr != .None {return {}, .Retry}
-	if _, ok := v.(json.Object); !ok {json.destroy_value(v); return {}, .Retry}
+	if jerr != .None {return {}, enrollment_invalid_response(e)}
+	if _, ok := v.(json.Object); !ok {json.destroy_value(v); return {}, enrollment_invalid_response(e)}
 	return v, .None
+}
+
+enrollment_invalid_response :: proc(e: ^Enrollment) -> EnrollmentError {
+	enrollment_failure(e, "api", "invalid_response")
+	return .Retry
 }
 
 enrollment_write_token :: private_file.write_token
@@ -94,12 +113,18 @@ enrollment_self :: proc(e: ^Enrollment) -> EnrollmentError {
 	v, err := enrollment_call(e, ENROLLMENT_GET, ENROLLMENT_SELF)
 	if err != .None {return err}
 	defer json.destroy_value(v)
-	if enrollment_string(v, ENROLLMENT_ID) != e.cfg.enrollment {return .Config}
+	if enrollment_string(v, ENROLLMENT_ID) != e.cfg.enrollment {
+		enrollment_failure(e, "api", "enrollment_mismatch")
+		return .Config
+	}
 	exp := enrollment_time(v, ENROLLMENT_EXPIRES_AT)
-	if exp == {} {return .Retry}
+	if exp == {} {return enrollment_invalid_response(e)}
 	e.expires_at = exp
 	if exp._nsec <= now._nsec {return .Expired}
-	if enrollment_string(v, ENROLLMENT_STATE) == ENROLLMENT_REVOKED {return .Denied}
+	if enrollment_string(v, ENROLLMENT_STATE) == ENROLLMENT_REVOKED {
+		enrollment_failure(e, "api", "unauthorized_or_revoked")
+		return .Denied
+	}
 	e.denied = false
 	if time.diff(now, exp) <= CALLER_ENROLLMENT_ROTATE_WINDOW {
 		r, rerr := enrollment_call(e, ENROLLMENT_POST, ENROLLMENT_SELF+ENROLLMENT_ROTATE, ENROLLMENT_EMPTY_OBJECT)
@@ -108,7 +133,7 @@ enrollment_self :: proc(e: ^Enrollment) -> EnrollmentError {
 		token := enrollment_string(r, ENROLLMENT_TOKEN)
 		expires := enrollment_time(r, ENROLLMENT_EXPIRES_AT)
 		previous := enrollment_time(r, ENROLLMENT_PREVIOUS_EXPIRES_AT)
-		if !enrollment_token_ok(token) || expires._nsec <= now._nsec || previous == {} || !enrollment_id_ok(enrollment_string(r, ENROLLMENT_CREDENTIAL_ID)) {return .Retry}
+		if !enrollment_token_ok(token) || expires._nsec <= now._nsec || previous == {} || !enrollment_id_ok(enrollment_string(r, ENROLLMENT_CREDENTIAL_ID)) {return enrollment_invalid_response(e)}
 		e.pending_token = strings.clone(token)
 		e.pending_expiry = expires
 		// Until persistence succeeds, the old credential is bounded by overlap.
@@ -168,15 +193,15 @@ enrollment_pick_grant :: proc(e: ^Enrollment, l: ^EnrollmentLink) -> (bool, Enro
 		if err != .None {return false, err}
 		defer json.destroy_value(v)
 		items, ok := enrollment_array(v, ENROLLMENT_ITEMS)
-		if !ok {return false, .Retry}
+		if !ok {return false, enrollment_invalid_response(e)}
 		for item in items {if enrollment_grant(e, l, item, &l.pending) {return true, .None}}
 		next := enrollment_string(v, ENROLLMENT_NEXT_CURSOR)
 		if len(next) == 0 {return false, .None}
-		if next == cursor {return false, .Retry}
+		if next == cursor {return false, enrollment_invalid_response(e)}
 		delete(cursor)
 		cursor = enrollment_query_escape(next)
 	}
-	return false, .Retry
+	return false, enrollment_invalid_response(e)
 }
 
 enrollment_query_escape :: proc(s: string) -> string {
@@ -215,16 +240,16 @@ enrollment_create_grant :: proc(e: ^Enrollment, l: ^EnrollmentLink) -> Enrollmen
 		id := enrollment_string(created, ENROLLMENT_ID)
 		if enrollment_id_ok(id) {l.request_id = strings.clone(id)}
 		json.destroy_value(created)
-		if len(l.request_id) == 0 {return .Retry}
+		if len(l.request_id) == 0 {return enrollment_invalid_response(e)}
 	}
 	approved, aerr := enrollment_call(e, ENROLLMENT_POST, fmt.tprintf("%s/%s%s", ENROLLMENT_REQUESTS, l.request_id, ENROLLMENT_APPROVE), ENROLLMENT_EMPTY_OBJECT)
 	if aerr != .None {return aerr}
 	defer json.destroy_value(approved)
 	grants, ok := enrollment_array(approved, ENROLLMENT_GRANT_ITEMS)
-	if !ok {return .Retry}
+	if !ok {return enrollment_invalid_response(e)}
 	delete(l.request_id); l.request_id = ""
 	for item in grants {if enrollment_grant(e, l, item, &l.pending) {return .None}}
-	return .Retry
+	return enrollment_invalid_response(e)
 }
 
 enrollment_mint :: proc(e: ^Enrollment, p: ^EnrollmentPlan) -> EnrollmentError {
@@ -233,7 +258,7 @@ enrollment_mint :: proc(e: ^Enrollment, p: ^EnrollmentPlan) -> EnrollmentError {
 	defer json.destroy_value(v)
 	token, id := enrollment_string(v, ENROLLMENT_TOKEN), enrollment_string(v, ENROLLMENT_CREDENTIAL_ID)
 	exp := enrollment_time(v, ENROLLMENT_EXPIRES_AT)
-	if !strings.has_prefix(token, ENROLLMENT_GRANT_TOKEN_PREFIX) || strings.contains_any(token, "\r\n \t") || !enrollment_id_ok(id) || exp._nsec <= enrollment_now(e)._nsec || exp._nsec > p.grant_end._nsec {return .Retry}
+	if !strings.has_prefix(token, ENROLLMENT_GRANT_TOKEN_PREFIX) || strings.contains_any(token, "\r\n \t") || !enrollment_id_ok(id) || exp._nsec <= enrollment_now(e)._nsec || exp._nsec > p.grant_end._nsec {return enrollment_invalid_response(e)}
 	p.token, p.credential_id, p.expires_at = strings.clone(token), strings.clone(id), exp
 	p.renew_at = enrollment_renew_at(enrollment_now(e), exp)
 	if exp == p.grant_end {p.renew_at = p.grant_end}
@@ -245,7 +270,7 @@ enrollment_renew :: proc(e: ^Enrollment, p: ^EnrollmentPlan) -> EnrollmentError 
 	if err != .None {return err}
 	defer json.destroy_value(v)
 	exp := enrollment_time(v, ENROLLMENT_EXPIRES_AT)
-	if enrollment_string(v, ENROLLMENT_CREDENTIAL_ID) != p.credential_id || exp._nsec <= enrollment_now(e)._nsec || exp._nsec > p.grant_end._nsec {return .Retry}
+	if enrollment_string(v, ENROLLMENT_CREDENTIAL_ID) != p.credential_id || exp._nsec <= enrollment_now(e)._nsec || exp._nsec > p.grant_end._nsec {return enrollment_invalid_response(e)}
 	p.expires_at = exp
 	p.renew_at = enrollment_renew_at(enrollment_now(e), exp)
 	if exp == p.grant_end {p.renew_at = p.grant_end}

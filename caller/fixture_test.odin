@@ -3,6 +3,7 @@ package caller
 import ag "../agent"
 import auth "../auth"
 import brk "../broker"
+import log "../logging"
 import proto "../protocol"
 import trans "../transport"
 import "core:net"
@@ -26,6 +27,7 @@ TestBroker :: struct {
 EchoWorker :: struct {
 	ln:   ^trans.Listener,
 	live: ^int,
+	stop: bool,
 }
 
 EchoMirrorArg :: struct {
@@ -44,7 +46,13 @@ AgentRunArg :: struct {
 	agent: ^ag.Agent,
 }
 
-start_test_broker :: proc(t: ^testing.T, fx: ^TestBroker, loc := #caller_location, tls_ctx: ^trans.TlsServerContext = nil) {
+start_test_broker :: proc(
+	t: ^testing.T,
+	fx: ^TestBroker,
+	loc := #caller_location,
+	tls_ctx: ^trans.TlsServerContext = nil,
+	logger: ^log.Logger = nil,
+) {
 	testing.expect_value(t, brk.registry_init(&fx.reg), brk.RegistryError.None, loc)
 	testing.expect_value(t, auth.auth_init(&fx.store), auth.AuthError.None, loc)
 	testing.expect_value(t, auth.auth_add_token(&fx.store, TEST_TOKEN_HOST, TEST_PRINCIPAL_HOST), auth.AuthError.None, loc)
@@ -52,6 +60,7 @@ start_test_broker :: proc(t: ^testing.T, fx: ^TestBroker, loc := #caller_locatio
 	brk.server_init(&fx.server, &fx.reg, auth.static_token_authenticator(&fx.store))
 	brk.server_disable_test_hardening(&fx.server)
 	fx.server.tls_ctx = tls_ctx
+	fx.server.logger = logger
 	fx.server.heartbeat_interval = 30 * time.Second
 	fx.server.session_timeout = 30 * time.Second
 	testing.expect_value(t, brk.server_listen(&fx.server, trans.loopback_endpoint(0)), trans.TransportError.None, loc)
@@ -73,35 +82,53 @@ broker_endpoint :: proc(t: ^testing.T, fx: ^TestBroker, loc := #caller_location)
 }
 
 start_echo :: proc(t: ^testing.T, fx: ^EchoFixture, loc := #caller_location) -> net.Endpoint {
+	return start_echo_at(t, fx, trans.loopback_endpoint(0), loc)
+}
+
+start_echo_at :: proc(t: ^testing.T, fx: ^EchoFixture, bind: net.Endpoint, loc := #caller_location) -> net.Endpoint {
 	lerr: trans.TransportError
-	fx.ln, lerr = trans.listener_listen(trans.loopback_endpoint(0))
-	testing.expect_value(t, lerr, trans.TransportError.None, loc)
-	_ = trans.listener_set_recv_timeout(&fx.ln, 50 * time.Millisecond)
+	fx.ln, lerr = trans.test_listener_listen(bind)
+	if !testing.expect_value(t, lerr, trans.TransportError.None, loc) ||
+	   !testing.expect_value(t, net.set_blocking(fx.ln.socket, false), net.Set_Blocking_Error.None, loc) {
+		return {}
+	}
 	ep, eerr := trans.listener_endpoint(fx.ln)
 	testing.expect_value(t, eerr, trans.TransportError.None, loc)
 	fx.live_conns = 0
-	fx.worker.ln = &fx.ln
-	fx.worker.live = &fx.live_conns
+	fx.worker = {ln = &fx.ln, live = &fx.live_conns}
 	fx.th = thread.create_and_start_with_poly_data(&fx.worker, echo_accept_loop)
+	testing.expect(t, fx.th != nil, "echo accept thread", loc = loc)
 	return ep
 }
 
 stop_echo :: proc(fx: ^EchoFixture) {
-	trans.listener_close(&fx.ln)
 	if fx.th != nil {
+		sync.atomic_store(&fx.worker.stop, true)
 		thread.join(fx.th)
 		thread.destroy(fx.th)
 		fx.th = nil
 	}
+	trans.listener_close(&fx.ln)
 }
 
 echo_accept_loop :: proc(w: ^EchoWorker) {
-	for {
+	for !sync.atomic_load(&w.stop) {
+		ready := trans.listener_wait_acceptable(w.ln, 50 * time.Millisecond)
+		if ready == .Timeout {
+			continue
+		}
+		if ready != .None || sync.atomic_load(&w.stop) {
+			return
+		}
 		conn, err := trans.listener_accept(w.ln)
 		if err == .Timeout {
 			continue
 		}
 		if err != .None {
+			return
+		}
+		if net.set_blocking(conn.socket, true) != .None {
+			trans.connection_destroy(conn)
 			return
 		}
 		arg, aerr := new(EchoMirrorArg)
@@ -119,9 +146,6 @@ echo_mirror_one :: proc(arg: ^EchoMirrorArg) {
 	conn := arg.conn
 	live := arg.live
 	free(arg)
-	// accept() inherits the listener's 50ms SO_RCVTIMEO. A timeout is not
-	// EOF; the mirror has to stay up for a stream that goes quiet.
-	_ = trans.connection_set_recv_timeout(conn, 0)
 	if live != nil {
 		sync.atomic_add(live, 1)
 	}

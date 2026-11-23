@@ -16,13 +16,6 @@ ConnState :: enum {
 	Authenticated,
 }
 
-ConnCloseReason :: enum {
-	None,
-	IdleTimeout,
-	Protocol,
-	Peer,
-}
-
 ConnHandler :: struct {
 	server:          ^Server,
 	conn:            ^trans.Connection,
@@ -43,7 +36,7 @@ ConnHandler :: struct {
 	last_recv:       time.Time,
 	last_ping_sent:  time.Time,
 	caller_counted:  bool,
-	close_reason:    ConnCloseReason,
+	close_reason:    trans.CloseCause,
 	// Stream ids this connection ended with the second HALF_CLOSE. The row
 	// is already gone, so a following CLOSE for one of these ids must not
 	// RESET StreamNotFound. Both peers get the id: the agent half-closes
@@ -99,10 +92,8 @@ conn_thread_proc :: proc(h: ^ConnHandler) {
 		// Publish idle only after the handler has returned its last allocation.
 		server_release_connection_slot(server, ip)
 	}
-	if h.server.tls_ctx != nil {
-		if trans.connection_tls_accept(h.conn, h.server.tls_ctx) != .None {
-			return
-		}
+	if server_accept_tls(server, h.conn) != .None {
+		return
 	}
 	if !conn_start_outbox(h) {
 		return
@@ -133,7 +124,7 @@ conn_cleanup :: proc(h: ^ConnHandler) {
 			} else {
 				code: proto.WireError = from == .Agent ? .AgentUnavailable : .InternalError
 				reason: ResetReason
-				if h.close_reason == .IdleTimeout {
+				if h.close_reason == .ReadIdle {
 					reason = .IdleTimeout
 				} else if from == .Agent {
 					reason = .AgentGone
@@ -166,11 +157,11 @@ conn_cleanup :: proc(h: ^ConnHandler) {
 		sync.atomic_sub(&h.server.metrics.active_caller_connections, 1)
 		h.caller_counted = false
 	}
-	if h.close_reason == .IdleTimeout {
+	if h.close_reason == .ReadIdle {
 		metrics_inc(&h.server.metrics.session_timeouts_total)
 	}
 	if h.state == .Authenticated {
-		conn_log(h, .Info, LOG_EVENT_SESSION_CLOSED, log.LogFields{reason = conn_close_reason_label(h.close_reason)})
+		conn_log_closed(h)
 	}
 	if h.session_id != INVALID_SESSION_ID {
 		_ = registry_remove_session(h.server.registry, h.session_id)
@@ -228,23 +219,25 @@ conn_run :: proc(h: ^ConnHandler) {
 			conn_expire_idle_streams(h)
 			conn_expire_grant_streams(h)
 			if conn_idle_expired(h) {
-				h.close_reason = .IdleTimeout
+				h.close_reason = .ReadIdle
 				return
 			}
 			if h.state == .Authenticated {
 				if !conn_maybe_send_ping(h) {
-					h.close_reason = .Peer
 					return
 				}
 			}
 			continue
 		}
 		if terr != .None {
-			h.close_reason = .Peer
+			h.close_reason = trans.connection_close_cause(h.conn, .NetworkError)
 			return
 		}
 		if perr != .None {
-			h.close_reason = .Protocol
+			h.close_reason = .ProtocolError
+			if perr == .Truncated {
+				h.close_reason = trans.connection_close_cause(h.conn, .ProtocolError)
+			}
 			wire := protocol_error_to_wire(perr)
 			metrics_inc(&h.server.metrics.protocol_errors_total)
 			if wire == .FrameTooLarge {
@@ -259,6 +252,9 @@ conn_run :: proc(h: ^ConnHandler) {
 		should_close := conn_handle_frame(h, frame)
 		proto.frame_destroy(&frame, h.server.allocator)
 		if should_close {
+			if h.close_reason == .None {
+				h.close_reason = trans.connection_close_cause(h.conn, .NetworkError)
+			}
 			return
 		}
 	}
@@ -304,10 +300,12 @@ conn_maybe_send_ping :: proc(h: ^ConnHandler) -> bool {
 	nonce := u64(time.time_to_unix_nano(time.now()))
 	payload, perr := proto.encode_ping(proto.Ping{nonce = nonce}, h.server.allocator)
 	if perr != .None {
+		h.close_reason = .InternalError
 		return false
 	}
 	defer delete(payload, h.server.allocator)
 	if !conn_write_payload(h, .Ping, payload) {
+		h.close_reason = trans.connection_close_cause(h.conn, .KeepaliveMiss)
 		return false
 	}
 	h.last_ping_sent = time.now()
@@ -374,7 +372,7 @@ conn_handle_authenticate :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 	if frame.header.opcode != .Authenticate {
 		metrics_inc(&h.server.metrics.protocol_errors_total)
 		_ = conn_send_failure(h, .Error, .ProtocolError)
-		h.close_reason = .Protocol
+		h.close_reason = .ProtocolError
 		return true
 	}
 	auth_started := time.now()
@@ -382,7 +380,7 @@ conn_handle_authenticate :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 	if err != .None {
 		metrics_inc(&h.server.metrics.protocol_errors_total)
 		_ = conn_send_failure(h, .Error, protocol_error_to_wire(err))
-		h.close_reason = .Protocol
+		h.close_reason = .ProtocolError
 		return true
 	}
 	ip := ip_key_from_endpoint(h.conn.remote)
@@ -397,7 +395,7 @@ conn_handle_authenticate :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 			log.LogFields{error_code = wire_error_name(.RateLimited), reason = peer_role_reason(h.role)},
 		)
 		_ = conn_send_failure(h, .AuthenticateFailed, .RateLimited)
-		h.close_reason = .Protocol
+		h.close_reason = .ProtocolError
 		return true
 	}
 	result, aerr := auth.authenticate(h.server.auth, msg.token)
@@ -412,7 +410,7 @@ conn_handle_authenticate :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 			log.LogFields{error_code = wire_error_name(.AuthenticationFailed), reason = peer_role_reason(h.role)},
 		)
 		_ = conn_send_failure(h, .AuthenticateFailed, auth_error_to_wire(aerr))
-		h.close_reason = .Protocol
+		h.close_reason = .ProtocolError
 		return true
 	}
 	pid, clone_err := strings.clone(result.id, h.server.allocator)
@@ -520,11 +518,9 @@ conn_handle_authenticated :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 	case .Hello, .HelloAck, .Authenticate, .AuthenticateOk, .AuthenticateFailed,
 	     .RegisterOk, .RegisterFailed, .UnregisterOk, .UnregisterFailed,
 	     .ConnectOk, .ConnectFailed, .Open, .Error:
-		_ = conn_send_failure(h, .Error, .ProtocolError)
-		return true
+		return conn_end_protocol(h, .ProtocolError)
 	}
-	_ = conn_send_failure(h, .Error, .ProtocolError)
-	return true
+	return conn_end_protocol(h, .ProtocolError)
 }
 
 conn_handle_register :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
@@ -551,8 +547,7 @@ conn_handle_register :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 		return false
 	}
 	if err != .None {
-		_ = conn_send_failure(h, .Error, protocol_error_to_wire(err))
-		return true
+		return conn_end_protocol(h, protocol_error_to_wire(err))
 	}
 	defer delete(string(msg.service_id), h.server.allocator)
 
@@ -622,6 +617,7 @@ conn_handle_register :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 		h.server.allocator,
 	)
 	if ok_err != .None {
+		h.close_reason = .InternalError
 		return true
 	}
 	defer delete(ok_payload, h.server.allocator)
@@ -671,8 +667,7 @@ conn_handle_unregister :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 			_ = conn_send_failure(h, .UnregisterFailed, .InvalidServiceId)
 			return false
 		}
-		_ = conn_send_failure(h, .Error, code)
-		return true
+		return conn_end_protocol(h, code)
 	}
 	defer delete(string(msg.service_id), h.server.allocator)
 	if perr := check_unregister_policy(h.server, conn_handler_principal(h)); perr != .None {
@@ -716,6 +711,7 @@ conn_handle_unregister :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 		h.server.allocator,
 	)
 	if ok_err != .None {
+		h.close_reason = .InternalError
 		return true
 	}
 	defer delete(ok_payload, h.server.allocator)
@@ -743,11 +739,11 @@ conn_handle_unregister :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 conn_handle_ping :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 	msg, err := proto.decode_ping(frame.payload)
 	if err != .None {
-		_ = conn_send_failure(h, .Error, protocol_error_to_wire(err))
-		return true
+		return conn_end_protocol(h, protocol_error_to_wire(err))
 	}
 	payload, perr := proto.encode_pong(proto.Pong{nonce = msg.nonce}, h.server.allocator)
 	if perr != .None {
+		h.close_reason = .InternalError
 		return true
 	}
 	defer delete(payload, h.server.allocator)
@@ -786,7 +782,7 @@ conn_handle_connect :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 		metrics_inc(&h.server.metrics.protocol_errors_total)
 		metrics_inc_connect_failure(&h.server.metrics, .ProtocolError)
 		_ = conn_send_failure(h, .Error, protocol_error_to_wire(err))
-		h.close_reason = .Protocol
+		h.close_reason = .ProtocolError
 		return true
 	}
 	defer delete(string(msg.service_id), h.server.allocator)
@@ -934,8 +930,7 @@ conn_handle_open_ok :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 		return conn_reject_role(h, .OpenOk)
 	}
 	if proto.decode_empty(frame.payload) != .None {
-		_ = conn_send_failure(h, .Error, .ProtocolError)
-		return true
+		return conn_end_protocol(h, .ProtocolError)
 	}
 	stream, err := relay_apply(h.server, frame.header.stream_id, .OpenOk, .Agent)
 	if err == .NotFound {
@@ -983,8 +978,7 @@ conn_handle_open_failed :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 	}
 	fail, ferr := proto.decode_wire_failure(frame.payload, h.server.allocator)
 	if ferr != .None {
-		_ = conn_send_failure(h, .Error, protocol_error_to_wire(ferr))
-		return true
+		return conn_end_protocol(h, protocol_error_to_wire(ferr))
 	}
 	delete(fail.diagnostic, h.server.allocator)
 
@@ -1084,14 +1078,12 @@ conn_handle_stream_frame :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 		event = .Data
 	case .HalfClose:
 		if proto.decode_empty(frame.payload) != .None {
-			_ = conn_send_failure(h, .Error, .ProtocolError)
-			return true
+			return conn_end_protocol(h, .ProtocolError)
 		}
 		event = .HalfClose
 	case .Close:
 		if proto.decode_empty(frame.payload) != .None {
-			_ = conn_send_failure(h, .Error, .ProtocolError)
-			return true
+			return conn_end_protocol(h, .ProtocolError)
 		}
 		event = .Close
 	case .Reset:
@@ -1100,8 +1092,7 @@ conn_handle_stream_frame :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 	     .Register, .RegisterOk, .RegisterFailed, .Unregister, .UnregisterOk,
 	     .UnregisterFailed, .Connect, .ConnectOk, .ConnectFailed, .Open, .OpenOk,
 	     .OpenFailed, .Ping, .Pong, .Error:
-		_ = conn_send_failure(h, .Error, .ProtocolError)
-		return true
+		return conn_end_protocol(h, .ProtocolError)
 	}
 
 	peer: ^trans.Connection
@@ -1294,7 +1285,8 @@ conn_enqueue_stream :: proc(
 			if box == nil {
 				return true
 			}
-			ok := outbox_wait_stream_space(box, stream_id, needed, h.server.stream_stall_timeout)
+			source := h.outbox if from == .Agent else nil
+			ok := outbox_wait_stream_space(box, stream_id, needed, h.server.stream_stall_timeout, source)
 			outbox_release(box)
 			if ok {
 				_, still := relay_lookup_stream(h.server, stream_id)
@@ -1650,8 +1642,12 @@ conn_reject_role :: proc(h: ^ConnHandler, opcode: proto.Opcode) -> bool {
 		LOG_EVENT_ROLE_VIOLATION,
 		log.LogFields{error_code = wire_error_name(.ProtocolError), reason = role_violation_reason(h.role, opcode)},
 	)
-	_ = conn_send_failure(h, .Error, .ProtocolError)
-	h.close_reason = .Protocol
+	return conn_end_protocol(h, .ProtocolError)
+}
+
+conn_end_protocol :: proc(h: ^ConnHandler, wire: proto.WireError) -> bool {
+	h.close_reason = .ProtocolError
+	_ = conn_send_failure(h, .Error, wire)
 	return true
 }
 

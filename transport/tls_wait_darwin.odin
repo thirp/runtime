@@ -1,6 +1,5 @@
 package transport
 
-import "core:c"
 import "core:sys/posix"
 import "core:time"
 
@@ -19,6 +18,7 @@ tls_wait_socket_impl :: proc(conn: ^Connection, want_write: bool, timeout: time.
 		return .WouldBlock if posix.get_errno() == .EINTR else .Network
 	}
 	if .NVAL in pfd.revents {
+		connection_note_close(conn, .NetworkError)
 		conn.closed = true
 		return .Closed
 	}
@@ -26,9 +26,11 @@ tls_wait_socket_impl :: proc(conn: ^Connection, want_write: bool, timeout: time.
 	if ready {
 		return .None
 	}
-	if .HUP in pfd.revents || .ERR in pfd.revents {
+	socket_error := .ERR in pfd.revents
+	if .HUP in pfd.revents || socket_error {
 		// HUP is the peer's FIN with nothing left to read. ERR is a dead socket.
-		if .ERR in pfd.revents {
+		connection_note_close(conn, socket_pending_error_cause(conn, .NetworkError if socket_error else .PeerEOF))
+		if socket_error {
 			conn.closed = true
 		}
 		return .Closed

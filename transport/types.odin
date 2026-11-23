@@ -18,6 +18,7 @@ Connection :: struct {
 	// SSL call can ever run on a released, possibly reused, fd or handle.
 	io_inflight:   int,
 	close_started: bool,
+	close_cause:   CloseCause, // atomic
 	fd_released:   bool,
 	allocator:     mem.Allocator,
 	remote:        net.Endpoint,

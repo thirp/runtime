@@ -57,12 +57,13 @@ enrollment_share_links :: proc(links: []EnrollmentLink) {
 
 enrollment_new_caller :: proc(e: ^Enrollment, l: ^EnrollmentLink) -> (^EnrollmentCaller, bool) {
 	ep, ok := enrollment_resolve(e.cfg.broker, time.time_add(time.now(), cl.DEFAULT_DIAL_TIMEOUT))
-	if !ok {return nil, false}
+	if !ok {enrollment_failure(e, "broker", "dns", l.cfg.service); return nil, false}
 	sid, serr := proto.make_service_id(l.pending.service_id)
-	if serr != .None {return nil, false}
+	if serr != .None {enrollment_failure(e, "api", "invalid_service_id", l.cfg.service); return nil, false}
 	c := new(EnrollmentCaller)
 	c.grant_end = l.pending.grant_end
 	c.run.service_id, c.run.stall = sid, l.stall
+	c.run.enrollment, c.run.catalog_service = e, l.cfg.service
 	name := e.cfg.tls_server_name
 	if len(name) == 0 {name, _ = trans.endpoint_host(e.cfg.broker)}
 	impl := ver.version_line("thirp-connect")
@@ -70,9 +71,14 @@ enrollment_new_caller :: proc(e: ^Enrollment, l: ^EnrollmentLink) -> (^Enrollmen
 	cerr := cl.caller_init(&c.run.c, {
 		broker = ep, token = l.pending.token, tls_ca = e.cfg.tls_ca,
 		tls_server_name = name, implementation = impl, logger = &e.logger,
+		setup_failure = enrollment_broker_failure, setup_failure_user = &c.run,
 		max_stream_buffer = l.buffer, dial_timeout = cl.DEFAULT_DIAL_TIMEOUT,
 	})
-	if cerr != .None {free(c); return nil, false}
+	if cerr != .None {
+		if cerr == .OutOfMemory {enrollment_failure(e, "broker", "internal", l.cfg.service)}
+		free(c)
+		return nil, false
+	}
 	return c, true
 }
 
@@ -134,16 +140,15 @@ enrollment_accept :: proc(l: ^EnrollmentLink) {
 	session := l
 	if l.owner != nil {session = l.owner}
 	for !sync.atomic_load(&l.stop) {
-		sync.mutex_lock(&session.mutex)
-		active := session.current != nil
-		sync.mutex_unlock(&session.mutex)
-		if !active {time.sleep(ACCEPT_POLL); continue}
+		// Drain the kernel accept queue even before the first successful login.
 		if trans.listener_wait_acceptable(&l.ln, ACCEPT_POLL) != .None {continue}
 		local, err := trans.listener_accept(&l.ln)
 		if err != .None {continue}
 		sync.mutex_lock(&session.mutex)
 		c := session.current
-		if c == nil || time.now()._nsec >= c.grant_end._nsec || time.now()._nsec >= sync.atomic_load(&c.expires_ns) || sync.atomic_load(&c.run.live) >= MAX_BRIDGES {
+		now := time.now()._nsec
+		if c == nil || now >= c.grant_end._nsec || now >= sync.atomic_load(&c.expires_ns) ||
+			sync.atomic_load(&c.run.live) >= MAX_BRIDGES || !cl.caller_session_admitted(&c.run.c) {
 			sync.mutex_unlock(&session.mutex)
 			trans.connection_destroy(local)
 			continue
@@ -206,7 +211,7 @@ enrollment_link_step :: proc(e: ^Enrollment, l: ^EnrollmentLink) {
 		sync.mutex_lock(&l.mutex)
 		enrollment_retire_locked(l, true)
 		sync.mutex_unlock(&l.mutex)
-		enrollment_log(e, "waiting for approval", &l.plan)
+		enrollment_failure(e, "approval", "waiting_for_approval", l.cfg.service)
 		enrollment_plan_destroy(&l.plan)
 		l.next = {}
 	}
@@ -238,7 +243,7 @@ enrollment_link_step :: proc(e: ^Enrollment, l: ^EnrollmentLink) {
 		err := enrollment_renew(e, &l.plan)
 		if err == .Denied {
 			enrollment_drop(e, l)
-			enrollment_log(e, "waiting for approval")
+			enrollment_failure(e, "approval", "waiting_for_approval", l.cfg.service)
 			enrollment_retry(e, l, true)
 			return
 		}
@@ -260,14 +265,14 @@ enrollment_link_step :: proc(e: ^Enrollment, l: ^EnrollmentLink) {
 		found, err = enrollment_pick_grant(e, l)
 		if err == .None && !found && len(e.cfg.environment) == 0 {err = enrollment_create_grant(e, l)}
 		if err == .None && len(l.pending.grant_id) == 0 {
-			if len(l.plan.grant_id) == 0 {enrollment_log(e, "waiting for approval")}
+			if len(l.plan.grant_id) == 0 {enrollment_failure(e, "approval", "waiting_for_approval", l.cfg.service)}
 			enrollment_retry(e, l)
 			return
 		}
 	}
 	if err == .None && len(l.pending.token) == 0 {err = enrollment_mint(e, &l.pending)}
 	if err != .None {
-		if err == .Denied {enrollment_drop(e, l); enrollment_log(e, "waiting for approval")}
+		if err == .Denied {enrollment_drop(e, l); enrollment_failure(e, "approval", "waiting_for_approval", l.cfg.service)}
 		enrollment_retry(e, l, err == .Denied)
 		return
 	}
@@ -279,7 +284,12 @@ enrollment_link_step :: proc(e: ^Enrollment, l: ^EnrollmentLink) {
 	j := new(EnrollmentJob)
 	j.e, j.link, j.allocator = e, l, context.allocator
 	j.th = thread.create_and_start_with_poly_data(j, enrollment_job_run)
-	if j.th == nil {free(j); enrollment_retry(e, l); return}
+	if j.th == nil {
+		free(j)
+		enrollment_failure(e, "broker", "internal", l.cfg.service)
+		enrollment_retry(e, l)
+		return
+	}
 	l.job = j
 }
 
@@ -294,7 +304,7 @@ enrollment_step :: proc(e: ^Enrollment) -> EnrollmentError {
 		if err == .Denied {
 			e.denied = true
 			for &l in e.links {enrollment_drop(e, &l)}
-			enrollment_log(e, "waiting for approval")
+			enrollment_failure(e, "approval", "waiting_for_approval")
 		}
 	}
 	if e.expires_at != {} && enrollment_now(e)._nsec >= e.expires_at._nsec && len(e.pending_token) == 0 {return .Expired}
@@ -310,6 +320,7 @@ enrollment_main :: proc(path: string, stall: time.Duration, buffer: int, ctl: ^R
 	defer enrollment_config_destroy(&cfg)
 	e := Enrollment{cfg = &cfg, token = token}
 	log.logger_init(&e.logger, .Info)
+	if ctl != nil && ctl.enrollment_log_sink != nil {e.logger.sink = ctl.enrollment_log_sink}
 	e.links = make([]EnrollmentLink, len(cfg.links))
 	defer {
 		for &l in e.links {sync.atomic_store(&l.stop, true)}
@@ -325,11 +336,11 @@ enrollment_main :: proc(path: string, stall: time.Duration, buffer: int, ctl: ^R
 			delete(l.retired)
 			if l.opened {trans.listener_close(&l.ln)}
 		}
-		delete(e.links); delete(e.token); delete(e.pending_token)
+		delete(e.links); delete(e.token); delete(e.pending_token); delete(e.failure_next)
 	}
 	for &l, i in e.links {l.cfg, l.stall, l.buffer = cfg.links[i], stall, buffer}
 	enrollment_share_links(e.links)
-	for &l in e.links {
+	for &l, i in e.links {
 		ep, _ := trans.parse_endpoint(l.cfg.listen)
 		if !endpoint_is_loopback(ep) {fmt.eprintln("WARNING: caller.conf listen is not loopback; reachable hosts can use the bridge")}
 		l.ln, _, l.opened = listen_local(ep)
@@ -342,7 +353,9 @@ enrollment_main :: proc(path: string, stall: time.Duration, buffer: int, ctl: ^R
 				time.sleep(poll)
 			}
 		}
+		if ctl != nil && i == 0 {ctl.bound, _ = trans.listener_endpoint(l.ln)}
 	}
+	if ctl != nil {sync.atomic_store(&ctl.ready, true)}
 	r := EnrollmentReaper{e = &e, allocator = context.allocator}
 	reaper: ^thread.Thread
 	for reaper == nil {

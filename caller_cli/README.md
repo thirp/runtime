@@ -1,6 +1,7 @@
 # thirp-connect
 
-Listens on local TCP ports. Each accepted connection dials a named service through the broker and copies bytes both ways.
+Listens on local TCP ports and copies bytes both ways between local clients
+and named services through the broker.
 
 Source: `caller_cli/`. Binary name: `thirp-connect`. Uses the `caller` package for broker connections.
 
@@ -101,11 +102,12 @@ two allow ACEs, granting the current process-token user and LocalSystem (SYSTEM)
 checks the open file's DACL and refuses a NULL DACL, an unprotected DACL,
 inherited ACEs, or a grant that lets another principal read the data. Deny ACEs
 are permitted. An unsafe file causes the same error and exit 1 as on Unix.
-Relative `token_file` and `tls_ca` paths resolve beside the conf.
+Relative `token_file`, `tls_ca`, and `api_tls_ca` paths resolve beside the conf.
 One process opens a listener for every `service = <catalog id> listen = <IP:port>`
-line. `api` must be an HTTPS origin. TLS verifies both the control API and broker;
-`tls_ca` and `tls_server_name` apply to both, with each endpoint's hostname used
-by default. Stream buffer and stall flags can also be used.
+line. `api` must be an HTTPS origin. The API's TLS identity comes from the URL.
+The API uses system trust or the PEM CA file in the optional `api_tls_ca` key.
+`tls_ca` and `tls_server_name` configure the broker's trust and identity.
+Stream buffer and stall flags can also be used.
 
 `--caller-conf` cannot be mixed with `--token`, `--token-file`, `--broker`,
 `--service`, `--listen`, `--tls-ca`, `--tls-server-name`, or `--insecure`;
@@ -113,12 +115,18 @@ mixing them prints an error and exits 1.
 Put endpoint and TLS settings in the conf.
 The enrollment secret authenticates only control-plane requests. The process
 mints and renews a separate broker credential for each grant. Platforms
-org-wide links create and approve replacement grants automatically. Support
-links stop accepting at grant end, log `waiting for approval`, and poll until
-a new Active grant exists. They never create or approve access requests.
-Listeners stay bound while waiting and during rollover; existing streams drain
+org-wide links create and approve replacement grants automatically. At grant
+end, Support links log `waiting for approval` and poll for a new active grant
+under the existing approval policy. Listeners stay bound while waiting and
+during rollover. They close new local sockets on accept whenever their service
+lacks an admitted broker session. The accept loop polls at 50 ms and the
+loopback regression requires EOF within two seconds. Existing streams drain
 until EOF or their grant end. Revocation closes the Caller and its streams and
 polls slowly. Configuration errors and enrollment expiry exit nonzero.
+
+Setup failures go to stderr with a reason such as `tls_verify`, `dns`,
+`unauthorized_or_revoked`, or `unknown_service`. Each source and reason logs
+immediately on first occurrence and at most once per ten seconds per process.
 
 On start and every six hours the process checks enrollment expiry. Within
 30 days of expiry it rotates the token and replaces the configured `token_file` atomically

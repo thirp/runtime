@@ -69,6 +69,25 @@ test_dial_timeout_bounds_syn_retries :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_dial_timeout_reports_refused_origin :: proc(t: ^testing.T) {
+	// XNU can drop SYNs to a bound, non-listening socket. Close a real
+	// listener before dialing to exercise a refusal on all platforms.
+	ln, listen_err := test_listener_listen(loopback_endpoint(0))
+	if !testing.expect_value(t, listen_err, TransportError.None) {
+		return
+	}
+	endpoint, endpoint_err := listener_endpoint(ln)
+	listener_close(&ln)
+	if !testing.expect_value(t, endpoint_err, TransportError.None) {
+		return
+	}
+	conn, err := connection_dial_timeout(endpoint, 5 * time.Second)
+	defer connection_destroy(conn)
+	testing.expect_value(t, err, TransportError.Network)
+	testing.expect(t, conn == nil, "a refused dial returned a connection")
+}
+
+@(test)
 test_dial_timeout_zero_still_connects :: proc(t: ^testing.T) {
 	ln, lerr := listener_listen(loopback_endpoint(0))
 	testing.expect_value(t, lerr, TransportError.None)

@@ -2,6 +2,13 @@
 
 Project version is independent of the wire protocol version. This tree speaks protocol 1.0. See [COMPATIBILITY.md](COMPATIBILITY.md).
 
+## 0.16.13
+
+- `thirp-connect --caller-conf` logs setup failures to stderr and closes local connections while no broker session is ready (#45).
+- The standalone broker reloads its TLS certificate and key in place without interrupting existing sessions (#47).
+- The agent logs `close_cause` when a registered session disconnects, and the broker records its observed cause in `session_closed.reason` (#48).
+- After a reconnect, the caller and agent resume every service, and a receive watchdog closes a silent broker session with `close_cause=read_deadline` (#46).
+
 ## 0.16.12
 
 - The broker closes and frees a connection if accept succeeds during shutdown, fixing the socket and memory leak (#42).

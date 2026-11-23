@@ -14,16 +14,17 @@ CALLER_TOKEN_PREFIX :: "thirp_cen_"
 
 EnrollmentLinkConfig :: struct {service, listen: string}
 EnrollmentConfig :: struct {
-	// String fields borrow this buffer, except the two resolved file paths.
+	// String fields borrow this buffer, except the resolved file paths.
 	text: []u8,
 	api, org, environment, enrollment, broker, tls_server_name: string,
-	token_file, tls_ca: string,
+	token_file, tls_ca, api_tls_ca: string,
 	links: [dynamic]EnrollmentLinkConfig,
 }
 
 enrollment_config_destroy :: proc(c: ^EnrollmentConfig) {
 	delete(c.token_file)
 	delete(c.tls_ca)
+	delete(c.api_tls_ca)
 	delete(c.links)
 	delete(c.text)
 	c^ = {}
@@ -53,7 +54,7 @@ enrollment_config_parse :: proc(text, path: string) -> (c: EnrollmentConfig, ok:
 	defer if !ok {enrollment_config_destroy(&c)}
 	seen := make(map[string]bool)
 	defer delete(seen)
-	token_file, tls_ca: string
+	token_file, tls_ca, api_tls_ca: string
 	rest := string(c.text)
 	for raw in strings.split_lines_iterator(&rest) {
 		line := raw
@@ -86,6 +87,7 @@ enrollment_config_parse :: proc(text, path: string) -> (c: EnrollmentConfig, ok:
 		case "token_file": token_file = value
 		case "broker": c.broker = value
 		case "tls_ca": tls_ca = value
+		case "api_tls_ca": api_tls_ca = value
 		case "tls_server_name": c.tls_server_name = value
 		case: return c, false
 		}
@@ -101,6 +103,7 @@ enrollment_config_parse :: proc(text, path: string) -> (c: EnrollmentConfig, ok:
 		strings.contains_any(c.broker, "/?#@ \r\n\t\x00") || strings.contains_any(c.tls_server_name, "\r\n\x00") {return c, false}
 	c.token_file = enrollment_relative_path(path, token_file)
 	c.tls_ca = enrollment_relative_path(path, tls_ca)
+	c.api_tls_ca = enrollment_relative_path(path, api_tls_ca)
 	return c, true
 }
 

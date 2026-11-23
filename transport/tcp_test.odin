@@ -79,6 +79,8 @@ test_connection_close_is_visible_to_peer :: proc(t: ^testing.T) {
 	buf: [8]u8
 	_, rerr := connection_read(server, buf[:])
 	testing.expect_value(t, rerr, TransportError.Closed)
+	testing.expect_value(t, connection_close_cause(server), CloseCause.PeerEOF)
+	testing.expect_value(t, connection_close_cause(client), CloseCause.LocalClose)
 }
 
 @(test)
@@ -128,8 +130,15 @@ test_set_recv_timeout_returns_timeout :: proc(t: ^testing.T) {
 
 	testing.expect_value(t, connection_set_recv_timeout(server, 20 * time.Millisecond), TransportError.None)
 	buf: [8]u8
-	_, rerr := connection_read(server, buf[:])
-	testing.expect_value(t, rerr, TransportError.Timeout)
+	for _ in 0 ..< 3 {
+		n, rerr := connection_read(server, buf[:])
+		testing.expect_value(t, rerr, TransportError.Timeout)
+		testing.expect_value(t, n, 0)
+	}
+	testing.expect_value(t, connection_write(client, []u8{'p'}), TransportError.None)
+	n, rerr := connection_read(server, buf[:])
+	testing.expect_value(t, rerr, TransportError.None)
+	testing.expect_value(t, string(buf[:n]), "p")
 }
 
 @(test)

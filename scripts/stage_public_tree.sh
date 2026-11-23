@@ -54,6 +54,7 @@ ALLOW_DOCS=(
 
 ALLOW_SCRIPTS=(
 	scripts/check_sdk_api.sh
+	scripts/replay_caller_conf_tls_base.sh
 	scripts/release.sh
 	scripts/release_broker.sh
 	scripts/release_sdk.sh

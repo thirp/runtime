@@ -54,18 +54,13 @@ TOMBSTONE_CAP_FLOOR :: 7 * time.Second
 // below this. The cap floor is what actually keeps the session up.
 DIAL_TIMEOUT_WARN_BELOW :: 6 * time.Second
 LOG_EVENT_DIAL_TIMEOUT_SHORT :: "dial_timeout_short"
-// After this long with no frame, the caller sends Ping. The broker
-// answers. Deployed brokers heartbeat every 15s; a slower one must not
-// look idle. On Linux an unacked Ping is aborted by TCP_USER_TIMEOUT
-// and logged dead_peer. READ_IDLE_TIMEOUT is the fallback when the
-// kernel does not abort (a proxy that still ACKs, or a non-Linux host).
-CALLER_PING_INTERVAL :: 15 * time.Second
-// Nothing arrived from the broker for this long. Our own Ping does not
-// count. Three missed broker intervals, or a Ping with no Pong.
-READ_IDLE_TIMEOUT :: 45 * time.Second
+// Probe after inbound silence and allow time for a reply even if a probe
+// has to wait behind a frame. Any inbound frame proves liveness.
+CALLER_PING_INTERVAL :: 2 * time.Second
+DEAD_PEER_TIMEOUT :: 7 * time.Second
+SESSION_IDLE_TIMEOUT :: 45 * time.Second
 LOG_REASON_IDLE :: "idle"
-// A dial timed out and the broker socket was retransmitting with nothing
-// read back since the CONNECT was sent.
+// The broker stopped sending frames, or outstanding bytes went unacknowledged.
 LOG_REASON_DEAD_PEER :: "dead_peer"
 DEAD_PEER_MIN_WAIT :: 1 * time.Second
 LOG_EVENT_SESSION_RETIRED :: "session_retired"

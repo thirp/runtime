@@ -222,7 +222,9 @@ agent_run :: proc(agent: ^Agent) -> AgentError {
 		relay.broker = conn
 		relay.streams = make(map[proto.StreamId]AgentLocalStream)
 		agent_set_live_relay(agent, &relay)
-		reason := agent_relay_loop(&relay, &decoder)
+		cause, closed_at, dead_peer := agent_relay_loop(&relay, &decoder)
+		// Unblock any pump still writing before waiting for old streams.
+		trans.connection_shutdown_both(conn)
 		agent_clear_all(&relay)
 		agent_set_live_relay(agent, nil)
 		delete(relay.streams)
@@ -231,13 +233,12 @@ agent_run :: proc(agent: ^Agent) -> AgentError {
 		proto.decoder_destroy(&decoder)
 		agent_set_live_conn(agent, nil)
 		trans.connection_destroy(conn)
+		agent_log_disconnected(agent, cause, closed_at, dead_peer)
 		if sync.atomic_load(&agent.stop) {
 			return .None
 		}
-		if reason != LOG_REASON_IDLE {
-			agent_log(agent, .Info, "disconnected")
-		}
 		delay := reconnect_delay(0, jitter_u64())
+		reason := LOG_REASON_DEAD_PEER if dead_peer else "disconnected"
 		agent_log(agent, .Info, "reconnect_scheduled", log.LogFields{reason = reason})
 		agent_sleep(agent, delay)
 		attempt = 1
@@ -582,6 +583,12 @@ agent_read_control :: proc(
 
 agent_log :: proc(agent: ^Agent, level: log.LogLevel, event: string, fields: log.LogFields = {}) {
 	log.log_event(agent.config.logger, level, event, fields)
+}
+
+agent_log_disconnected :: proc(agent: ^Agent, cause: trans.CloseCause, closed_at: time.Time, dead_peer: bool) {
+	label := trans.close_cause_label(cause)
+	reason := LOG_REASON_DEAD_PEER if dead_peer else label
+	log.log_event_at(agent.config.logger, .Info, "disconnected", closed_at, log.LogFields{reason = reason, close_cause = label})
 }
 
 agent_log_registered :: proc(agent: ^Agent) {

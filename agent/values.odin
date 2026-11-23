@@ -19,12 +19,11 @@ ERROR_CLASS_TLS :: "tls"
 LOG_EVENT_RATE_LIMITED :: "rate_limited"
 // One line per service that is live on the broker session.
 LOG_EVENT_REGISTERED :: "registered"
-HEARTBEAT_INTERVAL :: 15 * time.Second
+HEARTBEAT_INTERVAL :: 2 * time.Second
 HEARTBEAT_WRITE_TIMEOUT :: 50 * time.Millisecond
-// No inbound frame for three heartbeat intervals. Our own Ping does not
-// count: the broker must send a frame (including Ping or Pong).
-READ_IDLE_TIMEOUT :: 45 * time.Second
-LOG_REASON_IDLE :: "idle"
+// A successful local write does not prove the broker is responding.
+DEAD_PEER_TIMEOUT :: 7 * time.Second
+LOG_REASON_DEAD_PEER :: "dead_peer"
 LOG_EVENT_RELAY_IO_FAILED :: "relay_io_failed"
 LOG_PHASE_PING_WRITE :: "ping_write"
 LOG_PHASE_FRAME_READ :: "frame_read"

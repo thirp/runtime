@@ -17,7 +17,11 @@ ENROLLMENT_HEADER_MAX :: 16 << 10
 
 EnrollmentError :: enum {None, Retry, Denied, Config, Expired}
 EnrollmentRequest :: struct {method, path, bearer, body: string}
-EnrollmentResponse :: struct {status: int, body: string}
+EnrollmentResponse :: struct {
+	status: int,
+	body: string,
+	failure: string, // local reason class for transport failures
+}
 EnrollmentHttp :: proc(rawptr, ^EnrollmentConfig, EnrollmentRequest) -> (EnrollmentResponse, EnrollmentError)
 
 // OS DNS APIs have no portable cancellation. The request holds one reference;
@@ -98,16 +102,16 @@ enrollment_network_http :: proc(_: rawptr, cfg: ^EnrollmentConfig, req: Enrollme
 	if !ok {return {}, .Config}
 	until := time.time_add(time.now(), ENROLLMENT_HTTP_TIMEOUT)
 	ep, resolved := enrollment_resolve(address, until)
-	if !resolved {return {}, .Retry}
+	if !resolved {return {failure = "dns"}, .Retry}
 	trans.openssl_ensure_init()
 	left := time.diff(time.now(), until)
-	if left <= 0 {return {}, .Retry}
+	if left <= 0 {return {failure = "timeout"}, .Retry}
 	conn, derr := trans.connection_dial_timeout(ep, left)
-	if derr != .None {return {}, .Retry}
+	if derr != .None {return {failure = derr == .Timeout ? "timeout" : "connect"}, .Retry}
 	defer trans.connection_destroy(conn)
 	d := EnrollmentDeadline{until = until, conn = conn}
 	th := thread.create_and_start_with_poly_data(&d, enrollment_deadline_watch)
-	if th == nil {return {}, .Retry}
+	if th == nil {return {failure = "internal"}, .Retry}
 	defer {
 		sync.mutex_lock(&d.mutex)
 		d.cancelled = true
@@ -115,26 +119,32 @@ enrollment_network_http :: proc(_: rawptr, cfg: ^EnrollmentConfig, req: Enrollme
 		sync.mutex_unlock(&d.mutex)
 		thread.join(th); thread.destroy(th)
 	}
-	name := cfg.tls_server_name
-	if len(name) == 0 {name = host}
 	left = time.diff(time.now(), until)
-	if left <= 0 {return {}, .Retry}
-	if trans.connection_tls_connect(conn, {ca_path = cfg.tls_ca, server_name = name}, left) != .None {return {}, .Retry}
+	if left <= 0 {return {failure = "timeout"}, .Retry}
+	verify_failed: bool
+	if trans.connection_tls_connect(conn, {ca_path = cfg.api_tls_ca, server_name = host}, left,
+		&verify_failed, verify_ip = net.parse_address(host) != nil) != .None {
+		if verify_failed {return {failure = "tls_verify"}, .Retry}
+		if time.now()._nsec >= until._nsec {return {failure = "timeout"}, .Retry}
+		return {failure = "tls_handshake"}, .Retry
+	}
 	_ = trans.connection_set_recv_timeout(conn, ENROLLMENT_HTTP_TIMEOUT)
 	_ = trans.connection_set_send_timeout(conn, ENROLLMENT_HTTP_TIMEOUT)
 	wire := enrollment_http_request(hostport, req)
 	defer delete(wire)
-	if trans.connection_write(conn, transmute([]u8)wire) != .None {return {}, .Retry}
+	if err := trans.connection_write(conn, transmute([]u8)wire); err != .None {
+		return {failure = err == .Timeout || time.now()._nsec >= until._nsec ? "timeout" : "http_io"}, .Retry
+	}
 	raw: [dynamic]u8
 	defer delete(raw)
 	buf: [4096]u8
 	for {
 		n, err := trans.connection_read(conn, buf[:])
-		if len(raw)+n > ENROLLMENT_HTTP_MAX {return {}, .Retry}
+		if len(raw)+n > ENROLLMENT_HTTP_MAX {return {failure = "invalid_response"}, .Retry}
 		append(&raw, ..buf[:n])
-		if time.now()._nsec >= until._nsec {return {}, .Retry}
+		if time.now()._nsec >= until._nsec || err == .Timeout {return {failure = "timeout"}, .Retry}
 		if err == .Closed {break}
-		if err != .None {return {}, .Retry}
+		if err != .None {return {failure = "http_io"}, .Retry}
 	}
 	return enrollment_http_response(string(raw[:]))
 }
@@ -189,7 +199,7 @@ enrollment_http_response :: proc(raw: string) -> (EnrollmentResponse, Enrollment
 			if n == 0 {
 				// Trailers may be present; the terminating empty line is required.
 				if body != "\r\n" && !strings.has_suffix(body, "\r\n\r\n") {return {}, .Retry}
-				return {status, strings.clone(string(decoded[:]))}, .None
+				return {status = status, body = strings.clone(string(decoded[:]))}, .None
 			}
 			if body[n:n+2] != "\r\n" {return {}, .Retry}
 			append(&decoded, ..transmute([]u8)body[:n])
@@ -197,7 +207,7 @@ enrollment_http_response :: proc(raw: string) -> (EnrollmentResponse, Enrollment
 		}
 	}
 	if length >= 0 && length != len(body) {return {}, .Retry}
-	return {status, strings.clone(body)}, .None
+	return {status = status, body = strings.clone(body)}, .None
 }
 
 enrollment_string :: proc(v: json.Value, key: string) -> string {

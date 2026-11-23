@@ -4,6 +4,7 @@ import proto "../protocol"
 import trans "../transport"
 import "base:runtime"
 import "core:bytes"
+import "core:mem"
 import "core:sync"
 import "core:thread"
 import "core:time"
@@ -12,6 +13,7 @@ import "core:time"
 // DATA) are pulled first at each frame boundary. The socket write for the
 // frame already in flight is not interrupted.
 WriteJob :: struct {
+	allocator: mem.Allocator,
 	conn:      ^trans.Connection,
 	opcode:    proto.Opcode,
 	payload:   []u8,
@@ -190,6 +192,25 @@ caller_write_until :: proc(
 	return ok, false, ok
 }
 
+// Post a reader-generated control frame without waiting for the writer.
+caller_post_control :: proc(
+	c: ^Caller,
+	conn: ^trans.Connection,
+	gen: int,
+	opcode: proto.Opcode,
+	payload: []u8,
+	stream_id: proto.StreamId = proto.CONNECTION_STREAM_ID,
+) -> bool {
+	if !trans.connection_acquire(conn) {
+		return false
+	}
+	if caller_enqueue(c, conn, opcode, payload, stream_id, gen, false, true) == nil {
+		trans.connection_release(conn)
+		return false
+	}
+	return true
+}
+
 caller_enqueue :: proc(
 	c: ^Caller,
 	conn: ^trans.Connection,
@@ -200,16 +221,17 @@ caller_enqueue :: proc(
 	check_gen: bool = false,
 	release_conn: bool = false,
 ) -> ^WriteJob {
-	// A detached job is freed on the writer thread. The test tracking
-	// allocator is thread-local, so that alloc and free go through the heap.
+	// A detached control job or a timed CONNECT can outlive its submitting
+	// thread. Keep its storage on the heap until the writer is done.
 	alloc := context.allocator
-	if release_conn {
+	if release_conn || check_gen {
 		alloc = runtime.heap_allocator()
 	}
 	job, aerr := new(WriteJob, alloc)
 	if aerr != .None {
 		return nil
 	}
+	job.allocator = alloc
 	job.release_conn = release_conn
 	// CONNECT and a late RESET pass the generation they snapshotted.
 	// Anything else takes the generation the socket has right now.
@@ -239,7 +261,7 @@ caller_enqueue :: proc(
 	job.check_gen = check_gen
 	job.control = opcode != .Data
 	sync.mutex_lock(&c.write_mu)
-	if c.queues_closed {
+	if c.queues_closed || (release_conn && c.writer == nil) {
 		sync.mutex_unlock(&c.write_mu)
 		caller_free_job(job)
 		return nil
@@ -248,12 +270,25 @@ caller_enqueue :: proc(
 	if job.control {
 		q = &c.control_q
 	}
+	if release_conn && (opcode == .Ping || opcode == .Pong) {
+		// Keep at most one unsent probe or reply per socket generation.
+		for queued in c.control_q {
+			if queued.release_conn && queued.conn == conn && queued.gen == job_gen && queued.opcode == opcode {
+				queued.payload, job.payload = job.payload, queued.payload
+				sync.mutex_unlock(&c.write_mu)
+				caller_finish_detached(job)
+				return queued
+			}
+		}
+	}
 	if _, err := append(q, job); err != .None {
 		sync.mutex_unlock(&c.write_mu)
 		caller_free_job(job)
 		return nil
 	}
-	start := !c.writing
+	// Before the initial handshake finishes there is no reader or writer
+	// thread. Its synchronous writes can drain inline.
+	start := c.writer == nil && !c.writing
 	if start {
 		c.writing = true
 	}
@@ -306,14 +341,10 @@ caller_free_job :: proc(job: ^WriteJob) {
 	if job == nil {
 		return
 	}
-	alloc := context.allocator
-	if job.release_conn {
-		alloc = runtime.heap_allocator()
-	}
 	if len(job.payload) > 0 {
-		delete(job.payload, alloc)
+		delete(job.payload, job.allocator)
 	}
-	free(job, alloc)
+	free(job, job.allocator)
 }
 
 caller_pop_job :: proc(c: ^Caller) -> ^WriteJob {
@@ -328,6 +359,23 @@ caller_pop_job :: proc(c: ^Caller) -> ^WriteJob {
 		return job
 	}
 	return nil
+}
+
+caller_writer_proc :: proc(c: ^Caller) {
+	for {
+		sync.mutex_lock(&c.write_mu)
+		for !c.queues_closed && len(c.control_q) == 0 && len(c.data_q) == 0 {
+			sync.cond_wait(&c.write_cond, &c.write_mu)
+		}
+		if c.queues_closed {
+			sync.mutex_unlock(&c.write_mu)
+			return
+		}
+		c.writing = true
+		sync.cond_broadcast(&c.write_cond)
+		sync.mutex_unlock(&c.write_mu)
+		caller_drain(c)
+	}
 }
 
 caller_drain :: proc(c: ^Caller) {
@@ -432,6 +480,11 @@ caller_close_writes :: proc(c: ^Caller) {
 	sync.cond_broadcast(&c.write_cond)
 	sync.mutex_unlock(&c.write_mu)
 	caller_wait_writes(c)
+	if c.writer != nil {
+		thread.join(c.writer)
+		thread.destroy(c.writer)
+		c.writer = nil
+	}
 }
 
 caller_wait_writes :: proc(c: ^Caller) {
@@ -465,10 +518,8 @@ caller_delete_queues :: proc(c: ^Caller) {
 	c.data_q = nil
 }
 
-// One timer for the session. Wakes on write_cond (enqueue or completion),
-// not on a poll. The deadline is absolute: a broadcast that is not send
-// progress does not extend it. Idle sessions (nothing in flight) wait
-// instead of closing.
+// Watch receive liveness independently of the writer.
+// Send-stall deadlines still move only when a write makes progress.
 caller_stall_proc :: proc(c: ^Caller) {
 	baseline: u64
 	baseline_set := false
@@ -478,6 +529,7 @@ caller_stall_proc :: proc(c: ^Caller) {
 	use_tcp := false
 	deadline: time.Time
 	for !sync.atomic_load(&c.stall_stop) {
+		caller_watch_sessions(c, time.tick_now())
 		window := caller_send_stall(c)
 		sync.mutex_lock(&c.write_mu)
 		if sync.atomic_load(&c.stall_stop) {
@@ -488,7 +540,7 @@ caller_stall_proc :: proc(c: ^Caller) {
 		if window <= 0 || !inflight {
 			baseline_set = false
 			use_tcp = false
-			sync.cond_wait(&c.write_cond, &c.write_mu)
+			_ = sync.cond_wait_with_timeout(&c.write_cond, &c.write_mu, CALLER_POLL_INTERVAL)
 			sync.mutex_unlock(&c.write_mu)
 			continue
 		}
@@ -515,7 +567,10 @@ caller_stall_proc :: proc(c: ^Caller) {
 			use_tcp = false
 			sync.mutex_lock(&c.write_mu)
 			for (c.write_inflight || c.writing) && !sync.atomic_load(&c.stall_stop) {
-				sync.cond_wait(&c.write_cond, &c.write_mu)
+				_ = sync.cond_wait_with_timeout(&c.write_cond, &c.write_mu, CALLER_POLL_INTERVAL)
+				sync.mutex_unlock(&c.write_mu)
+				caller_watch_sessions(c, time.tick_now())
+				sync.mutex_lock(&c.write_mu)
 			}
 			sync.mutex_unlock(&c.write_mu)
 			continue
@@ -530,7 +585,7 @@ caller_stall_proc :: proc(c: ^Caller) {
 			baseline_set = false
 			continue
 		}
-		_ = sync.cond_wait_with_timeout(&c.write_cond, &c.write_mu, left)
+		_ = sync.cond_wait_with_timeout(&c.write_cond, &c.write_mu, min(left, CALLER_POLL_INTERVAL))
 		sync.mutex_unlock(&c.write_mu)
 	}
 }

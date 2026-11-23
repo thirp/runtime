@@ -24,36 +24,42 @@ windows_disable_loopback_syn_retries :: proc(fd: win.SOCKET) {
 }
 
 dial_connect_other :: proc(sock: net.TCP_Socket, ep: net.Endpoint, timeout: time.Duration) -> TransportError {
-		addr: win.SOCKADDR_STORAGE_LH
-		loopback := false
-		switch a in ep.address {
-		case net.IP4_Address:
-			loopback = a[0] == 127
-			(^win.sockaddr_in)(&addr)^ = {sin_family = u16(win.AF_INET), sin_port = u16be(ep.port), sin_addr = transmute(win.in_addr)a}
-		case net.IP6_Address:
-			loopback = a == net.IP6_Loopback
-			(^win.sockaddr_in6)(&addr)^ = {sin6_family = u16(win.AF_INET6), sin6_port = u16be(ep.port), sin6_addr = transmute(win.in6_addr)a}
-		}
-		fd := win.SOCKET(sock)
-		if loopback {
-			windows_disable_loopback_syn_retries(fd)
-		}
-		if win.connect(fd, &addr, size_of(addr)) == 0 {return .None}
-		e := win.WSAGetLastError()
-		if e != win.WSAEWOULDBLOCK && e != win.WSAEINPROGRESS {return e == win.WSAETIMEDOUT ? .Timeout : .Network}
-		deadline := time.time_add(time.now(), timeout)
-		for {
-			left := time.diff(time.now(), deadline)
-			if left <= 0 {return .Timeout}
-			pfd := win.WSA_POLLFD{fd = fd, events = i16(win.POLLOUT)}
-			n := win.WSAPoll(&pfd, 1, max(1, tls_poll_timeout_ms(left)))
-			if n == win.SOCKET_ERROR && win.WSAGetLastError() == win.WSAEINTR {continue}
-			if n == win.SOCKET_ERROR {return .Network}
-			if n == 0 {return .Timeout}
-			soerr: i32
-			length := i32(size_of(soerr))
-			if win.getsockopt(fd, win.SOL_SOCKET, win.SO_ERROR, ([^]u8)(&soerr), &length) != 0 {return .Network}
-			if soerr == 0 {return .None}
-			return soerr == win.WSAETIMEDOUT ? .Timeout : .Network
+	addr: win.SOCKADDR_STORAGE_LH
+	loopback := false
+	switch a in ep.address {
+	case net.IP4_Address:
+		loopback = a[0] == 127
+		(^win.sockaddr_in)(&addr)^ = {sin_family = u16(win.AF_INET), sin_port = u16be(ep.port), sin_addr = transmute(win.in_addr)a}
+	case net.IP6_Address:
+		loopback = a == net.IP6_Loopback
+		(^win.sockaddr_in6)(&addr)^ = {sin6_family = u16(win.AF_INET6), sin6_port = u16be(ep.port), sin6_addr = transmute(win.in6_addr)a}
+	}
+	fd := win.SOCKET(sock)
+	if loopback {
+		windows_disable_loopback_syn_retries(fd)
+	}
+	if win.connect(fd, &addr, size_of(addr)) == 0 {return .None}
+	e := win.WSAGetLastError()
+	if e != win.WSAEWOULDBLOCK && e != win.WSAEINPROGRESS {return e == win.WSAETIMEDOUT ? .Timeout : .Network}
+
+	// Winsock select reports failed connects through exceptfds. WSAPoll on
+	// older Windows may wait out the full timeout after a refusal.
+	deadline := time.tick_add(time.tick_now(), timeout)
+	for {
+		left := time.tick_diff(time.tick_now(), deadline)
+		if left <= 0 {return .Timeout}
+		ms := max(1, tls_poll_timeout_ms(left))
+		wait := win.timeval{tv_sec = ms / 1000, tv_usec = (ms % 1000) * 1000}
+		writable, failed := win.fd_set{fd_count = 1}, win.fd_set{fd_count = 1}
+		writable.fd_array[0], failed.fd_array[0] = fd, fd
+		n := win.select(0, nil, &writable, &failed, &wait)
+		if n == win.SOCKET_ERROR && win.WSAGetLastError() == win.WSAEINTR {continue}
+		if n == win.SOCKET_ERROR {return .Network}
+		if n == 0 {return .Timeout}
+		soerr: i32
+		length := i32(size_of(soerr))
+		if win.getsockopt(fd, win.SOL_SOCKET, win.SO_ERROR, ([^]u8)(&soerr), &length) != 0 {return .Network}
+		if soerr == 0 && failed.fd_count == 0 && writable.fd_count == 1 {return .None}
+		return soerr == win.WSAETIMEDOUT ? .Timeout : .Network
 		}
 }

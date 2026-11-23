@@ -28,6 +28,7 @@ ConnOutbox :: struct {
 	closed:       bool,
 	refs:         int,
 	writer:       ^thread.Thread,
+	waiting_on_stream: bool, // our reader is waiting for a downstream outbox
 	// Test only. While set, the writer leaves queued frames in place so a
 	// test can observe what a terminal HALF_CLOSE does to them. Production
 	// leaves it false. Shutdown (closed) still drains.
@@ -350,9 +351,16 @@ outbox_wait_stream_space :: proc(
 	stream_id: proto.StreamId,
 	needed: int,
 	timeout: time.Duration,
+	source: ^ConnOutbox = nil,
 ) -> bool {
 	if box == nil {
 		return false
+	}
+	if source != nil {
+		outbox_set_stream_wait(source, true)
+	}
+	defer if source != nil {
+		outbox_set_stream_wait(source, false)
 	}
 	// No-progress semantics: the clock restarts whenever this stream's
 	// queue shrinks, so a slow but steady destination never trips it; only
@@ -390,21 +398,65 @@ outbox_wait_stream_space :: proc(
 	}
 }
 
+outbox_set_stream_wait :: proc(box: ^ConnOutbox, waiting: bool) {
+	sync.mutex_lock(&box.mutex)
+	box.waiting_on_stream = waiting
+	sync.cond_broadcast(&box.cond)
+	sync.mutex_unlock(&box.mutex)
+}
+
 outbox_writer_proc :: proc(box: ^ConnOutbox) {
 	allocator := box.allocator
+	interval := BACKPRESSURE_PING_INTERVAL
+	if box.server != nil && box.server.heartbeat_interval > 0 {
+		interval = min(interval, box.server.heartbeat_interval)
+	}
+	next_ping: time.Tick
 	for {
 		sync.mutex_lock(&box.mutex)
-		for !box.closed && (!outbox_has_frame_locked(box) || box.writer_hold) {
-			sync.cond_wait(&box.cond, &box.mutex)
+		ping := false
+		for !box.closed {
+			if !box.waiting_on_stream || box.writer_hold {
+				if !box.writer_hold && outbox_has_frame_locked(box) {
+					break
+				}
+				sync.cond_wait(&box.cond, &box.mutex)
+				continue
+			}
+			// The reader cannot consume the agent's Ping with a DATA frame
+			// waiting for space. A broker Ping still proves the path is alive.
+			now := time.tick_now()
+			left := time.tick_diff(now, next_ping)
+			if next_ping == {} || left <= 0 {
+				next_ping = time.tick_add(now, interval)
+				ping = true
+				break
+			}
+			if outbox_has_frame_locked(box) {
+				break
+			}
+			_ = sync.cond_wait_with_timeout(&box.cond, &box.mutex, left)
 		}
 		if box.closed && !outbox_has_frame_locked(box) {
 			sync.mutex_unlock(&box.mutex)
 			return
 		}
-		frame, ok := outbox_take_next_locked(box)
+		frame: QueuedFrame
+		ok := ping
+		if !ping {
+			frame, ok = outbox_take_next_locked(box)
+		}
 		sync.mutex_unlock(&box.mutex)
 		if !ok {
 			continue
+		}
+		if ping {
+			frame.opcode = .Ping
+			payload, err := proto.encode_ping(proto.Ping{nonce = u64(time.time_to_unix_nano(time.now()))}, allocator)
+			if err != .None {
+				continue
+			}
+			frame.payload = payload
 		}
 		terr, perr := trans.write_frame(box.conn, frame.opcode, frame.payload, frame.stream_id, allocator)
 		if len(frame.payload) > 0 {

@@ -427,6 +427,7 @@ test_tls_set_recv_timeout_returns_timeout :: proc(t: ^testing.T) {
 	buf: [8]u8
 	_, rerr := connection_read(server, buf[:])
 	testing.expect_value(t, rerr, TransportError.Timeout)
+	testing.expect_value(t, connection_close_cause(server), CloseCause.None)
 }
 
 @(test)
@@ -520,6 +521,7 @@ test_tls_response_after_peer_shutdown_write :: proc(t: ^testing.T) {
 		}
 	}
 	testing.expect_value(t, rerr, TransportError.Closed)
+	testing.expect_value(t, connection_close_cause(server), CloseCause.PeerEOF)
 
 	body := make([]u8, 20 * 1024)
 	defer delete(body)

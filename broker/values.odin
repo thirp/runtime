@@ -8,6 +8,8 @@ DEFAULT_MAX_STREAM_BUFFER :: 256 * 1024
 // A stream whose destination queue is full is reset only after it drained
 // nothing for this long. A slow but steady destination is never reset.
 DEFAULT_STREAM_STALL_TIMEOUT :: 30 * time.Second
+// Keep the source session alive while its reader waits for a slow caller.
+BACKPRESSURE_PING_INTERVAL :: 2 * time.Second
 DEFAULT_MAX_CONNECTION_BUFFER :: 8 * 1024 * 1024
 DEFAULT_MAX_STREAMS_PER_SESSION :: 256
 DEFAULT_MAX_PHYSICAL_CONNECTIONS :: 4096

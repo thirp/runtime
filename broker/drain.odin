@@ -52,6 +52,8 @@ server_drain :: proc(server: ^Server, grace: time.Duration) {
 
 	conns := server_copy_outbox_conns(server)
 	for conn in conns {
+		// The agent may close immediately after the notice.
+		trans.connection_note_close(conn, .BrokerDrain)
 		_ = relay_write_failure(
 			conn,
 			.Error,
@@ -124,6 +126,7 @@ server_drain :: proc(server: ^Server, grace: time.Duration) {
 
 	left := server_copy_outbox_conns(server)
 	for conn in left {
+		trans.connection_note_close(conn, .BrokerDrain)
 		trans.connection_close(conn)
 		trans.connection_release(conn)
 	}

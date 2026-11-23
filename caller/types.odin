@@ -13,10 +13,10 @@ import "core:time"
 // binary does not carry them.
 when ODIN_TEST {
 	Caller_Test_Config :: struct {
-		// 0 = the production constants. Tests shorten the idle watchdog
-		// and the caller Ping so a suite does not sleep for minutes.
-		read_idle_timeout: time.Duration,
-		ping_interval:     time.Duration,
+		// 0 = the production constants.
+		read_idle_timeout:    time.Duration,
+		session_idle_timeout: time.Duration,
+		ping_interval:        time.Duration,
 	}
 	Caller_Test_State :: struct {
 		// Last reason the reader logged for a drop. Not cleared on
@@ -38,8 +38,8 @@ CallerDrain :: struct {
 	decoder:    proto.FrameDecoder,
 	streams:    map[proto.StreamId]^Conn,
 	tombstone:  bool,
-	last_recv:  time.Time,
-	last_ping:  time.Time,
+	last_recv:  time.Tick,
+	last_ping:  time.Tick,
 	stop:       bool,
 	closed:     bool,
 }
@@ -86,6 +86,8 @@ CallerConfig :: struct {
 	tls_server_name: string,
 	implementation:  string,
 	logger:          ^log.Logger,
+	setup_failure:   proc(user: rawptr, phase, reason: string),
+	setup_failure_user: rawptr,
 	// Bounds broker setup (TCP, TLS, Hello and Authenticate together), and
 	// each stream CONNECT. 0 keeps legacy broker setup behavior and waits until
 	// CONNECT_OK or the session ends. thirp-connect passes
@@ -115,9 +117,10 @@ Conn :: struct {
 	reset:        bool,
 	eof:          bool,
 	write_closed: bool,
-	// Set when CONNECT_OK binds this stream. A dial whose slot was cleared
-	// and then reused must not treat pending_err == None as success.
+	// The outcome belongs to this dial even after the session or slot is reused.
+	// Protected by caller.mutex while dial is in progress.
 	accepted:     bool,
+	dial_error:   CallerError,
 	// Set under caller.mutex before a stalled session clears this dial's
 	// pending slot. The reader can consume disconnect_reason before dial wakes.
 	dial_stalled: bool,
@@ -139,19 +142,18 @@ Caller :: struct {
 	decoder:      proto.FrameDecoder,
 	streams:      map[proto.StreamId]^Conn,
 	pending:      ^Conn,
-	pending_err:  CallerError,
 	// A CONNECT already left and its dial gave up. The slot stays taken
 	// until that CONNECT_OK (RESET, not bound), CONNECT_FAILED, or the
 	// session drops. A later dial waits behind it, on its own deadline.
 	pending_tombstone:  bool,
 	tombstone_capped:   bool,
 	tombstone_deadline: time.Time,
-	// Last frame from the broker. The read loop drops the session when this
-	// is older than READ_IDLE_TIMEOUT. Poll timeouts and our own Ping do
-	// not move it.
-	last_recv: time.Time,
-	// When the caller last sent Ping. Zero means it has not.
-	last_ping: time.Time,
+	// Only inbound frames satisfy the receive watchdog. Idle time is tracked
+	// separately and starts when there are no open streams or pending dials.
+	last_recv:  time.Tick,
+	idle_since: time.Tick,
+	// When the caller last queued a Ping. Zero means it has not.
+	last_ping: time.Tick,
 	// Bumps on every frame. A dial compares this to the value from before
 	// its CONNECT to see whether the broker has said anything since.
 	recv_gen:  int,
@@ -173,6 +175,7 @@ Caller :: struct {
 	// down, which may be a retired drain rather than the live session.
 	write_conn:      ^trans.Connection,
 	write_waiters:   int,
+	writer:          ^thread.Thread,
 	queues_closed:   bool,
 	user_send_bytes: int,
 	stall_stop:      bool,

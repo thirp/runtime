@@ -21,6 +21,9 @@ caller_init :: proc(c: ^Caller, config: CallerConfig) -> CallerError {
 		return .InvalidConfig
 	}
 	if !tls_ca_readable(config.tls_ca) {
+		if config.setup_failure != nil {
+			config.setup_failure(config.setup_failure_user, SETUP_PHASE_TLS, "tls_verify")
+		}
 		return .InvalidConfig
 	}
 
@@ -93,7 +96,10 @@ caller_init :: proc(c: ^Caller, config: CallerConfig) -> CallerError {
 		c.streams = nil
 		return hs
 	}
-	if !caller_start_stall(c) {
+	c.writer = thread.create_and_start_with_poly_data(c, caller_writer_proc)
+	if c.writer == nil || !caller_start_stall(c) {
+		broker_setup_report(&setup, c, .Internal)
+		caller_close_writes(c)
 		caller_unbind_session(conn)
 		caller_delete_queues(c)
 		proto.decoder_destroy(&c.decoder)
@@ -104,11 +110,16 @@ caller_init :: proc(c: ^Caller, config: CallerConfig) -> CallerError {
 		c.streams = nil
 		return .Internal
 	}
-	c.last_recv = time.now()
+	sync.mutex_lock(&c.mutex)
+	c.last_recv = time.tick_now()
+	c.idle_since = c.last_recv
 	c.connected = true
+	sync.mutex_unlock(&c.mutex)
 	c.reader = thread.create_and_start_with_poly_data(c, caller_reader_proc)
 	if c.reader == nil {
+		broker_setup_report(&setup, c, .Internal)
 		caller_stop_stall(c)
+		caller_close_writes(c)
 		caller_unbind_session(conn)
 		caller_delete_queues(c)
 		proto.decoder_destroy(&c.decoder)
@@ -120,6 +131,12 @@ caller_init :: proc(c: ^Caller, config: CallerConfig) -> CallerError {
 		return .Internal
 	}
 	return .None
+}
+
+caller_session_admitted :: proc(c: ^Caller) -> bool {
+	sync.mutex_lock(&c.mutex)
+	defer sync.mutex_unlock(&c.mutex)
+	return c.connected && c.conn != nil && !sync.atomic_load(&c.stop)
 }
 
 caller_destroy :: proc(c: ^Caller) {
@@ -138,7 +155,7 @@ caller_destroy :: proc(c: ^Caller) {
 	}
 	caller_signal_drains(c)
 	if c.pending != nil {
-		c.pending_err = .Closed
+		c.pending.dial_error = .Closed
 		c.pending = nil
 	}
 	c.pending_tombstone = false
@@ -247,6 +264,7 @@ caller_dial_broker :: proc(c: ^Caller, setup: ^BrokerSetup) -> (^trans.Connectio
 			conn,
 			trans.TlsClientConfig{ca_path = c.config.tls_ca, server_name = name},
 			setup.deadline == {} ? trans.TLS_HANDSHAKE_TIMEOUT : 0,
+			&setup.tls_verify_failed,
 		)
 	}
 	if derr == .None {
@@ -334,8 +352,10 @@ caller_read :: proc(
 	return got, true
 }
 
-caller_write_failure :: proc(
+caller_post_failure :: proc(
+	c: ^Caller,
 	conn: ^trans.Connection,
+	gen: int,
 	opcode: proto.Opcode,
 	code: proto.WireError,
 	stream_id: proto.StreamId,
@@ -347,7 +367,7 @@ caller_write_failure :: proc(
 		return false
 	}
 	defer delete(payload)
-	return caller_write(conn, opcode, payload, stream_id)
+	return caller_post_control(c, conn, gen, opcode, payload, stream_id)
 }
 
 caller_reader_proc :: proc(c: ^Caller) {
@@ -388,9 +408,6 @@ caller_reader_proc :: proc(c: ^Caller) {
 
 caller_read_session :: proc(c: ^Caller) -> SessionRead {
 	for !sync.atomic_load(&c.stop) {
-		if caller_read_idle(c) {
-			return .Dropped
-		}
 		switch caller_expire_tombstone(c) {
 		case .Dropped:
 			return .Dropped
@@ -398,16 +415,14 @@ caller_read_session :: proc(c: ^Caller) -> SessionRead {
 			return .Retired
 		case .Continue, .Stopped:
 		}
-		caller_maybe_ping(c, c.conn, c.last_recv, &c.last_ping)
+		caller_maybe_ping(c, c.conn, c.conn_gen, c.last_recv, &c.last_ping)
 		_ = trans.connection_set_recv_timeout(c.conn, CALLER_POLL_INTERVAL)
 		frame, terr, perr := trans.read_frame(c.conn, &c.decoder)
 		if terr == .Timeout {
 			continue
 		}
 		if terr != .None || perr != .None {
-			// TCP_USER_TIMEOUT aborts an unacked Ping before the idle
-			// watchdog. A clean FIN leaves the flag clear (recv 0 does
-			// not update errno), so that stays peer_close.
+			// A clean FIN leaves the TCP_USER_TIMEOUT flag clear.
 			if trans.connection_user_timed_out(c.conn) {
 				caller_note_disconnect(c, LOG_REASON_DEAD_PEER)
 			}
@@ -457,7 +472,9 @@ caller_reconnect :: proc(c: ^Caller, attempt: ^int) -> bool {
 				reason = "configuration"
 				cap_attempt = 8
 			}
-			caller_log(c, .Info, "reconnect_scheduled", log.LogFields{reason = reason})
+			if c.config.setup_failure == nil {
+				caller_log(c, .Info, "reconnect_scheduled", log.LogFields{reason = reason})
+			}
 			caller_sleep(c, reconnect_delay(cap_attempt, jitter_u64()))
 			attempt^ += 1
 			continue
@@ -467,7 +484,8 @@ caller_reconnect :: proc(c: ^Caller, attempt: ^int) -> bool {
 		hs := broker_setup_finish(&setup, c, caller_handshake(c))
 		if hs == .None {
 			sync.mutex_lock(&c.mutex)
-			c.last_recv = time.now()
+			c.last_recv = time.tick_now()
+			c.idle_since = c.last_recv
 			c.last_ping = {}
 			c.connected = true
 			sync.cond_broadcast(&c.cond)
@@ -487,17 +505,23 @@ caller_reconnect :: proc(c: ^Caller, attempt: ^int) -> bool {
 		if hs == .Timeout {
 			reason = LOG_BROKER_SETUP_TIMEOUT
 		} else if hs == .AuthFailed {
-			caller_log(c, .Warn, "auth_failed", log.LogFields{error_code = "AUTHENTICATION_FAILED"})
+			if c.config.setup_failure == nil {
+				caller_log(c, .Warn, "auth_failed", log.LogFields{error_code = "AUTHENTICATION_FAILED"})
+			}
 			reason = "authentication"
 			cap_attempt = 8
 		} else if hs == .RateLimited {
-			caller_log(c, .Warn, "auth_failed", log.LogFields{error_code = "RATE_LIMITED"})
+			if c.config.setup_failure == nil {
+				caller_log(c, .Warn, "auth_failed", log.LogFields{error_code = "RATE_LIMITED"})
+			}
 			reason = "rate_limited"
 		}
 		if sync.atomic_load(&c.stop) {
 			return false
 		}
-		caller_log(c, .Info, "reconnect_scheduled", log.LogFields{reason = reason})
+		if c.config.setup_failure == nil {
+			caller_log(c, .Info, "reconnect_scheduled", log.LogFields{reason = reason})
+		}
 		caller_sleep(c, reconnect_delay(cap_attempt, jitter_u64()))
 		attempt^ += 1
 	}
@@ -516,7 +540,7 @@ caller_set_conn :: proc(c: ^Caller, conn: ^trans.Connection) {
 		// then wait until the drainer has left before freeing it.
 		caller_unbind_session(prev)
 		trans.connection_shutdown_both(prev)
-		caller_wait_writes(c)
+		caller_wait_conn_write(c, prev)
 		trans.connection_destroy(prev)
 	}
 	if conn != nil {
@@ -572,13 +596,22 @@ caller_warn_short_dial_timeout :: proc(logger: ^log.Logger, dial_timeout: time.D
 	)
 }
 
-caller_read_idle_limit :: proc(c: ^Caller) -> time.Duration {
+caller_dead_peer_limit :: proc(c: ^Caller) -> time.Duration {
 	when ODIN_TEST {
 		if c != nil && c.config.read_idle_timeout > 0 {
 			return c.config.read_idle_timeout
 		}
 	}
-	return READ_IDLE_TIMEOUT
+	return DEAD_PEER_TIMEOUT
+}
+
+caller_session_idle_limit :: proc(c: ^Caller) -> time.Duration {
+	when ODIN_TEST {
+		if c.config.session_idle_timeout > 0 {
+			return c.config.session_idle_timeout
+		}
+	}
+	return SESSION_IDLE_TIMEOUT
 }
 
 caller_ping_interval :: proc(c: ^Caller) -> time.Duration {
@@ -590,18 +623,11 @@ caller_ping_interval :: proc(c: ^Caller) -> time.Duration {
 	return CALLER_PING_INTERVAL
 }
 
-// Send Ping when the broker has been quiet for a ping interval. Does not
-// move last_recv: only the Pong, or any other frame, does. A failed write
-// leaves last_ping alone so the next poll tries again.
-caller_maybe_ping :: proc(c: ^Caller, conn: ^trans.Connection, last_recv: time.Time, last_ping: ^time.Time) {
-	if c == nil || conn == nil || last_ping == nil {
-		return
-	}
+// Queue a Ping after a quiet interval. Only inbound frames move last_recv.
+// If the queue rejects a probe, the next poll can try again.
+caller_maybe_ping :: proc(c: ^Caller, conn: ^trans.Connection, gen: int, last_recv: time.Tick, last_ping: ^time.Tick) {
 	interval := caller_ping_interval(c)
-	if interval <= 0 {
-		return
-	}
-	if time.since(last_recv) < interval || time.since(last_ping^) < interval {
+	if time.tick_since(last_recv) < interval || time.tick_since(last_ping^) < interval {
 		return
 	}
 	payload, err := proto.encode_ping(proto.Ping{nonce = jitter_u64()})
@@ -609,8 +635,8 @@ caller_maybe_ping :: proc(c: ^Caller, conn: ^trans.Connection, last_recv: time.T
 		return
 	}
 	defer delete(payload)
-	if caller_write(conn, .Ping, payload) {
-		last_ping^ = time.now()
+	if caller_post_control(c, conn, gen, .Ping, payload) {
+		last_ping^ = time.tick_now()
 	}
 }
 
@@ -653,7 +679,7 @@ caller_handle_frame :: proc(
 		delete(fail.diagnostic)
 		caller_handle_connect_failed(c, wire_to_caller_error(code))
 	case .Data:
-		caller_handle_data(c, streams, conn, frame)
+		caller_handle_data(c, streams, conn, frame, gen)
 	case .HalfClose:
 		caller_handle_half_close(c, streams, frame.header.stream_id)
 	case .Close, .Reset:
@@ -663,7 +689,7 @@ caller_handle_frame :: proc(
 		msg, merr := proto.decode_ping(frame.payload)
 		if merr == .None {
 			pong, _ := proto.encode_pong(proto.Pong{nonce = msg.nonce})
-			_ = caller_write(conn, .Pong, pong)
+			_ = caller_post_control(c, conn, gen, .Pong, pong)
 			delete(pong)
 		}
 	case .Pong:
@@ -767,7 +793,6 @@ caller_handle_connect_ok :: proc(c: ^Caller, stream_id: proto.StreamId) {
 		pending.stream_id = stream_id
 		pending.accepted = true
 		c.streams[stream_id] = pending
-		c.pending_err = .None
 		sync.cond_broadcast(&c.cond)
 		sync.mutex_unlock(&c.mutex)
 		if held {
@@ -791,8 +816,10 @@ caller_handle_connect_failed :: proc(c: ^Caller, err: CallerError) {
 		sync.mutex_unlock(&c.mutex)
 		return
 	}
-	c.pending = nil
-	c.pending_err = err
+	if c.pending != nil {
+		c.pending.dial_error = err
+		c.pending = nil
+	}
 	sync.cond_broadcast(&c.cond)
 	sync.mutex_unlock(&c.mutex)
 }
@@ -846,7 +873,7 @@ caller_reset_targets :: proc(c: ^Caller, conn: ^trans.Connection, gen: int) -> b
 // one is not kicked.
 caller_expire_tombstone :: proc(c: ^Caller) -> SessionRead {
 	sync.mutex_lock(&c.mutex)
-	if !c.pending_tombstone || !c.tombstone_capped || time.diff(time.now(), c.tombstone_deadline) > 0 {
+	if c.disconnect_reason != "" || !c.pending_tombstone || !c.tombstone_capped || time.diff(time.now(), c.tombstone_deadline) > 0 {
 		sync.mutex_unlock(&c.mutex)
 		return .Continue
 	}
@@ -888,31 +915,41 @@ caller_expire_tombstone :: proc(c: ^Caller) -> SessionRead {
 
 caller_note_recv :: proc(c: ^Caller) {
 	sync.mutex_lock(&c.mutex)
-	c.last_recv = time.now()
+	c.last_recv = time.tick_now()
 	c.recv_gen += 1
 	sync.mutex_unlock(&c.mutex)
 }
 
-// No frame from the broker for the read-idle limit. Shut the socket down
-// so the reader reconnects. Poll timeouts and our own Ping do not count.
-caller_read_idle :: proc(c: ^Caller) -> bool {
+// Runs on the timer thread so a blocked Ping, Pong or DATA write cannot
+// prevent shutdown. Retired sessions have live streams only and need the
+// same receive deadline while their reader is waiting on a write.
+caller_watch_sessions :: proc(c: ^Caller, now: time.Tick) {
 	sync.mutex_lock(&c.mutex)
-	if c.conn == nil || time.since(c.last_recv) < caller_read_idle_limit(c) {
-		sync.mutex_unlock(&c.mutex)
-		return false
+	defer sync.mutex_unlock(&c.mutex)
+	limit := caller_dead_peer_limit(c)
+	if c.connected && c.conn != nil && c.disconnect_reason == "" {
+		reason := ""
+		if time.tick_diff(c.last_recv, now) >= limit {
+			reason = LOG_REASON_DEAD_PEER
+		} else if len(c.streams) != 0 || c.pending != nil || c.pending_tombstone {
+			c.idle_since = {}
+		} else if c.idle_since == {} {
+			c.idle_since = now
+		} else if time.tick_diff(c.idle_since, now) >= caller_session_idle_limit(c) {
+			reason = LOG_REASON_IDLE
+		}
+		if reason != "" {
+			c.disconnect_reason = reason
+			c.connected = false
+			trans.connection_shutdown_both(c.conn)
+		}
 	}
-	if len(c.disconnect_reason) == 0 {
-		c.disconnect_reason = LOG_REASON_IDLE
+	for d in c.drains {
+		if d != nil && !d.stop && !d.closed && d.conn != nil && time.tick_diff(d.last_recv, now) >= limit {
+			d.stop = true
+			trans.connection_shutdown_both(d.conn)
+		}
 	}
-	conn := c.conn
-	held := trans.connection_acquire(conn)
-	sync.mutex_unlock(&c.mutex)
-	if held {
-		trans.connection_shutdown_both(conn)
-		trans.connection_release(conn)
-	}
-	caller_fail_all(c, .Transport)
-	return true
 }
 
 // Looks a stream up for the session reader and takes a reference, so the
@@ -954,6 +991,7 @@ caller_handle_data :: proc(
 	streams: ^map[proto.StreamId]^Conn,
 	sock: ^trans.Connection,
 	frame: proto.Frame,
+	gen: int,
 ) {
 	stream := caller_acquire_stream(c, streams, frame.header.stream_id)
 	if stream == nil {
@@ -987,7 +1025,7 @@ caller_handle_data :: proc(
 		log.LogFields{stream_id = u64(frame.header.stream_id), reason = LOG_REASON_STREAM_BUFFER_FULL},
 	)
 	if sock != nil {
-		_ = caller_write_failure(sock, .Reset, .InternalError, frame.header.stream_id)
+		_ = caller_post_failure(c, sock, gen, .Reset, .InternalError, frame.header.stream_id)
 	}
 }
 
@@ -1060,7 +1098,7 @@ caller_fail_all :: proc(c: ^Caller, err: CallerError) {
 	c.connected = false
 	c.dropped_streams = len(c.streams)
 	if c.pending != nil {
-		c.pending_err = err
+		c.pending.dial_error = err
 		c.pending.dial_stalled = err == .Transport && c.disconnect_reason == LOG_REASON_STALL
 		c.pending = nil
 	}

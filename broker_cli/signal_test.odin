@@ -1,3 +1,4 @@
+#+build linux
 package main
 
 import broker "../broker"
@@ -22,9 +23,6 @@ broker_signal_stack_clobber :: proc(depth: int) {
 
 @(test)
 test_sigterm_stops_broker_after_setup_returns :: proc(t: ^testing.T) {
-	when ODIN_OS != .Linux {
-		return
-	}
 	server: broker.Server
 	broker_setup_interrupt(&server)
 	defer {

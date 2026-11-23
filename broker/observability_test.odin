@@ -70,6 +70,28 @@ obs_wait_contains :: proc(needle: string, timeout := 2 * time.Second) -> string 
 }
 
 @(test)
+test_session_close_log_counts_suppressed_repetitions :: proc(t: ^testing.T) {
+	server: Server
+	start := time.tick_now()
+	take := proc(t: ^testing.T, server: ^Server, role: proto.PeerRole,
+		cause: trans.CloseCause, at: time.Tick, want_emit: bool, want_suppressed: u64) {
+		emit, suppressed := close_log_take(server, role, cause, at)
+		testing.expect_value(t, emit, want_emit)
+		testing.expect_value(t, suppressed, want_suppressed)
+	}
+	take(t, &server, .Agent, .PeerEOF, start, true, 0)
+	for _ in 0 ..< 100 {
+		take(t, &server, .Agent, .PeerEOF, start, false, 0)
+	}
+	take(t, &server, .Agent, .PeerReset, start, true, 0)
+	take(t, &server, .Caller, .PeerEOF, start, true, 0)
+	next := time.tick_add(start, SESSION_CLOSE_LOG_INTERVAL)
+	take(t, &server, .Agent, .PeerEOF, next, true, 100)
+	take(t, &server, .Agent, .PeerEOF, next, false, 0)
+	take(t, &server, .Agent, .PeerEOF, time.tick_add(next, SESSION_CLOSE_LOG_INTERVAL), true, 1)
+}
+
+@(test)
 test_obs_connect_absent_service_is_labeled :: proc(t: ^testing.T) {
 	reg: Registry
 	store: auth.StaticTokenAuth

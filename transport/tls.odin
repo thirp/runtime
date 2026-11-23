@@ -17,11 +17,14 @@ openssl_ensure_init :: proc() {
 tls_server_context_init :: proc(
 	cert_path, key_path: string,
 	allocator := context.allocator,
+	allow_key_prompt := true,
 ) -> (
 	^TlsServerContext,
 	TransportError,
 ) {
 	openssl_ensure_init()
+	ERR_clear_error()
+	defer ERR_clear_error()
 	if len(cert_path) == 0 || len(key_path) == 0 {
 		return nil, .Tls
 	}
@@ -38,20 +41,19 @@ tls_server_context_init :: proc(
 	_ = SSL_CTX_set_options(ctx, SSL_OP_IGNORE_UNEXPECTED_EOF)
 	SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nil)
 
-	cert_c := strings.clone_to_cstring(cert_path, allocator)
-	defer delete(cert_c, allocator)
-	key_c := strings.clone_to_cstring(key_path, allocator)
-	defer delete(key_c, allocator)
-
-	if SSL_CTX_use_certificate_chain_file(ctx, cert_c) != 1 {
-		SSL_CTX_free(ctx)
-		return nil, .Tls
+	loaded: bool
+	if allow_key_prompt {
+		cert_c := strings.clone_to_cstring(cert_path, allocator)
+		defer delete(cert_c, allocator)
+		key_c := strings.clone_to_cstring(key_path, allocator)
+		defer delete(key_c, allocator)
+		loaded = SSL_CTX_use_certificate_chain_file(ctx, cert_c) == 1 &&
+		         SSL_CTX_use_PrivateKey_file(ctx, key_c, SSL_FILETYPE_PEM) == 1
+	} else {
+		SSL_CTX_set_default_passwd_cb(ctx, tls_no_pem_password)
+		loaded = tls_load_reload_pem(ctx, cert_path, key_path, allocator)
 	}
-	if SSL_CTX_use_PrivateKey_file(ctx, key_c, SSL_FILETYPE_PEM) != 1 {
-		SSL_CTX_free(ctx)
-		return nil, .Tls
-	}
-	if SSL_CTX_check_private_key(ctx) != 1 {
+	if !loaded || SSL_CTX_check_private_key(ctx) != 1 {
 		SSL_CTX_free(ctx)
 		return nil, .Tls
 	}
@@ -134,7 +136,7 @@ connection_tls_servername :: proc(conn: ^Connection) -> string {
 	return string(name)
 }
 
-tls_client_context_new :: proc(cfg: TlsClientConfig, allocator := context.allocator) -> (SSL_CTX, TransportError) {
+tls_client_context_new :: proc(cfg: TlsClientConfig, verify_failed: ^bool, allocator := context.allocator) -> (SSL_CTX, TransportError) {
 	openssl_ensure_init()
 	ctx := SSL_CTX_new(TLS_client_method())
 	if ctx == nil {
@@ -155,6 +157,7 @@ tls_client_context_new :: proc(cfg: TlsClientConfig, allocator := context.alloca
 	SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nil)
 	if len(cfg.ca_path) == 0 {
 		if !tls_client_context_load_system_ca(ctx) {
+			if verify_failed != nil {verify_failed^ = true}
 			SSL_CTX_free(ctx)
 			return nil, .Tls
 		}
@@ -162,6 +165,7 @@ tls_client_context_new :: proc(cfg: TlsClientConfig, allocator := context.alloca
 		ca_c := strings.clone_to_cstring(cfg.ca_path, allocator)
 		defer delete(ca_c, allocator)
 		if SSL_CTX_load_verify_locations(ctx, ca_c, nil) != 1 {
+			if verify_failed != nil {verify_failed^ = true}
 			SSL_CTX_free(ctx)
 			return nil, .Tls
 		}
@@ -185,6 +189,7 @@ tls_attach_ssl :: proc(conn: ^Connection, ssl: SSL, owned_ctx: SSL_CTX) -> Trans
 	session.ssl = ssl
 	session.ctx = owned_ctx
 	conn.tls = session
+	SSL_set_info_callback(ssl, tls_info_callback)
 	if err := net.set_blocking(conn.socket, false); err != nil {
 		tls_session_free(conn)
 		return .Network
@@ -215,19 +220,40 @@ connection_tls_accept :: proc(
 	ctx: ^TlsServerContext,
 	timeout := TLS_HANDSHAKE_TIMEOUT,
 ) -> TransportError {
-	if conn == nil || conn.closed || ctx == nil || ctx.ctx == nil {
+	if conn == nil || conn.closed {
 		return .Tls
 	}
-	if !conn_io_enter(conn) {
-		return .Tls
+	return connection_tls_accept_session(conn, tls_server_session_new(ctx), timeout)
+}
+
+// SSL_new retains the OpenSSL context independently of the Odin wrapper.
+tls_server_session_new :: proc(ctx: ^TlsServerContext) -> SSL {
+	if ctx == nil || ctx.ctx == nil {
+		return nil
 	}
-	defer conn_io_exit(conn)
-	openssl_ensure_init()
 	ERR_clear_error()
-	ssl := SSL_new(ctx.ctx)
+	return SSL_new(ctx.ctx)
+}
+
+// Takes ownership of ssl. The context owner can publish a replacement while
+// this handshake is in progress or while the resulting session is in use.
+connection_tls_accept_session :: proc(
+	conn: ^Connection,
+	ssl: SSL,
+	timeout := TLS_HANDSHAKE_TIMEOUT,
+) -> TransportError {
 	if ssl == nil {
 		return .Tls
 	}
+	if conn == nil || conn.closed {
+		SSL_free(ssl)
+		return .Tls
+	}
+	if !conn_io_enter(conn) {
+		SSL_free(ssl)
+		return .Tls
+	}
+	defer conn_io_exit(conn)
 	ssl_enable_partial_write(ssl)
 	if !ssl_set_fd_noclose(ssl, connection_socket_fd(conn)) {
 		SSL_free(ssl)
@@ -238,7 +264,8 @@ connection_tls_accept :: proc(
 		handshake_timeout = TLS_HANDSHAKE_TIMEOUT
 	}
 	start := time.now()
-	_ = connection_set_recv_timeout(conn, handshake_timeout)
+	// SSL_accept uses the blocking socket until TLS is attached.
+	_ = connection_set_recv_timeouts(conn, handshake_timeout, handshake_timeout)
 	rc := SSL_accept(ssl)
 	if rc != 1 {
 		SSL_free(ssl)
@@ -276,13 +303,15 @@ connection_dial_tls :: proc(
 // Upgrade an owned TCP connection before sharing it. The caller may bound
 // the entire setup by shutting down this socket at its absolute deadline.
 // Keep the legacy TLS receive timeout for users of connection_dial_tls.
-connection_tls_connect :: proc(conn: ^Connection, cfg: TlsClientConfig, timeout := TLS_HANDSHAKE_TIMEOUT) -> TransportError {
+connection_tls_connect :: proc(conn: ^Connection, cfg: TlsClientConfig, timeout := TLS_HANDSHAKE_TIMEOUT,
+	verify_failed: ^bool = nil, verify_ip := false) -> TransportError {
+	if verify_failed != nil {verify_failed^ = false}
 	if conn == nil || len(cfg.server_name) == 0 || !conn_io_enter(conn) {
 		return .Tls
 	}
 	defer conn_io_exit(conn)
 	allocator := conn.allocator
-	owned_ctx, cerr := tls_client_context_new(cfg, allocator)
+	owned_ctx, cerr := tls_client_context_new(cfg, verify_failed, allocator)
 	if cerr != .None {
 		return cerr
 	}
@@ -300,12 +329,14 @@ connection_tls_connect :: proc(conn: ^Connection, cfg: TlsClientConfig, timeout 
 	}
 	name_c := strings.clone_to_cstring(cfg.server_name, allocator)
 	defer delete(name_c, allocator)
-	if SSL_set1_host(ssl, name_c) != 1 {
+	name_ok := verify_ip ? X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), name_c) : SSL_set1_host(ssl, name_c)
+	if name_ok != 1 {
+		if verify_failed != nil {verify_failed^ = true}
 		SSL_free(ssl)
 		SSL_CTX_free(owned_ctx)
 		return .Tls
 	}
-	if !cfg.omit_sni {
+	if !cfg.omit_sni && !verify_ip {
 		ssl_set_sni(ssl, name_c)
 	}
 	if len(cfg.alpn) > 0 {
@@ -316,9 +347,12 @@ connection_tls_connect :: proc(conn: ^Connection, cfg: TlsClientConfig, timeout 
 		}
 	}
 
-	_ = connection_set_recv_timeout(conn, timeout)
+	// SSL_connect uses the blocking socket until TLS is attached.
+	_ = connection_set_recv_timeouts(conn, timeout, timeout)
 	rc := SSL_connect(ssl)
-	if rc != 1 || SSL_get_verify_result(ssl) != X509_V_OK {
+	verified := SSL_get_verify_result(ssl) == X509_V_OK
+	if rc != 1 || !verified {
+		if verify_failed != nil {verify_failed^ = !verified}
 		SSL_free(ssl)
 		SSL_CTX_free(owned_ctx)
 		return .Tls
@@ -364,24 +398,39 @@ tls_poll :: proc(conn: ^Connection, want_write: bool, timeout: time.Duration) ->
 	return tls_wait_socket(conn, want_write, timeout)
 }
 
-tls_map_ssl_error :: proc(conn: ^Connection, rc: c.int, ssl_err: c.int) -> TransportError {
-	_ = rc
+// OpenSSL calls this synchronously on the SSL_read/SSL_write thread. A
+// close_notify is a warning alert and retains the existing half-close path.
+@(private, thread_local)
+tls_fatal_alert: bool
+
+@(private)
+tls_info_callback :: proc "c" (ssl: SSL, flags, ret: c.int) {
+	if flags & SSL_CB_ALERT != 0 && ret >> 8 == SSL3_AL_FATAL {
+		tls_fatal_alert = true
+	}
+}
+
+tls_map_ssl_error :: proc(conn: ^Connection, ssl_err: c.int, code: i32, alert: bool) -> TransportError {
 	switch ssl_err {
 	case SSL_ERROR_WANT_READ, SSL_ERROR_WANT_WRITE:
 		return .WouldBlock
 	case SSL_ERROR_ZERO_RETURN:
 		// close_notify, or a TCP FIN accepted by SSL_OP_IGNORE_UNEXPECTED_EOF.
 		// The reply can still be written. Do not set conn.closed.
+		connection_note_close(conn, .PeerEOF)
 		return .Closed
 	case SSL_ERROR_SYSCALL:
+		cause := socket_error_cause(code)
+		connection_note_close(conn, cause)
 		when ODIN_OS == .Linux {
-			if connection_syscall_timed_out() {
+			if cause == .ReadDeadline {
 				conn.user_timed_out = true
 			}
 		}
 		conn.closed = true
 		return .Closed
 	}
+	connection_note_close(conn, .TLSAlert if alert else .TLSError)
 	return .Tls
 }
 
@@ -399,8 +448,16 @@ tls_connection_read :: proc(conn: ^Connection, dst: []u8) -> (n: int, err: Trans
 			sync.mutex_unlock(&conn.tls.mutex)
 			return 0, .Closed
 		}
+		ERR_clear_error()
+		tls_fatal_alert = false
 		rc := SSL_read(conn.tls.ssl, raw_data(dst), c.int(to_read))
-		ssl_err := SSL_get_error(conn.tls.ssl, rc)
+		code := socket_syscall_error()
+		mapped: TransportError
+		ssl_err: c.int
+		if rc <= 0 {
+			ssl_err = SSL_get_error(conn.tls.ssl, rc)
+			mapped = tls_map_ssl_error(conn, ssl_err, code, tls_fatal_alert)
+		}
 		if hook := sync.atomic_load(&conn.tls_read_hook); hook != nil {
 			(TlsReadHook)(hook)(conn)
 		}
@@ -408,7 +465,6 @@ tls_connection_read :: proc(conn: ^Connection, dst: []u8) -> (n: int, err: Trans
 		if rc > 0 {
 			return int(rc), .None
 		}
-		mapped := tls_map_ssl_error(conn, rc, ssl_err)
 		if mapped != .WouldBlock {
 			return 0, mapped
 		}
@@ -434,14 +490,21 @@ tls_connection_write :: proc(conn: ^Connection, src: []u8) -> TransportError {
 			sync.mutex_unlock(&conn.tls.mutex)
 			return .Closed
 		}
+		ERR_clear_error()
+		tls_fatal_alert = false
 		rc := SSL_write(conn.tls.ssl, raw_data(src[off:]), c.int(remain))
-		ssl_err := SSL_get_error(conn.tls.ssl, rc)
+		code := socket_syscall_error()
+		mapped: TransportError
+		ssl_err: c.int
+		if rc <= 0 {
+			ssl_err = SSL_get_error(conn.tls.ssl, rc)
+			mapped = tls_map_ssl_error(conn, ssl_err, code, tls_fatal_alert)
+		}
 		sync.mutex_unlock(&conn.tls.mutex)
 		if rc > 0 {
 			off += int(rc)
 			continue
 		}
-		mapped := tls_map_ssl_error(conn, rc, ssl_err)
 		if mapped != .WouldBlock {
 			return mapped
 		}

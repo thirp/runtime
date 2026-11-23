@@ -1,6 +1,5 @@
 package transport
 
-import "core:c"
 import "core:sys/posix"
 import "core:time"
 
@@ -19,6 +18,7 @@ tls_wait_socket_impl :: proc(conn: ^Connection, want_write: bool, timeout: time.
 		return .WouldBlock if posix.get_errno() == .EINTR else .Network
 	}
 	if .NVAL in pfd.revents {
+		connection_note_close(conn, .NetworkError)
 		conn.closed = true
 		return .Closed
 	}
@@ -26,36 +26,19 @@ tls_wait_socket_impl :: proc(conn: ^Connection, want_write: bool, timeout: time.
 	if ready {
 		return .None
 	}
-	if .HUP in pfd.revents || .ERR in pfd.revents {
+	socket_error := .ERR in pfd.revents
+	if .HUP in pfd.revents || socket_error {
 		// HUP is the peer's FIN with nothing left to read. ERR is a dead socket.
 		// ETIMEDOUT is TCP_USER_TIMEOUT, not a peer FIN.
-		if .ERR in pfd.revents {
-			if connection_so_error_timed_out(conn) {
-				conn.user_timed_out = true
-			}
+		cause := socket_pending_error_cause(conn, .NetworkError if socket_error else .PeerEOF)
+		connection_note_close(conn, cause)
+		if cause == .ReadDeadline {
+			conn.user_timed_out = true
+		}
+		if socket_error {
 			conn.closed = true
 		}
 		return .Closed
 	}
 	return .None
-}
-
-connection_syscall_timed_out :: proc() -> bool {
-	return posix.get_errno() == .ETIMEDOUT
-}
-
-connection_so_error_timed_out :: proc(conn: ^Connection) -> bool {
-	soerr: c.int
-	olen := posix.socklen_t(size_of(soerr))
-	rc := posix.getsockopt(
-		posix.FD(connection_socket_fd(conn)),
-		posix.SOL_SOCKET,
-		.ERROR,
-		&soerr,
-		&olen,
-	)
-	if rc != .OK {
-		return false
-	}
-	return posix.Errno(soerr) == .ETIMEDOUT
 }

@@ -17,6 +17,8 @@ LOG_EVENT_SERVICE_UNREGISTERED :: "service_unregistered"
 LOG_EVENT_SESSION_AUTHENTICATED :: "session_authenticated"
 LOG_EVENT_SESSION_CLOSED :: "session_closed"
 LOG_EVENT_STREAM_RESET :: "stream_reset"
+LOG_EVENT_TLS_RELOADED :: "tls_reloaded"
+LOG_EVENT_TLS_RELOAD_FAILED :: "tls_reload_failed"
 LOG_EVENT_UNREGISTER_FAILED :: "unregister_failed"
 
 // Shared log/metric reason and limit labels.

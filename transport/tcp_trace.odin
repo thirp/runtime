@@ -45,23 +45,25 @@ when ODIN_TEST {
 }
 
 @(private)
-tcp_recv :: proc(conn: ^Connection, sock: net.TCP_Socket, dst: []u8) -> (int, net.TCP_Recv_Error) {
+tcp_recv :: proc(conn: ^Connection, sock: net.TCP_Socket, dst: []u8) -> (int, net.TCP_Recv_Error, i32) {
 	n, err := net.recv_tcp(sock, dst)
+	code := net.last_platform_error() if err != .None else 0
 	when ODIN_TEST {
 		if side := sync.atomic_load(&conn.test_tcp_trace); side != .None {
 			tcp_trace_result(conn, side, sock, "recv", len(dst), n, err)
 		}
 	}
-	return n, err
+	return n, err, code
 }
 
 @(private)
-tcp_send :: proc(conn: ^Connection, sock: net.TCP_Socket, src: []u8) -> (int, net.TCP_Send_Error) {
+tcp_send :: proc(conn: ^Connection, sock: net.TCP_Socket, src: []u8) -> (int, net.TCP_Send_Error, i32) {
 	n, err := net.send_tcp(sock, src)
+	code := net.last_platform_error() if err != .None else 0
 	when ODIN_TEST {
 		if side := sync.atomic_load(&conn.test_tcp_trace); side != .None {
 			tcp_trace_result(conn, side, sock, "send", len(src), n, err)
 		}
 	}
-	return n, err
+	return n, err, code
 }

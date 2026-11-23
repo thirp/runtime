@@ -36,7 +36,7 @@ thirp-broker [--version] [--config PATH] --listen HOST:PORT (--token TOKEN=PRINC
 
 CLI flags override file values. Required fields may come from either source. After merge, every practical error is printed (`config: line N: …` or `flag: --listen: …`) and the process exits 1 without listening. Unknown keys and duplicate non-repeatable keys fail. `policy_mode = production` cannot be combined with `insecure`. Empty grants in production are valid (deny-all).
 
-Secrets stay in `token_file`, not in the main file. Example: [examples/production/broker.conf](../examples/production/broker.conf). Operator walkthrough: [OPERATIONS.md](../docs/OPERATIONS.md). Process restart is required to change configuration (no SIGHUP).
+Secrets stay in `token_file`, not in the main file. Restart the process to apply configuration changes. To rotate the certificate at its configured path, use the reload procedure. [Production example](../examples/production/broker.conf) · [Certificate rotation](../docs/OPERATIONS.md#certificate-rotation)
 
 `--version` prints the project version, build commit and protocol 1.0, then exits 0.
 
@@ -94,7 +94,7 @@ Do not log tokens. Expired and unknown credentials both return `AUTHENTICATION_F
 
 ### Credential rotation
 
-Broker restart is required to change the credential set (no SIGHUP reload).
+Broker restart is required to change the credential set.
 
 1. Add the replacement token line (same principal) to `--token-file`.
 2. Restart the broker.
@@ -105,7 +105,7 @@ Broker restart is required to change the credential set (no SIGHUP reload).
 
 | Flag | Meaning |
 |---|---|
-| `--tls-cert PATH` | Server certificate PEM |
+| `--tls-cert PATH` | Server certificate PEM, leaf first followed by any intermediates |
 | `--tls-key PATH` | Server private key PEM |
 | `--insecure` | Plaintext TCP. Development only |
 
@@ -117,6 +117,8 @@ openssl req -x509 -newkey rsa:2048 -sha256 -days 365 -nodes \
   -subj "/CN=127.0.0.1" \
   -addext "subjectAltName=IP:127.0.0.1,DNS:localhost"
 ```
+
+After replacing the configured PEM files, write a fresh request ID to `<tls-cert>.reload`. Generate it with `openssl rand -hex 16` on Linux and macOS or write it with `Set-Content` in PowerShell on Windows. New TLS handshakes use the replacement chain and established streams keep running. [Certificate rotation](../docs/OPERATIONS.md#certificate-rotation)
 
 ### Limits
 

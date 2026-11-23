@@ -15,7 +15,7 @@ deploy/container/        Dockerfile for a pre-built broker binary
 
 `thirp-connect` legacy mode uses flags and `--token-file`; enrolled callers use `--caller-conf PATH`. Mixing `--caller-conf` with `--broker`, `--token`, `--token-file`, `--service`, `--listen`, or TLS flags prints an error and exits 1. See [caller enrollment](../caller_cli/README.md#caller-enrollment). `thirp-web-ingress` accepts `--config` or flags.
 
-Process restart is the supported way to change configuration. There is no SIGHUP reload.
+Restart the process to apply configuration changes.
 
 ## Dependencies
 
@@ -48,7 +48,7 @@ openssl req -x509 -newkey rsa:2048 -sha256 -days 365 -nodes \
 
 On a public host, use a certificate whose SAN matches the hostname in the agent/caller `broker` address (or set `tls_server_name`). Agents and callers verify the server certificate by default. `--tls-ca` points at a PEM CA file; omit it to use the system CA bundle.
 
-Hot reload of certificates is not implemented. Replace the PEM files and restart the broker. Drain (SIGINT/SIGTERM) lets existing streams finish within `shutdown_grace` (default 10s).
+The broker supports certificate rotation while streams are active. [Certificate rotation](#certificate-rotation)
 
 ## Configuration
 
@@ -227,9 +227,26 @@ Two different token values may map to the same principal (overlapping validity).
 
 ## Certificate rotation
 
-1. Install the new certificate and key (keep the old files until the new ones load).
-2. Restart the broker. Drain drops sessions that outlive `shutdown_grace`.
-3. Agents reconnect and re-register. Callers reconnect the broker session; in-flight local streams still die.
+1. Install the new unencrypted PEM certificate chain (leaf first, then intermediates in issuer order) and matching unencrypted PEM key at the configured `tls_cert` and `tls_key` paths. The chain must permit TLS server authentication. The root certificate is optional. For reload, each path must resolve to a regular file of at most 1 MiB. The certificate file must contain complete PEM certificate blocks, with only whitespace outside the blocks. The chain can use LF or CRLF line endings. Finish replacing both files before requesting reload. Keep a backup of the previous pair for rollback.
+2. Write a fresh 32-digit hexadecimal request ID followed by a newline to the regular file at the exact configured certificate path with `.reload` appended. The examples use `/etc/thirp/broker.crt` or `C:\Thirp\broker.crt` as the certificate path.
+
+   **Linux and macOS**
+
+   ```bash
+   openssl rand -hex 16 > /etc/thirp/broker.crt.reload
+   ```
+
+   **Windows PowerShell**
+
+   ```powershell
+   Set-Content -LiteralPath 'C:\Thirp\broker.crt.reload' -Encoding ascii -Value ([Guid]::NewGuid().ToString('N'))
+   ```
+
+3. The broker checks the request file once a second and consumes each complete ID once. A successful attempt logs `tls_reloaded` at info level. A rejected attempt logs `tls_reload_failed` once at error level and keeps serving the previous certificate. Correct the PEM files and write a new ID to retry. Wait for the attempt to complete before issuing another request.
+
+The request file can stay in place between rotations and across restarts. Give the broker account read access and restrict write access to trusted operators.
+
+New TLS handshakes use the replacement chain after success, and established sessions and streams continue. Agents and callers can reuse their configurations on reconnect when the new certificate matches the configured name and trust roots. To roll back, restore both previous PEM files and write a fresh request ID.
 
 ## Backup and restore
 
@@ -362,7 +379,7 @@ Threat model: [SECURITY.md](SECURITY.md).
 ## Known limitations
 
 - One broker process. Restart drops sessions.
-- No SIGHUP; edit files and restart.
+- Restart the broker to apply configuration changes. Use the `.reload` request file to rotate certificates at the configured paths.
 - Caller modes cannot be mixed: legacy mode uses flags and `--token-file`; enrolled callers use `--caller-conf PATH`. Adding `--broker`, `--token`, `--token-file`, `--service`, `--listen`, or TLS flags to `--caller-conf` prints an error and exits 1.
 - Metrics/health HTTP has no TLS and no authentication.
 - This tree does not claim an external security assessment. See [SECURITY.md](SECURITY.md).

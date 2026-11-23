@@ -2,6 +2,7 @@ package agent
 
 import auth "../auth"
 import brk "../broker"
+import log "../logging"
 import proto "../protocol"
 import trans "../transport"
 import "core:net"
@@ -35,7 +36,8 @@ AgentRunArg :: struct {
 	agent: ^Agent,
 }
 
-start_test_broker :: proc(t: ^testing.T, fx: ^TestBroker, loc := #caller_location, heartbeat := 30 * time.Second) {
+start_test_broker :: proc(t: ^testing.T, fx: ^TestBroker, loc := #caller_location, heartbeat := 30 * time.Second,
+	session_timeout := 30 * time.Second, logger: ^log.Logger = nil, tls_ctx: ^trans.TlsServerContext = nil) {
 	testing.expect_value(t, brk.registry_init(&fx.reg), brk.RegistryError.None, loc)
 	testing.expect_value(t, auth.auth_init(&fx.store), auth.AuthError.None, loc)
 	testing.expect_value(t, auth.auth_add_token(&fx.store, TEST_TOKEN_HOST, TEST_PRINCIPAL_HOST), auth.AuthError.None, loc)
@@ -43,9 +45,12 @@ start_test_broker :: proc(t: ^testing.T, fx: ^TestBroker, loc := #caller_locatio
 	brk.server_init(&fx.server, &fx.reg, auth.static_token_authenticator(&fx.store))
 	brk.server_disable_test_hardening(&fx.server)
 	fx.server.heartbeat_interval = heartbeat
-	fx.server.session_timeout = 30 * time.Second
-	testing.expect_value(t, brk.server_listen(&fx.server, trans.loopback_endpoint(0)), trans.TransportError.None, loc)
-	brk.server_start(&fx.server)
+	fx.server.session_timeout = session_timeout
+	fx.server.logger = logger
+	fx.server.tls_ctx = tls_ctx
+	if testing.expect_value(t, brk.server_listen(&fx.server, trans.loopback_endpoint(0)), trans.TransportError.None, loc) {
+		brk.server_start(&fx.server)
+	}
 }
 
 stop_test_broker :: proc(fx: ^TestBroker) {
@@ -98,6 +103,7 @@ echo_accept_loop :: proc(w: ^EchoWorker) {
 
 echo_mirror_one :: proc(conn: ^trans.Connection) {
 	defer trans.connection_destroy(conn)
+	_ = trans.connection_set_recv_timeout(conn, 0)
 	buf: [1024]u8
 	for {
 		n, err := trans.connection_read(conn, buf[:])
