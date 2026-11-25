@@ -1,8 +1,6 @@
 # Operations
 
-How to deploy and run a self-hosted Thirp Runtime broker. This document is for an operator who did not write the software.
-
-The open-source release is **production-capable self-hosted infrastructure**. It is not a globally distributed service, not high availability, and not an externally assessed security product. Live service registrations are ephemeral: they exist only while the owning agent session is connected.
+Deploy and run a self-hosted Thirp Runtime broker. The systemd and container examples below use Linux.
 
 Configuration files, systemd units, and a container example live in the repository:
 
@@ -13,29 +11,13 @@ deploy/systemd/          thirp-broker.service, thirp-agent.service, thirp-web-in
 deploy/container/        Dockerfile for a pre-built broker binary
 ```
 
-`thirp-connect` legacy mode uses flags and `--token-file`; enrolled callers use `--caller-conf PATH`. Mixing `--caller-conf` with `--broker`, `--token`, `--token-file`, `--service`, `--listen`, or TLS flags prints an error and exits 1. See [caller enrollment](../caller_cli/README.md#caller-enrollment). `thirp-web-ingress` accepts `--config` or flags.
-
-Restart the process to apply configuration changes.
-
-## Dependencies
-
-Linux, [Odin](https://odin-lang.org/) `dev-2026-07` or later, and OpenSSL 3 (`libssl` / `libcrypto`). See [DEPENDENCIES.md](DEPENDENCIES.md).
-
-```bash
-odin build broker_cli -out:thirp-broker
-odin build agent_cli -out:thirp-agent
-odin build caller_cli -out:thirp-connect
-odin build web_ingress_cli -out:thirp-web-ingress
-odin build echo_http_cli -out:thirp-echo-http
-```
-
-Install the binaries where the systemd units expect them, default `/usr/local/bin/`.
+For binary downloads and native builds, see [Building](BUILDING.md).
 
 ## TLS
 
-TLS is required unless `--insecure` or `insecure = true` is set. Production policy (`policy_mode = production`) cannot be combined with insecure. The broker terminates TLS itself; a reverse proxy is not required.
+The broker terminates TLS. Use TLS with `policy_mode = production`.
 
-Minimum version is TLS 1.2, inherited from OpenSSL. Cipher policy is the library default.
+Runtime sets the minimum to TLS 1.2 and uses OpenSSL's default cipher policy.
 
 The certificate SAN must include the name or address clients verify. For a local test with `127.0.0.1`:
 
@@ -48,8 +30,6 @@ openssl req -x509 -newkey rsa:2048 -sha256 -days 365 -nodes \
 
 On a public host, use a certificate whose SAN matches the hostname in the agent/caller `broker` address (or set `tls_server_name`). Agents and callers verify the server certificate by default. `--tls-ca` points at a PEM CA file; omit it to use the system CA bundle.
 
-The broker supports certificate rotation while streams are active. [Certificate rotation](#certificate-rotation)
-
 ## Configuration
 
 Broker and agent accept `--config PATH`. CLI flags override file values. Required fields may come from either source. Unknown keys, duplicate non-repeatable keys, and validation errors are reported together, then the process exits 1 without listening.
@@ -58,9 +38,9 @@ Format: line-oriented `key = value`. `#` starts a comment line. Optional `[secti
 
 Secrets do not belong in the main file. Use `token_file = PATH` and keep that file mode `0600`. `token = ...` remains for development and prints a warning in production.
 
-Flags-only launch (no `--config`) is unchanged: `--policy-mode` defaults to `development` (allow-all after a successful role check) and prints a stderr warning.
+The Broker defaults to `development` policy even when a configuration file is supplied. Set `policy_mode = production` explicitly for deny-by-default access.
 
-Key names are the flag names without `--`, with hyphens turned into underscores. Full flag lists: [broker_cli/README.md](../broker_cli/README.md), [agent_cli/README.md](../agent_cli/README.md).
+See the command references for input and defaults. [Broker](../broker_cli/README.md) · [Agent](../agent_cli/README.md) · [Caller](../caller_cli/README.md) · [Web Ingress](../web_ingress_cli/README.md)
 
 ## Production walkthrough
 
@@ -126,7 +106,7 @@ Empty grants in production are valid (deny-all). Malformed grants fail startup; 
 
 - Prefer `--token-file` / `token_file`. Do not put long-lived secrets on the command line.
 - Broker token file: line grammar `TOKEN=PRINCIPAL[:ORG][;capabilities=...][;label=...][;expires=RFC3339]`. Agent and caller token files: raw secret only.
-- Mode `0600`. Broker, agent, and legacy caller token files that are group- or world-readable print a warning; this does not prevent startup. On Unix, enrolled callers reject configuration and token files with permissions wider than `0600` and exit 1. On Windows they require a protected DACL without inherited ACEs and refuse data-read grants to principals other than the current user and SYSTEM; rotation writes a current-user + SYSTEM DACL before any secret bytes. See [Caller enrollment](../caller_cli/README.md#caller-enrollment).
+- On Unix, use mode `0600` for token files. On Windows, restrict access with file ACLs. Enrolled callers enforce private access on both input files. [Caller enrollment](../caller_cli/README.md#caller-enrollment)
 - Tokens never appear in logs.
 
 ## Bind addresses
@@ -179,40 +159,22 @@ Do not log tokens or application payloads. Correlate with `session_id`, `stream_
 
 ## Resource limits
 
-Defaults (override in the broker config or flags):
+Read the limits and defaults in the command references.
+[Broker limits](../broker_cli/README.md#limits) · [Agent options](../agent_cli/README.md#usage) · [Caller options](../caller_cli/README.md#usage)
 
-| Limit | Default |
-|---|---|
-| Per-stream outbound buffer | 256 KiB |
-| Per-connection outbound buffer | 8 MiB |
-| Global buffered DATA | 256 MiB |
-| Streams per agent session | 256 |
-| Registrations per agent session | 32 |
-| Frame payload | 64 KiB |
-| Physical connections | 4096 |
-| Connections per source IP | 256 |
-| Failed AUTHENTICATE / IP / minute | 20 |
-| REGISTER+UNREGISTER / principal / minute | 60 |
-| CONNECT / principal and IP / minute | 600 |
-| Stream idle timeout | 0 (off). Production recommendation: 300 |
-| Session idle timeout | 45 s |
-| Shutdown grace | 10 s |
-
-`ulimit -n` (and `LimitNOFILE`) should be at least `2 * max_connections + 64`. If accept fails because the process is out of file descriptors, the broker logs `accept_failed`, increments `thirp_limit_exceeds_total{limit="file_descriptors"}`, and keeps running.
-
-Sizing is workload-dependent. Start with the defaults on a single host and raise connection/buffer caps after measuring. Do not treat these numbers as a capacity claim.
-
-#### Some Qualification Notes
-
-Burst load on the relay was run after these defaults existed. It is not a 24-hour soak, and it did not drive the 4096 connection cap. An N=256 graceful CLOSE (`thirp-connect` / ingress `conn_destroy`) then idle left about 258 agent origin fds open, about 383k `stream_not_found` RESETs/s, and broker RSS moving from 121 MiB to 2749 MiB over 5 minutes. An earlier cut of the same storm was about 288k RESET/s with unbounded RSS, and the matching Info logs were about 23 GiB over 5 minutes. Those leaks are fixed: terminal frames are delivered before the stream is dropped, finished streams do not echo RESET, and `STREAM_NOT_FOUND` Info is one line per second. Regressions are `caller/reset_test.odin` (N=32) and `agent/reset_test.odin` (N=64); both keep `resets_total{reason=stream_not_found}` flat and return origin fds to 0. The idle in those tests is short because a storm at that rate shows up immediately. A lab soak has since been run and passed. Thirp CLI listeners on lab VM 104 ran from 11:47 AM CT on November 11, 2026 to a PASS at about 7:23 AM CT on November 12, about 19.5 hours. They connected to agents on VM 104, the lab iMac, Lab Proxmox and Lab Proxmox Guests. The listeners kept the same pids for the whole run, one session refresh and two grant rollovers succeeded, and there were no authentication failures. The only probe failures were from 6:01 to 6:16 PM CT on November 11, during a known lab network outage, and the listeners recovered on their own. The agents moved to runtime 0.16.7 during the run: VM 104 at 11:20 PM CT on November 11, and the other three between 6:18 and 6:25 AM CT on November 12. Each was active on 0.16.7 with no re-registration loop at the verdict. This is a soak result on lab hardware, not a capacity rating.
+A full destination queue can make the Broker wait while it checks for
+progress. During caller-to-agent backpressure it can read ahead and respond
+to heartbeats. If the caller input is also saturated and the Broker cannot
+read ahead, it can reset the affected stream while keeping the session.
+On the receiving side, the Caller and Agent also reset individual streams
+that overrun their local buffers.
 
 ## Startup and shutdown
 
 Startup validates configuration, loads TLS and credentials, then listens. Development policy and argv `--token` in production print warnings on stderr.
 
-SIGINT/SIGTERM: stop accepts, reject new REGISTER/CONNECT with `BROKER_DRAINING`, wait `shutdown_grace` for live streams, RESET what remains, exit. `/readyz` returns `503 draining` during this window.
-
-A deliberate agent stop UNREGISTERs owned services (best effort), RESET remaining streams, and does not reconnect. Broker session teardown is the cleanup guarantee if unregister does not complete.
+During a Broker drain, `/readyz` returns `503 draining`. See how to request
+a drain on your platform. [Broker shutdown](../broker_cli/README.md#session-and-shutdown)
 
 ## Credential rotation
 
@@ -220,7 +182,7 @@ Broker restart is required to change the credential set.
 
 1. Add the replacement token line (same principal) to the broker token file.
 2. Restart the broker (`systemctl restart thirp-broker`).
-3. Deploy the new secret to the agent or caller token file and confirm it authenticates.
+3. Update the Agent or legacy Caller token file, restart that client, and confirm it authenticates. The running processes keep their startup tokens in memory.
 4. Remove the old token line and restart the broker again.
 
 Two different token values may map to the same principal (overlapping validity). Duplicate token values are rejected.
@@ -228,7 +190,7 @@ Two different token values may map to the same principal (overlapping validity).
 ## Certificate rotation
 
 1. Install the new unencrypted PEM certificate chain (leaf first, then intermediates in issuer order) and matching unencrypted PEM key at the configured `tls_cert` and `tls_key` paths. The chain must permit TLS server authentication. The root certificate is optional. For reload, each path must resolve to a regular file of at most 1 MiB. The certificate file must contain complete PEM certificate blocks, with only whitespace outside the blocks. The chain can use LF or CRLF line endings. Finish replacing both files before requesting reload. Keep a backup of the previous pair for rollback.
-2. Write a fresh 32-digit hexadecimal request ID followed by a newline to the regular file at the exact configured certificate path with `.reload` appended. The examples use `/etc/thirp/broker.crt` or `C:\Thirp\broker.crt` as the certificate path.
+2. Write a fresh 32-digit hexadecimal request ID followed by LF or CRLF to the regular file at the configured certificate path with `.reload` appended. Use a regular request file directly at that path.
 
    **Linux and macOS**
 
@@ -242,7 +204,7 @@ Two different token values may map to the same principal (overlapping validity).
    Set-Content -LiteralPath 'C:\Thirp\broker.crt.reload' -Encoding ascii -Value ([Guid]::NewGuid().ToString('N'))
    ```
 
-3. The broker checks the request file once a second and consumes each complete ID once. A successful attempt logs `tls_reloaded` at info level. A rejected attempt logs `tls_reload_failed` once at error level and keeps serving the previous certificate. Correct the PEM files and write a new ID to retry. Wait for the attempt to complete before issuing another request.
+3. The Broker checks the request file once a second. It acts on a complete ID that differs from the last one it read. A successful attempt logs `tls_reloaded` at info level. A rejected attempt logs `tls_reload_failed` at error level and keeps serving the previous certificate. Correct the PEM files and write a new ID to retry. Wait for the attempt to complete before issuing another request.
 
 The request file can stay in place between rotations and across restarts. Give the broker account read access and restrict write access to trusted operators.
 
@@ -266,12 +228,12 @@ Restore: put the files back, start the broker, start agents. Agents re-register 
 
 A single-broker restart interrupts active sessions. There is no zero-downtime broker upgrade. Protocol and config compatibility: [COMPATIBILITY.md](COMPATIBILITY.md). User-visible changes: [CHANGELOG.md](CHANGELOG.md).
 
-`v0.16.8` is one Release of archives. `scripts/release.sh` writes `thirp-runtime-linux-<arch>-<VERSION>.tar.gz`: the operator binaries (including `thirp-web-ingress`), `libthirp.so`, the Broker tarball, a source archive, an SPDX SBOM, `NOTICE`, `PROVENANCE.txt`, and `SHA256SUMS`. macOS and Windows data-plane archives from `scripts/release_macos.sh` and `scripts/release_windows.ps1` are attached to that same Release (`thirp-runtime-macos-arm64-0.16.8.tar.gz`, `thirp-runtime-macos-x86_64-0.16.8.tar.gz`, and `thirp-runtime-windows-AMD64-0.16.8.zip`); they include Agent/Caller and `libthirp` plus their own `SHA256SUMS`. A combined embed SDK tarball is not attached to v0.16.8. Verify `SHA256SUMS` inside the archive before install. Treat data-plane binaries as integrity-checked. They are not OS-signed unless Developer ID or Authenticode was configured for that build. The Windows zip vendors the OpenSSL 3 DLLs (`libssl-3-x64.dll` / `libcrypto-3-x64.dll`).
+Download the platform archive and verify it before install.
+[Release archives](BUILDING.md#release-archives) · [Archive verification](BUILDING.md#verify-a-downloaded-tree)
 
 1. Install the new binaries.
 2. Restart the broker (drain, then exit).
 3. Restart agents if their binary also changed. They reconnect and re-register.
-4. `thirp-connect` reconnects the broker session after transient loss; lost local sockets still close.
 
 Breaking configuration changes will be called out in [CHANGELOG.md](CHANGELOG.md). Do not silently reinterpret a security rule.
 
@@ -294,13 +256,39 @@ Use logs and labeled metrics. Packet capture is not required to distinguish thes
 | Stream idle | `resets_total{reason=stream_idle}` when `stream_idle_timeout` > 0 |
 | FD exhaustion | `accept_failed`, `limit_exceeds_total{limit="file_descriptors"}` |
 
-Agent reconnect logs `reason`: `network`, `broker_unavailable`, `tls`, `authentication`, `authorization`, `duplicate_registration`, `configuration`, `rate_limited`, `disconnected`. Authentication, authorization, and configuration failures use the long backoff cap.
+For a closed Agent link, inspect the Agent's `disconnected.close_cause` and
+the Broker's `session_closed.reason`. Examples include `peer_eof`,
+`peer_reset`, `tls_alert` and `read_deadline`. The Broker uses `idle_timeout`
+for its session-idle deadline. The Agent's `reconnect_scheduled.reason`
+classifies the retry separately. [Agent behavior](../agent_cli/README.md#behavior)
+
+## Session recovery
+
+A Caller tries to queue a Ping after 15 seconds without an inbound frame
+and at least 15 seconds since its last Ping. Each complete inbound frame
+refreshes the receive timer. After 45 seconds of inbound silence, the
+receive watchdog closes the session with `dead_peer`. Send stalls and socket
+failures can also end a session. A legacy Caller can recycle a session after
+45 seconds with no open streams or outstanding dials, including replies it
+still expects after a dial has timed out. Enrolled Callers keep healthy
+sessions admitted while idle.
+
+An Agent reconnects and re-registers its desired services. The Broker
+removes the old session's registrations when that session closes. A legacy
+Caller reconnects using its startup credential. An enrolled Caller manages
+grant, credential and session replacement through its enrollment file.
+[Caller enrollment](../caller_cli/README.md#caller-enrollment)
+
+Streams on a lost session end. Once the service is registered and the Caller
+is admitted again, a new connection opens a new stream. During rollover a
+healthy enrolled session can drain existing streams until they finish or
+the grant ends.
 
 ## Web Ingress
 
-`thirp-web-ingress` is a separate public process. It is a Caller, not an Agent. It does not register services and does not drain the Broker.
+`thirp-web-ingress` runs as a separate Caller process on Linux and macOS.
 
-A normal Thirp Runtime registration is not browser-reachable until all of these are true: the Agent is registered, an exact public-host route exists, the Ingress Principal has an exact Broker `allow_connect` grant, and Web Ingress is ready.
+See the Web Ingress command reference for [route setup](../web_ingress_cli/README.md#routes).
 
 The public hostname is a locator, not a secret. Anyone who can complete TLS to that host reaches the Origin. **The Origin Application must authenticate users** unless it is intentionally public. Configure the Origin to accept the public `Host` / SNI. Web Ingress does not rewrite `Host` and does not add `Forwarded` / `X-Forwarded-*`.
 
@@ -328,58 +316,13 @@ curl -sS http://127.0.0.1:9190/metrics
 
 `/healthz` is process liveness. `/readyz` is false while the public listener is down, required TLS context is missing, the Caller session is unusable, or the process is draining. One unavailable Origin does not make the whole process unready.
 
-SIGINT/SIGTERM: mark draining (`/readyz` 503), stop accepts, reject connections that have not finished route selection, stop new CONNECT, wait `shutdown_grace` (default 15s) for established streams, then close what remains. Web Ingress does not request Broker-wide drain.
-
-| Limit | Default |
-|---|---|
-| Browser connections | 4096 |
-| Browser connections per source IP | 64 |
-| Maximum ClientHello bytes | 65536 |
-| ClientHello / TLS handshake timeout | 10 s (cannot be 0) |
-| Broker service-dial timeout | 10 s (cannot be 0) |
-| Established idle timeout | 300 s (`0` disables idle only) |
-| Shutdown grace | 15 s |
-
-`ulimit -n` should be at least `2 * max_connections + 64`. A hostile client that holds sockets open is rejected at the configured cap; it must not create unbounded memory, pending handshakes, or Broker CONNECT work.
+See the Web Ingress command reference for
+[limits](../web_ingress_cli/README.md#limits) and
+[drain behavior](../web_ingress_cli/README.md#metrics-and-health).
 
 systemd unit: [deploy/systemd/thirp-web-ingress.service](../deploy/systemd/thirp-web-ingress.service). Same user and hardening as the broker unit, plus `CAP_NET_BIND_SERVICE` when `listen` is port 443. SIGTERM is the drain path. A reverse proxy is not required.
 
-### Local check and failure behavior
-
-Run the five-terminal demo from the repository root ([examples/web-ingress/](../examples/web-ingress/), [README.md](../README.md)). Open the URL with `curl` (and a browser if you add `portfolio.demo.test` to `/etc/hosts`):
-
-```bash
-curl --cacert examples/web-ingress/web-ingress.crt \
-  --resolve portfolio.demo.test:9443:127.0.0.1 \
-  https://portfolio.demo.test:9443/invite/demo
-```
-
-Then:
-
-1. Stop the Agent. New requests return `503`. In-flight streams close. They are not replayed.
-2. Start the Agent again. It re-registers. New connections succeed. Old ones stay dead.
-3. Remove the Ingress Principal `allow_connect` grant and restart the Broker (drain). New requests return `403`.
-4. Remove the route from `web-ingress.conf` and SIGTERM/restart Web Ingress. That hostname is unpublished. Unknown SNI does not dial another service.
-
-A Broker process kill drops the Caller session. `/readyz` goes false until Web Ingress reconnects. In-flight browser connections die. Later connections work after Agent re-register and Caller reconnect.
-
-### Qualification
-
-In-process tests in `web_ingress/qualify_test.odin` measured:
-
-- 20 sequential GET/close cycles; `connections_total{ok}` increased by 20; `active_conns`, slot, and per-IP maps returned to zero
-- 8 concurrent GETs on one route with no cross-talk, then the same leak check
-- Slow-writer backpressure next to a fast sibling, then idle
-- Agent loss, Caller session loss, and Web Ingress restart: in-flight fails, later GET succeeds
-
-Those numbers are measured results on the machine that ran the suite. They are not a capacity claim. The configured 4096 connection cap was not part of this suite. Relay burst load and the lab soak result are under [Resource limits](#resource-limits).
+For a loopback deployment to try locally, see the
+[Web Ingress demo](../web_ingress_cli/README.md#local-demo).
 
 Threat model: [SECURITY.md](SECURITY.md).
-
-## Known limitations
-
-- One broker process. Restart drops sessions.
-- Restart the broker to apply configuration changes. Use the `.reload` request file to rotate certificates at the configured paths.
-- Caller modes cannot be mixed: legacy mode uses flags and `--token-file`; enrolled callers use `--caller-conf PATH`. Adding `--broker`, `--token`, `--token-file`, `--service`, `--listen`, or TLS flags to `--caller-conf` prints an error and exits 1.
-- Metrics/health HTTP has no TLS and no authentication.
-- This tree does not claim an external security assessment. See [SECURITY.md](SECURITY.md).

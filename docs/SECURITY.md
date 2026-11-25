@@ -1,6 +1,6 @@
 # Security
 
-Report vulnerabilities in Thirp Runtime to `security@thirp.net`. Do not open a public issue for an unfixed vulnerability. This is not the product-intake mailbox (`partners@thirp.net`). Privacy questions: `privacy@thirp.net`.
+Report vulnerabilities in Thirp Runtime to `security@thirp.net`. Do not open a public issue for an unfixed vulnerability. Send privacy questions to `privacy@thirp.net`.
 
 ## Release signing
 
@@ -10,24 +10,14 @@ Release `SHA256SUMS` files may include a detached signature `SHA256SUMS.asc`. Th
 3B8559D8754FB3C5B21110C786897A405CF3D8C4
 ```
 
-Verify with `gpg --verify SHA256SUMS.asc SHA256SUMS`. Unsigned checksums are still usable; the signature is additional. The same fingerprint signs Linux operator `SHA256SUMS` and macOS/Windows data-plane `SHA256SUMS` when `THIRP_GPG_KEY` or the CI secret `THIRP_GPG_PRIVATE_KEY` is present.
+When the signature is present, verify it with
+`gpg --verify SHA256SUMS.asc SHA256SUMS`. Then check the extracted files
+against `SHA256SUMS`. macOS Developer ID and Windows Authenticode signatures
+are separate from archive signatures. See how to verify each platform's
+archive. [Verify a downloaded tree](BUILDING.md#verify-a-downloaded-tree)
 
-OS-level signatures are separate and optional:
-
-- macOS Developer ID: `THIRP_MACOS_CODESIGN_IDENTITY` (plus a `.p12` in CI). Notarization needs `THIRP_MACOS_NOTARY_PROFILE`.
-- Windows Authenticode: `THIRP_WINDOWS_PFX` / `WINDOWS_CERT_PFX`.
-
-Those certificates are not in this repository. Without them, Gatekeeper and SmartScreen warn; `SHA256SUMS` still identifies the files. See [BUILDING.md](BUILDING.md#signing-blockers-certs-pending).
-
-Data-plane archives on `v0.16.8` are checksummed. They include `SHA256SUMS.asc`
-only when the publish key was present at build time, and they are not
-Apple- or Authenticode-signed unless those certificates were present. Verify
-with `SHA256SUMS`. Do not claim Developer ID, notarization, or Authenticode
-until a signed build is published.
-
-This document is the threat model for a self-hosted Thirp Runtime deployment. It is not an external assessment and does not claim that the software is qualified for hostile public SaaS.
-
-The open-source release is production-capable self-hosted infrastructure: TLS, deny-by-default Broker policy, least-privilege credentials, and bounded resources. Completing parent PR-8 does not qualify Web Ingress for an untrusted Internet edge. Treat a public `thirp-web-ingress` listener as hostile-input software.
+This threat model covers a self-hosted deployment. A public Web Ingress
+listener receives untrusted requests.
 
 ## Identities
 
@@ -111,4 +101,7 @@ Broker-facing TLS reuses the existing Caller verification path. A public product
 
 Metrics and health HTTP have no TLS and no authentication; bind them to loopback or a protected network.
 
-This tree does not implement HTTP/2, a WAF, request rewriting, trusted client-IP propagation, or dynamic route revocation. There is no external assessment. Web Ingress in-process tests covered connection churn (20 sequential), 8 concurrent GETs, backpressure isolation, Agent/Caller session loss, and ingress restart; counters returned to zero. Relay burst load (N=256 CLOSE, then idle) exposed RESET storms and RSS growth; those are fixed, and the regressions keep `stream_not_found` flat. See [OPERATIONS.md](OPERATIONS.md#resource-limits). None of this is a capacity rating or a claim that the software is assessed for hostile public SaaS.
+Web Ingress supports HTTP/1.1 termination and TLS passthrough. It provides no
+WAF, request rewriting, trusted client-IP propagation or dynamic route
+revocation. The software has no external security assessment. See how the
+relay handles a full queue. [Resource limits](OPERATIONS.md#resource-limits)

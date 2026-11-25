@@ -1,13 +1,7 @@
 /*
- * SDK C example: Caller that dials a join code and echoes a payload.
- * The join code identifies a service. AUTH still uses the token; the code
- * is not a credential.
- *
- * Build against an extracted SDK only:
- *   cc -o echo_client echo_client.c \
- *      -I /opt/thirp-runtime-sdk-<VERSION>/c/include \
- *      -L /opt/thirp-runtime-sdk-<VERSION>/c/lib/linux-x86_64 \
- *      -lthirp -Wl,-rpath,/opt/thirp-runtime-sdk-<VERSION>/c/lib/linux-x86_64
+ * SDK C example for Linux and macOS. The Caller uses the bearer token to
+ * authenticate and the join code to select a service. See docs/SDK.md for
+ * build instructions and options.
  */
 
 #include "thirp.h"

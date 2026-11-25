@@ -5,8 +5,7 @@
 # macos-15-intel (x86_64), and windows-latest (or self-hosted equivalents).
 # macos-15-intel is the last Intel image GitHub hosts.
 #
-# Secrets Chuck must supply for a signed publish (all optional; unsigned
-# checksums still upload):
+# Optional signing secrets. The workflow uploads checksums with or without signing.
 #   THIRP_GPG_PRIVATE_KEY     ASCII-armored private key (fingerprint in docs/SECURITY.md)
 #   THIRP_GPG_PASSPHRASE      if the key is protected
 #   THIRP_MACOS_CODESIGN_IDENTITY   Apple Developer ID Application identity name
@@ -138,9 +137,7 @@ jobs:
       - name: Install OpenSSL 3
         shell: pwsh
         run: |
-          # Pinned OpenSSL 3.5.9 (same series as shipped 0.16.6 provenance) from the
-          # Win64 OpenSSL publisher, hash-checked. Chocolatey has no 3.5.9 package, and
-          # its older 3.x packages point at installers the publisher has removed (404).
+          # Verify the pinned Win64 OpenSSL installer by SHA-256.
           $url = "https://slproweb.com/download/Win64OpenSSL-3_5_9.exe"
           $sha256 = "5fe338c81d62515df7292f16542a0eef2a29db3efc023cd5a8c08ec3c97027ae"
           $root = "C:\Program Files\OpenSSL"
@@ -241,7 +238,7 @@ jobs:
             exit 1
           fi
           if ! gh release view "$TAG" --repo thirp/runtime >/dev/null 2>&1; then
-            echo "publish: release ${TAG} is missing; scripts/publish_github.sh --release creates it" >&2
+            echo "publish: create the GitHub Release for ${TAG} before uploading archives" >&2
             exit 1
           fi
           gh release upload "$TAG" "${files[@]}" --repo thirp/runtime

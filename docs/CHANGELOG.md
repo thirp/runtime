@@ -4,6 +4,8 @@ Project version is independent of the wire protocol version. This tree speaks pr
 
 ## Unreleased
 
+- Documentation updated for 0.16.16
+
 ## 0.16.16 - 2026-11-25
 
 - Restore caller Pings after 15 seconds of inbound silence and the 45-second receive deadline before `dead_peer`, so short host or network pauses do not tear down otherwise recoverable sessions.

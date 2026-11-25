@@ -1,7 +1,6 @@
 # Local TLS quickstart
 
-This walkthrough proves the complete Thirp Runtime relay path on one Linux
-machine:
+Run the complete Thirp Runtime relay locally on Linux, macOS or Windows:
 
 ```text
 curl → thirp-connect → thirp-broker ← thirp-agent → private HTTP service
@@ -16,7 +15,7 @@ The example credentials and certificate are for loopback testing only.
 
 ## Prerequisites
 
-- Linux
+- A Linux, macOS or Windows machine
 - OpenSSL 3 command-line tools
 - Python 3 for the private HTTP fixture
 - `curl`
@@ -27,55 +26,33 @@ files. See [DEPENDENCIES.md](DEPENDENCIES.md).
 
 ## 1. Get the Runtime binaries
 
-### Download the Linux release
-
-Download `thirp-runtime-linux-x86_64-0.16.8.tar.gz` from the
-[v0.16.8 GitHub release](https://github.com/thirp/runtime/releases/tag/v0.16.8).
-That archive is the Linux operator bundle. It contains `thirp-broker`,
-`thirp-agent`, `thirp-connect`, `thirp-web-ingress`, `libthirp.so`, and the
-checksums. Extract it, verify, and make the binaries executable:
+On Linux x86_64, use the operator archive if it is available for your tag.
+Verify the checksums from the extracted directory. [Release archives](BUILDING.md#release-archives)
 
 ```bash
-tar -xzf thirp-runtime-linux-x86_64-0.16.8.tar.gz
-cd thirp-runtime-linux-x86_64-0.16.8
+tar -xzf thirp-runtime-linux-x86_64-0.16.16.tar.gz
+cd thirp-runtime-linux-x86_64-0.16.16
 sha256sum -c SHA256SUMS
-chmod +x thirp-broker thirp-agent thirp-connect thirp-web-ingress
 ```
 
-When `SHA256SUMS.asc` is present, verify it using the publish-key fingerprint
-and command in [SECURITY.md](SECURITY.md#release-signing).
+On macOS, use the full local build and open each terminal in the output
+directory printed by the build. On Windows, use the three direct Odin build
+commands. On Linux you can also build all three from source.
+[Build command-line components](BUILDING.md#build-command-line-components)
 
-### Other platforms
+The shell examples below use Bash syntax. On Windows, open each PowerShell
+terminal in the build directory. Add the OpenSSL 3 `bin` directory to `PATH`
+in each terminal so the `openssl` command and DLLs are available. Adjust the
+path for your installation.
 
-This walkthrough uses the Linux operator binaries above. Agent, Caller, and
-`libthirp` for macOS and Windows are on the same Release,
-[v0.16.8](https://github.com/thirp/runtime/releases/tag/v0.16.8). They are not
-used in this walkthrough. Checksums, the signature, and provenance are inside
-the archives. Apple Developer ID and Authenticode are not claimed.
-The Windows zip vendors the OpenSSL 3 DLLs (`libssl-3-x64.dll` /
-`libcrypto-3-x64.dll`). Verify with `SHA256SUMS` and
-[BUILDING.md](BUILDING.md#verify-a-downloaded-tree). A combined embed SDK
-tarball is not attached to v0.16.8.
-
-| Platform | Asset on `v0.16.8` |
-|---|---|
-| Linux operator, including Web Ingress | `thirp-runtime-linux-x86_64-0.16.8.tar.gz` |
-| macOS arm64 | `thirp-runtime-macos-arm64-0.16.8.tar.gz` |
-| macOS x86_64 (Intel) | `thirp-runtime-macos-x86_64-0.16.8.tar.gz` |
-| Windows AMD64 | `thirp-runtime-windows-AMD64-0.16.8.zip` |
-
-### Or build from source
-
-Run from the repository root:
-
-```bash
-odin build broker_cli -out:thirp-broker
-odin build agent_cli -out:thirp-agent
-odin build caller_cli -out:thirp-connect
+```powershell
+$env:Path = "C:\Program Files\OpenSSL\bin;$env:Path"
 ```
 
-For the full build, test, C ABI, and packaging workflow, see
-[BUILDING.md](BUILDING.md).
+In PowerShell, use `curl.exe` and `py -3` (or `python`) for the HTTP service.
+Run each Runtime binary by its `.exe` name, such as `.\thirp-broker.exe`.
+Put each command on one line or replace Bash's trailing backslashes with
+PowerShell backticks.
 
 ## 2. Create a loopback certificate
 
@@ -107,10 +84,10 @@ deployments use separate token files and explicit deny-by-default grants.
 
 ## 4. Start the private service
 
-Terminal 2:
+Terminal 2. Create an empty `demo-origin` directory before starting the server.
 
 ```bash
-python3 -m http.server 7000 --bind 127.0.0.1 --directory /tmp
+python3 -m http.server 7000 --bind 127.0.0.1 --directory demo-origin
 ```
 
 Treat this as the private service that a real product would provide.
@@ -143,12 +120,6 @@ Terminal 4:
 Existing TCP tools can now use loopback port `8000`; they do not need to speak
 the Thirp protocol.
 
-For a caller enrolled through the control plane, use
-`./thirp-connect --caller-conf /path/to/caller.conf` instead. One process serves
-all service/listen lines in the file. Keep the configuration and `caller.token`
-at mode `0600` in a `0700` directory; relative token and CA paths resolve beside
-the configuration. See [caller enrollment](../caller_cli/README.md#caller-enrollment).
-
 ## 7. Send a payload
 
 Terminal 5:
@@ -177,14 +148,9 @@ loopback or a protected management network.
 
 ## Test reconnect behavior
 
-Stop Terminal 3 while an `nc` session is open:
-
-- The active stream closes.
-- The Broker removes the Agent-owned registration.
-- A new Caller connection cannot reach `demo/http`.
-
-Restart the Agent command. It reconnects and re-registers the desired service,
-and a new `nc` connection succeeds. The old stream is not resumed.
+Stop the Agent, then repeat the HTTP request. It fails while the service is
+unregistered. Start the Agent again and retry with a new HTTP connection.
+[Session recovery](OPERATIONS.md#session-recovery)
 
 ## Plaintext loopback shortcut
 

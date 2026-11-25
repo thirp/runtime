@@ -41,15 +41,13 @@ odin build ./my_app -collection:thirp=../thirp-runtime
 Extracted embed SDK:
 
 ```bash
-odin build ./my_app \
-  -collection:thirp=/opt/thirp-runtime-sdk-<VERSION>/odin/thirp
+odin build ./my_app -collection:thirp=/path/to/extracted-sdk/odin/thirp
 ```
 
 Extracted Broker collection:
 
 ```bash
-odin build ./my_app \
-  -collection:thirp=/opt/thirp-runtime-broker-<VERSION>/odin/thirp
+odin build ./my_app -collection:thirp=/path/to/extracted-broker/odin/thirp
 ```
 
 Pinned vendor snapshot: copy the chosen artifact’s `odin/thirp` tree (plus `LICENSE`, `NOTICE`, the manifest, and a recorded version/checksum). Do not copy the full repository.
@@ -96,7 +94,10 @@ defer ag.hosting_destroy(&hosting)
 // print hosting.join_code and string(hosting.service_id); never print token
 ```
 
-TLS: omit `tls_ca` to verify the Broker against the system CA bundle. Set `tls_server_name` when the certificate name is not the host in `broker`. `insecure` is plaintext and cannot be combined with TLS fields. Development plaintext is loopback-only.
+Omit `tls_ca` to verify the Broker against system trust. The Odin API
+defaults to verifying the Broker's IP address. Set `tls_server_name` if the
+certificate identifies it by DNS name. For loopback testing, `insecure`
+enables plaintext and requires both TLS fields to be empty.
 
 The library takes a token string. Read `--token-file` yourself (mode `0600`). Do not pass long-lived secrets on a command line.
 
@@ -104,7 +105,13 @@ A refused local TCP dial reports `LocalServiceUnavailable` to the Caller. Bounde
 
 ## Caller
 
-`caller_init` dials the Broker, authenticates as Caller, and starts the session reader. There is no `caller_stop`; `caller_destroy` is shutdown. `dial` and `dial_join_code` return a `Conn` with blocking `conn_read` / `conn_write`. `conn_half_close` stops writes. `conn_close` / `conn_destroy` finish the stream.
+`caller_init` dials the Broker, authenticates as Caller, and starts the
+session reader. `caller_destroy` closes the session and releases the
+Caller’s internal resources. The application owns the Odin `Caller` struct
+storage. If you allocated it on the heap, free it after `caller_destroy`.
+`dial` and `dial_join_code` return a `Conn` with blocking `conn_read` and
+`conn_write`. `conn_half_close` stops writes. `conn_close` and `conn_destroy`
+finish the stream.
 
 ```odin
 c: cl.Caller
@@ -123,7 +130,7 @@ n, rerr := cl.conn_read(conn, buf[:])
 cl.conn_close(conn)
 ```
 
-The Caller reconnects the Broker session after transient loss. In-flight `Conn` streams do not resume; they fail. A later `dial` can open a new stream.
+For recovery and stream lifetime after a lost Broker session, see [session recovery](https://github.com/thirp/runtime/blob/main/docs/OPERATIONS.md#session-recovery).
 
 ## Shutdown order
 
@@ -138,7 +145,7 @@ releasing the server's allocator or connection observer state.
 
 ## C ABI
 
-The published embed SDK tarball ships every `libthirp` next to one header, `c/include/thirp.h`:
+The combined embed SDK includes `c/include/thirp.h` and these shared libraries:
 
 | Target | Library |
 |---|---|
@@ -147,13 +154,17 @@ The published embed SDK tarball ships every `libthirp` next to one header, `c/in
 | `darwin-x86_64` | `c/lib/darwin-x86_64/libthirp.dylib` |
 | `windows-amd64` | `c/lib/windows-amd64/libthirp.dll` |
 
-`scripts/assemble_sdk.sh` builds that tarball from the platform artifacts. `scripts/release.sh` on one machine still packs only the library it just built, so `scripts/verify_sdk.sh` can link it; that host tarball is not the published SDK. macOS `libthirp.dylib` statically links `libssl.a` and `libcrypto.a` from the build machine’s `OPENSSL_PREFIX`; macOS SDK consumers need no separate OpenSSL 3 install. Linux `libthirp.so` dynamically links system OpenSSL 3, which consumers must supply. Windows SDK consumers must supply the matching OpenSSL 3 DLLs. No static library. No versioned soname. Data-plane archives ship the Agent and Caller CLIs beside their own copy of `libthirp`. The Windows data-plane zip also vendors `libssl-3-x64.dll` and `libcrypto-3-x64.dll` from the build tree. Linux archives use distro OpenSSL without vendoring it. macOS needs neither Homebrew nor MacPorts at runtime; release provenance records the build prefix’s exact OpenSSL 3 version.
+Use the OpenSSL runtime dependencies for your platform. The Windows
+data-plane archive includes the required OpenSSL 3 DLLs. The macOS build
+links OpenSSL 3 into `libthirp.dylib`. Linux uses system OpenSSL 3.
+[Dependencies](https://github.com/thirp/runtime/blob/main/docs/DEPENDENCIES.md#openssl-3)
+
+For example, build the C sample on Linux from the extracted SDK:
 
 ```bash
 cc -o echo_client examples/c/echo_client/echo_client.c \
-  -I /opt/thirp-runtime-sdk-<VERSION>/c/include \
-  -L /opt/thirp-runtime-sdk-<VERSION>/c/lib/linux-x86_64 \
-  -lthirp -Wl,-rpath,/opt/thirp-runtime-sdk-<VERSION>/c/lib/linux-x86_64
+  -I c/include -L c/lib/linux-x86_64 -lthirp \
+  -Wl,-rpath,"$PWD/c/lib/linux-x86_64"
 ```
 
 `thirp_conn_read` and `thirp_conn_write` may block. Branch on integer error codes, not message text. Opaque handles; call the matching destroy.
@@ -162,11 +173,25 @@ If the dynamic linker cannot find `libthirp.so`, set `LD_LIBRARY_PATH` to the `c
 
 ## Examples
 
-SDK examples live in the artifact under `examples/`. In this repository they are [examples/sdk/](../examples/sdk/).
+SDK examples live in the artifact under `examples/`. For the source and
+platform build commands, see [examples/sdk/](https://github.com/thirp/runtime/tree/main/examples/sdk) and
+[Building](https://github.com/thirp/runtime/blob/main/docs/BUILDING.md#build-sdk-examples).
 
-```bash
-odin build examples/sdk/odin/ephemeral_host -collection:thirp=.
-odin build examples/sdk/odin/join_code_client -collection:thirp=.
-```
+On Linux and macOS, `ephemeral_host` starts a loopback echo target, calls
+`host_ephemeral` and prints its join code and service ID. Run it with an
+Agent credential. SIGINT or SIGTERM starts cleanup. The Odin
+`join_code_client` runs on Linux, macOS or Windows. Run it with a Caller
+credential authorized for the service. The C `echo_client` example uses
+POSIX `usleep` and can be built on Linux or macOS.
 
-`ephemeral_host` starts a loopback echo target, calls `host_ephemeral`, prints `join_code` and `service_id`, and exits on SIGINT/SIGTERM after unregister. `join_code_client` dials that code and exchanges a payload.
+| Flag | Example programs | Meaning and default |
+|---|---|---|
+| `--broker HOST:PORT` | All | Required Broker address |
+| `--token-file PATH` | All | Required file containing the bearer secret |
+| `--namespace NAME` | All | Join-code namespace, default `sdk-demo` |
+| `--join-code CODE` | Both clients | Required code printed by the host |
+| `--payload TEXT` | Both clients | Short payload to echo, default `hello` |
+| `--tls-ca PATH` | All | PEM CA for Broker verification. Default system trust |
+| `--tls-server-name NAME` | Both Odin examples | Broker TLS hostname. Defaults to verifying the resolved Broker IP |
+| `--insecure` | All | Plaintext Broker connection for development. Off by default |
+| `-h`, `--help` | All | Print usage and exit 0 |

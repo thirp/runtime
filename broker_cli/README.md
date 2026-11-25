@@ -1,16 +1,12 @@
 # thirp-broker
 
-Public switchboard. Agents register named services. Callers ask for a name and get a bidirectional byte stream. The broker does not terminate application protocols.
+Agents register named services. Authorized Callers connect by name and get a bidirectional byte stream.
 
 Source: `broker_cli/`. Binary name: `thirp-broker`. Thin wrapper over the `broker` package.
 
 ## Build
 
-Requires [Odin](https://odin-lang.org/) and OpenSSL 3. See [DEPENDENCIES.md](../docs/DEPENDENCIES.md).
-
-```bash
-odin build broker_cli -out:thirp-broker
-```
+See the native Linux, macOS and Windows instructions. [Building](../docs/BUILDING.md#build-command-line-components)
 
 ## Usage
 
@@ -32,7 +28,7 @@ thirp-broker [--version] [--config PATH] --listen HOST:PORT (--token TOKEN=PRINC
 
 ### Config file
 
-`--config PATH` loads a line-oriented `key = value` file. `#` starts a comment. Optional `[section]` lines are ignored. Keys are the flag names without `--` (`tls_cert`, `allow_register`, `metrics_listen`, …). Repeatable keys append (`token`, `token_file`, `capability`, `allow_register`, `allow_connect`, `org_namespace`).
+`--config PATH` loads a line-oriented `key = value` file. `#` starts a comment. Optional `[section]` lines are ignored. Keys such as `tls_cert`, `allow_register`, and `metrics_listen` use underscores where the flags use hyphens. Repeatable keys append (`token`, `token_file`, `capability`, `allow_register`, `allow_connect`, `org_namespace`).
 
 CLI flags override file values. Required fields may come from either source. After merge, every practical error is printed (`config: line N: …` or `flag: --listen: …`) and the process exits 1 without listening. Unknown keys and duplicate non-repeatable keys fail. `policy_mode = production` cannot be combined with `insecure`. Empty grants in production are valid (deny-all).
 
@@ -45,9 +41,10 @@ Secrets stay in `token_file`, not in the main file. Restart the process to apply
 | Flag | Meaning |
 |---|---|
 | `--config PATH` | Optional broker config file. May be set once |
-| `--listen HOST:PORT` | Rendezvous listener |
+| `--listen HOST:PORT` | Broker listener. Use a numeric IP address |
 | `--token TOKEN=PRINCIPAL[:ORG][;...]` | Static credential mapping. Repeatable. At least one `--token` or `--token-file` |
 | `--token-file PATH` | File of credential lines (same grammar as `--token`). Repeatable. Prefer mode `0600` |
+| `-h`, `--help` | Print usage and exit 0 |
 
 `--tls-cert` and `--tls-key` are required unless `--insecure` is set. Combining `--insecure` with either TLS flag is rejected.
 
@@ -63,7 +60,7 @@ TOKEN=PRINCIPAL[:ORG][;capabilities=register|connect][;label=LABEL][;expires=RFC
 
 `TOKEN=PRINCIPAL` and `TOKEN=PRINCIPAL:ORG` remain valid. Optional fields may appear in any order. Unknown or duplicate keys are rejected. Token at most 4096 bytes; principal, organization, and label at most 128 bytes. Label charset is `A-Z a-z 0-9 - _ / .`. Duplicate token values are rejected. Two different tokens may map to the same principal (rotation).
 
-`--token-file` is line-oriented: `#` starts a comment line; blank lines are ignored. Max file size 1 MiB. Missing, unreadable, or empty-of-records files fail startup without printing file contents. Group- or world-readable files print a warning; prefer mode `0600`.
+`--token-file` is line-oriented: `#` starts a comment line; blank lines are ignored. Max file size 1 MiB. Missing, unreadable, or empty-of-records files fail startup without printing file contents. On Unix, group- or world-readable files print a warning. Use mode `0600` on Unix and a private ACL on Windows.
 
 `--token` remains for development. In `--policy-mode production`, any argv `--token` prints:
 
@@ -73,7 +70,7 @@ WARNING: --token puts the credential in the process listing and shell history. P
 
 Capabilities on the credential are unioned with `--capability PRINCIPAL=...`. The broker does not infer capabilities from the token value.
 
-Tokens are not role-typed. The same store authenticates agents and callers. HELLO carries the peer role (`Agent` or `Caller`). Role-invalid opcodes (`Caller` `REGISTER`/`UNREGISTER`, `Agent` `CONNECT`) are `PROTOCOL_ERROR` and close the connection, regardless of policy.
+The credential store authenticates both Agent and Caller roles. HELLO carries the peer role (`Agent` or `Caller`). Role-invalid opcodes (`Caller` `REGISTER`/`UNREGISTER`, `Agent` `CONNECT`) are `PROTOCOL_ERROR` and close the connection, regardless of policy.
 
 Default `--policy-mode development` allows any authenticated principal to register or connect after the role check. The process prints an unmistakable stderr warning. Do not use development policy on an Internet-reachable host.
 
@@ -94,12 +91,8 @@ Do not log tokens. Expired and unknown credentials both return `AUTHENTICATION_F
 
 ### Credential rotation
 
-Broker restart is required to change the credential set.
-
-1. Add the replacement token line (same principal) to `--token-file`.
-2. Restart the broker.
-3. Deploy the new secret to the agent or caller `--token-file` and confirm it authenticates.
-4. Remove the old token line and restart the broker.
+To replace static credentials, follow the rotation procedure.
+[Credential rotation](../docs/OPERATIONS.md#credential-rotation)
 
 ### TLS and plaintext
 
@@ -118,7 +111,8 @@ openssl req -x509 -newkey rsa:2048 -sha256 -days 365 -nodes \
   -addext "subjectAltName=IP:127.0.0.1,DNS:localhost"
 ```
 
-After replacing the configured PEM files, write a fresh request ID to `<tls-cert>.reload`. Generate it with `openssl rand -hex 16` on Linux and macOS or write it with `Set-Content` in PowerShell on Windows. New TLS handshakes use the replacement chain and established streams keep running. [Certificate rotation](../docs/OPERATIONS.md#certificate-rotation)
+For live certificate replacement, follow the reload procedure.
+[Certificate rotation](../docs/OPERATIONS.md#certificate-rotation)
 
 ### Limits
 
@@ -126,7 +120,7 @@ Unset flags keep the server defaults. Integer flags must be nonnegative. `--max-
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--max-stream-buffer BYTES` | 262144 (256 KiB) | Per-stream outbound buffer. Overflow RESET that stream only |
+| `--max-stream-buffer BYTES` | 262144 (256 KiB) | Per-stream outbound queue limit |
 | `--max-connection-buffer BYTES` | 8388608 (8 MiB) | Per-connection outbound buffer |
 | `--max-streams-per-session N` | 256 | Live streams on one agent session |
 | `--max-registrations-per-session N` | 32 | Live `ServiceId`s on one agent session |
@@ -139,9 +133,9 @@ Unset flags keep the server defaults. Integer flags must be nonnegative. `--max-
 | `--max-buffered-bytes BYTES` | 268435456 (256 MiB) | Sum of queued DATA across all connections. New `CONNECT` gets `QUOTA_EXCEEDED`; new accepts are closed. `0` disables |
 | `--stream-idle-timeout SECONDS` | 0 (off) | RESET a relay stream with `TIMEOUT` if it has no DATA / HALF_CLOSE / OPEN_OK for this long. `300` is a reasonable production value |
 
-A stream that exceeds its buffer is RESET. Other streams on the same agent stay up. `/metrics` distinguishes overflow RESET from peer-gone, session `idle_timeout`, per-stream `stream_idle`, and drain. `idle_timeout` on `thirp_resets_total` is **session** idle (no inbound frames for `--session-timeout`). `stream_idle` is the per-relay-stream timeout when `--stream-idle-timeout` is greater than 0.
+For full outbound queues and stream resets, see [resource limits](../docs/OPERATIONS.md#resource-limits). `/metrics` distinguishes overflow RESET from peer-gone, session `idle_timeout`, per-stream `stream_idle`, and drain. `idle_timeout` on `thirp_resets_total` is **session** idle (no inbound frames for `--session-timeout`). `stream_idle` is the per-relay-stream timeout when `--stream-idle-timeout` is greater than 0.
 
-Recommended `ulimit -n` is at least `2 * --max-connections + 64` (relay sockets plus metrics/log). If accept fails because the process is out of file descriptors, the broker logs `accept_failed`, increments `thirp_limit_exceeds_total{limit="file_descriptors"}`, and keeps the accept loop running.
+On Unix, recommended `ulimit -n` is at least `2 * --max-connections + 64` (relay sockets plus metrics/log). If accept fails because the process is out of file descriptors, the broker logs `accept_failed`, increments `thirp_limit_exceeds_total{limit="file_descriptors"}`, and keeps the accept loop running.
 
 ### Session and shutdown
 
@@ -149,14 +143,21 @@ Recommended `ulimit -n` is at least `2 * --max-connections + 64` (relay sockets 
 |---|---|---|
 | `--heartbeat-interval SECONDS` | 15 | Broker `PING` interval |
 | `--session-timeout SECONDS` | 45 | Idle session timeout. Disconnect removes registrations and RESET live streams |
-| `--shutdown-grace SECONDS` | 10 | Drain wait for live streams after SIGINT/SIGTERM |
+| `--shutdown-grace SECONDS` | 10 | Maximum Broker wait after sending the drain notice |
 | `--log-level LEVEL` | `info` | `error`, `warn`, `info`, or `debug` |
 
-SIGINT or SIGTERM: stop accepts, reject new `REGISTER`/`CONNECT` with `BROKER_DRAINING`, wait `--shutdown-grace` for live streams, RESET what remains, then exit.
+On Linux and macOS, SIGINT or SIGTERM requests a drain. On Windows the
+console handler responds to Ctrl+C, Ctrl+Break and console close. The Broker
+stops accepting connections and rejects new `REGISTER` and `CONNECT`
+requests with `BROKER_DRAINING`. It sends a connection-level
+`ERROR/BROKER_DRAINING` notice before waiting. On receipt, the Agent exits its
+relay loop and the Caller fails its active streams. `--shutdown-grace` controls
+only the Broker's wait before it resets any remaining streams. Transfers can
+be interrupted as soon as a client receives the notice.
 
 ### Metrics and health
 
-`--metrics-listen HOST:PORT` starts a separate HTTP listener (not the relay port):
+`--metrics-listen HOST:PORT` starts a separate HTTP listener. It is off by default.
 
 | Path | Meaning |
 |---|---|
@@ -231,4 +232,4 @@ Plaintext:
 - [caller_cli/README.md](../caller_cli/README.md) — local listen that dials a service
 - [OPERATIONS.md](../docs/OPERATIONS.md) — deploy, systemd, backup
 - [PROTOCOL.md](../docs/PROTOCOL.md) — wire format
-- [README.md](../README.md) — five-terminal echo demo
+- [Quickstart](../docs/QUICKSTART.md) — local relay demo

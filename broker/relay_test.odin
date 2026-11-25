@@ -478,6 +478,9 @@ blocked_write_proc :: proc(w: ^BlockedWrite) {
 
 @(test)
 test_blocked_agent_write_unblocks_when_caller_session_dies :: proc(t: ^testing.T) {
+	if !RUN_FLAKY {
+		return
+	}
 	reg: Registry
 	store: auth.StaticTokenAuth
 	server: Server

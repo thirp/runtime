@@ -46,7 +46,7 @@ macos_prepare_openssl() {
 		for token in $private; do
 			case "$token" in
 				# Name the SDK stub by path: a bare -lz follows the toolchain's -L
-				# list (Clay's iMac Odin pulls /opt/local/lib/libz.1.dylib).
+			# list, which can pick up a package manager's libz.
 				-lz) sdk="$(xcrun --sdk macosx --show-sdk-path)" || return 1
 					[[ -f "$sdk/usr/lib/libz.tbd" ]] || { echo "macos_openssl: missing $sdk/usr/lib/libz.tbd" >&2; return 1; }
 					OPENSSL_LINK_FLAGS="$OPENSSL_LINK_FLAGS $sdk/usr/lib/libz.tbd" ;;

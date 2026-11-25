@@ -29,54 +29,21 @@ operational problems.
 | What it is | Apache-2.0 Broker, Agent, Caller, CLI tools, Web Ingress, and embeddable SDK | Managed control plane and hosted Broker operation built on Thirp Runtime |
 | Access control | Standalone Broker: static credentials and file-backed, deny-by-default policy | Managed identity, customer approval, timed grants, revocation, audit, and usage |
 | Operating model | Self-hosted | Thirp-hosted |
-| Availability | Public Linux operator release, multi-OS dataplane artifacts, and source; independently useful | Selective hosted pilot; not part of this repository |
+| Availability | Linux operator archive, cross-platform data-plane archives and source | Managed service |
 
 The customer-side process used with Thirp Cloud is the same open-source
 `thirp-agent` provided by Runtime. Runtime does not require Thirp Cloud.
 
-Learn about the managed pilot at [thirp.net](https://thirp.net/).
+Learn about Thirp Cloud at [thirp.net](https://thirp.net/).
 
 ## Project status
 
-- Source version: **0.16.9**
-- Wire protocol: **1.0**, frozen and documented in
-  [docs/PROTOCOL.md](docs/PROTOCOL.md)
-- Platforms: **Linux** (operator release), **macOS arm64**, **macOS x86_64
-  (Intel)**, and **Windows AMD64** (data-plane Agent/Caller CLIs and C ABI
-  shared libraries). One download:
-  [v0.16.8](https://github.com/thirp/runtime/releases/tag/v0.16.8).
-- SDKs: Odin source packages. Each published platform archive includes the
-  C ABI shared library: `libthirp.so` (linux-x86_64), `libthirp.dylib`
-  (darwin-arm64 and darwin-x86_64), and `libthirp.dll` (windows-amd64). A
-  combined embed SDK tarball is not attached to v0.16.8.
-- Release artifacts on `v0.16.8` are archives:
-  - Linux operator, attached by `scripts/publish_github.sh --release`:
-    `thirp-runtime-linux-x86_64-0.16.8.tar.gz` (`thirp-broker`, `thirp-agent`,
-    `thirp-connect`, `thirp-web-ingress`, `libthirp.so`, the Broker tarball,
-    source archive, SBOM, checksums, and provenance)
-  - Data-plane archives also attached to that tag:
-    `thirp-runtime-macos-arm64-0.16.8.tar.gz`,
-    `thirp-runtime-macos-x86_64-0.16.8.tar.gz`, and
-    `thirp-runtime-windows-AMD64-0.16.8.zip`. Checksums, the signature, and
-    provenance are inside the archives. Apple Developer ID
-    and Authenticode are not claimed. The Windows zip vendors the
-    OpenSSL 3 DLLs (`libssl-3-x64.dll` / `libcrypto-3-x64.dll`).
+Thirp Runtime 0.16.16 uses wire protocol 1.0. [Wire specification](docs/PROTOCOL.md)
 
-The self-hosted Runtime implements TLS, role separation, deny-by-default
-production policy, bounded resources, reconnect, health/metrics, and graceful
-drain. Qualification work, including a lab soak, is documented
-at ([OPERATIONS.md](docs/OPERATIONS.md#resource-limits)). Web
-Ingress has additional edge-facing limitations described in the
-[security model](docs/SECURITY.md).
-
-Broker / Web Ingress / full operator stacks remain **Linux-primary** in the
-published operator Release. Dataplane Agent/Caller binaries on macOS and Windows
-are produced by `scripts/release_macos.sh` / `scripts/release_windows.ps1` and
-the green `dataplane-release` GitHub Actions workflow; they connect outbound to
-a Linux broker over TLS. Do not treat Gatekeeper or SmartScreen warnings as
-authenticity proofs until OS-level signing lands; see
-[Building](docs/BUILDING.md#macos-and-windows-data-plane-release) and
-[SECURITY.md](docs/SECURITY.md#release-signing).
+The Linux operator bundle includes Broker, Agent, Caller and Web Ingress.
+The macOS arm64, macOS Intel and Windows AMD64 data-plane bundles include
+Agent, Caller and the C shared library. See the platform builds and downloads.
+[Building](docs/BUILDING.md#release-archives)
 
 ## What is included
 
@@ -103,19 +70,10 @@ The supported local walkthrough uses TLS and exercises the complete path:
 curl → thirp-connect → thirp-broker ← thirp-agent → private HTTP service
 ```
 
-It downloads three Linux binaries—or builds them from source—creates a loopback
-certificate, starts each component, and sends an HTTP request through the relay.
+Start the Broker, Agent and Caller with a loopback certificate, then send an
+HTTP request through the relay. The guide covers Linux, macOS and Windows.
 
 **Start here: [Local TLS quickstart](docs/QUICKSTART.md).**
-
-Download published archives from
-[v0.16.8](https://github.com/thirp/runtime/releases/tag/v0.16.8).
-The Linux operator archive includes `thirp-web-ingress` and the Broker
-collection. The macOS and Windows data-plane archives are attached to the
-same Release. A combined embed SDK tarball is not attached to v0.16.8.
-Checksums are inside each archive. To
-compile individual components, or to produce a platform release tree, see
-[Building, testing, and packaging](docs/BUILDING.md).
 
 ## How authorization works
 
@@ -126,9 +84,9 @@ A successful connection requires three separate facts:
    an explicitly granted namespace.
 3. The Agent can reach the configured local target.
 
-Knowing a service name is not permission. Agent credentials can register but
-cannot connect; Caller credentials can connect but cannot register. Production
-policy is deny-by-default.
+Production policy is deny-by-default. The Agent role can register services
+and the Caller role can connect to them. The authenticated principal also
+needs the corresponding capability and grant.
 
 Runtime policy is intentionally local and file-backed. A replaceable Broker
 authenticator and authorizer allow a managed control plane—such as Thirp
@@ -138,21 +96,10 @@ without changing protocol 1.0.
 See the [production walkthrough](docs/OPERATIONS.md#production-walkthrough) for
 separate least-privilege credentials and exact service grants.
 
-## Operating characteristics
+## Operations
 
-- Agent and Caller sessions reconnect after transient Broker loss.
-- Service registrations return when an Agent reconnects.
-- In-flight streams do **not** survive a disconnect or Broker restart.
-- Revocation, grant expiry, and authorization-lease expiry terminate affected
-  live streams when supplied by the active authorizer.
-- The Broker relays opaque bytes and records control/connection metadata, not
-  application payloads.
-- A self-hosted deployment uses one Broker process; high availability and
-  cross-Broker handoff are not implemented in this repository.
-
-For configuration, TLS, resource limits, metrics, systemd, containers, upgrades,
-and failure triage, use the [operations guide](docs/OPERATIONS.md). Compatibility
-and restart behavior are defined in [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md).
+See the operations guide for configuration, TLS, recovery, metrics and
+deployment. [Operations](docs/OPERATIONS.md)
 
 ## Embed Runtime
 
@@ -195,13 +142,6 @@ Additional project references:
 Report vulnerabilities to `security@thirp.net`. Do not open a public issue for
 an unfixed vulnerability. See [docs/SECURITY.md](docs/SECURITY.md) for the
 self-hosted threat model and release-signing key.
-
-## Project history
-
-Version 0.16.0 renamed the project from Rendez to Thirp Runtime. Wire protocol
-1.0 did not change, but command names, source imports, configuration paths,
-metrics, release artifacts, and the C ABI did. See
-[docs/CHANGELOG.md](docs/CHANGELOG.md#0160) for the migration details.
 
 ## License
 

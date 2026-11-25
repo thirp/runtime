@@ -253,12 +253,27 @@ fi
 if ! grep -q 'macos-15-intel' "${ROOT}/docs/BUILDING.md"; then
 	fail_msg "BUILDING.md missing macos-15-intel"
 fi
-if ! grep -q 'v0.16.8' "${ROOT}/docs/QUICKSTART.md"; then
-	fail_msg "QUICKSTART.md missing v0.16.8"
-fi
-if ! grep -q 'v0.16.8' "${ROOT}/README.md"; then
-	fail_msg "README.md missing v0.16.8"
-fi
+# Match named Runtime releases, archive names, release URLs and bare tags
+# with the Runtime major version. Dependency versions are independent.
+doc_semver='v?[0-9]+(\.[0-9]+){2,}'
+runtime_prose='(^|[^[:alnum:]_-])Runtime([[:blank:]]+(release|version))?[[:blank:]]+`?'
+runtime_archive='thirp-runtime(-[[:alnum:]_]+)*-'
+runtime_url='github[.]com/thirp/runtime/releases/(tag|download)/'
+runtime_major=${VERSION%%.*}
+runtime_tag="(^|[^[:alnum:]_-])v${runtime_major}[.][0-9]+([.][0-9]+){1,}"
+runtime_reference="(${runtime_prose}|${runtime_archive}|${runtime_url})${doc_semver}|${runtime_tag}"
+for doc in docs/QUICKSTART.md README.md; do
+	current_version_found=false
+	while IFS= read -r reference; do
+		case "$reference" in
+			"$VERSION"|"v$VERSION") current_version_found=true ;;
+			*) fail_msg "$doc names release $reference (expected $VERSION)" ;;
+		esac
+	done < <(grep -oiE "$runtime_reference" "${ROOT}/$doc" | grep -oE "${doc_semver}$")
+	if [[ $current_version_found == false ]]; then
+		fail_msg "$doc missing release $VERSION"
+	fi
+done
 if ! grep -q 'dev-2026-07' "${ROOT}/docs/CHANGELOG.md"; then
 	fail_msg "CHANGELOG.md missing the dev-2026-07 Odin pin note"
 fi

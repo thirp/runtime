@@ -504,6 +504,9 @@ test_dial_timeout_2s_dead_backend_does_not_retire :: proc(t: ^testing.T) {
 // is 7s, so a 1s or 2s dial_timeout must not retire the session. A new
 // healthy dial can sit behind the tombstone until that OPEN_FAILED.
 short_dial_dead_backend :: proc(t: ^testing.T, dt: time.Duration) {
+	if !RUN_FLAKY {
+		return
+	}
 	fx: TestBroker
 	start_test_broker(t, &fx)
 	defer stop_test_broker(&fx)

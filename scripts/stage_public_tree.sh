@@ -186,7 +186,7 @@ for pkg in "${ALLOW_PACKAGES[@]}"; do
 done
 # Static OpenSSL staging is local build input, never public source content.
 rm -rf "${STAGE}/transport/build"
-# These internal gate tests require the Support lab or private Git history.
+# Exclude tests that depend on resources outside the public source tree.
 rm -f "${STAGE}/agent/support_lab_linux_test.odin" \
 	"${STAGE}/caller_cli/connect/enrollment_base_replay_linux_test.odin"
 copy_dir examples

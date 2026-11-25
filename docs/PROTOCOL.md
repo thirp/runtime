@@ -4,7 +4,7 @@
 **Status:** normative for the Odin reference implementation  
 **Transport:** Version 1 runs over TCP, typically with TLS. This document specifies only the application framing and payloads. Rendezvous semantics do not depend on TCP, TLS, or QUIC.
 
-This is the wire contract. Implementation details live in [`protocol/`](../protocol/). The broader product specification is `named-service-rendezvous-broker-spec-v3-acquisition.md`.
+This is the wire contract. Implementation details live in [`protocol/`](https://github.com/thirp/runtime/tree/main/protocol).
 
 ## 1. Framing
 
@@ -216,7 +216,8 @@ nonce u64
 
 Unknown codes MUST be treated as an error the implementation does not understand; they MUST NOT be confused with `OK`.
 
-Note: the product spec’s caller-flow prose uses `SERVICE_UNAVAILABLE` for a failed local dial. The Version 1.0 numeric set uses `LOCAL_SERVICE_UNAVAILABLE` (9) for that case and `AGENT_UNAVAILABLE` (8) when the agent session is gone.
+A failed local dial uses `LOCAL_SERVICE_UNAVAILABLE` (9). If the agent
+session is lost during stream setup, the broker uses `AGENT_UNAVAILABLE` (8).
 
 ## 7. ServiceId
 
@@ -312,7 +313,7 @@ BROKER -> CALLER : CONNECT_OK    (same stream_id)
 
 Then `DATA` in both directions until `HALF_CLOSE` / `CLOSE` / `RESET`.
 
-Lost application streams are not resumed after a broker-session reconnect. The caller and agent may open new streams on a new session. Deliberate agent shutdown sends `UNREGISTER` for owned names when the connection is still usable; broker session teardown remains the cleanup guarantee if that courtesy fails.
+For reconnection and stream lifetime, see [session recovery](https://github.com/thirp/runtime/blob/main/docs/OPERATIONS.md#session-recovery).
 
 The broker’s idle timeout is a **session** timeout (no inbound frames). `--stream-idle-timeout` (default off) RESET a relay stream with `TIMEOUT` (numeric `15`) when it has no `DATA` / `HALF_CLOSE` / `OPEN_OK` for that long. Opening streams that never receive `OPEN_OK` expire the same way (`CONNECT_FAILED` / `TIMEOUT` to the caller). With the timeout at `0`, streams may stay open until peer `CLOSE` / `RESET`, session timeout, drain, or disconnect.
 

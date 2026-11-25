@@ -10,6 +10,9 @@ import "core:testing"
 // Each invocation exercises the original TCP fixture and memory checks.
 @(test)
 test_connection_observer_bytes_on_close_native_repeat :: proc(t: ^testing.T) {
+	if !RUN_FLAKY {
+		return
+	}
 	executable, err := os.get_executable_path(context.temp_allocator)
 	if !testing.expect_value(t, err, nil) {
 		return

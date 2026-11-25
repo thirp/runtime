@@ -4,10 +4,9 @@ Thirp Runtime is the open-source named-Service data plane. Protocol 1.0 is froze
 
 ## Release versions
 
-Clay stamps versions with the Runtime release command. For each fix, add one
-line under `## Unreleased` in CHANGELOG.md. Create the section above the
-first release heading if needed. Leave the version declarations and released
-headings to the release command.
+For each fix, add one line under `## Unreleased` in CHANGELOG.md. Create the
+section above the first release heading if needed. Leave published versions
+and dated release headings intact.
 
 ## Tests
 

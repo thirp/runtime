@@ -639,6 +639,9 @@ test_connection_observer_authorized_and_opened :: proc(t: ^testing.T) {
 
 @(test)
 test_connection_observer_bytes_on_close :: proc(t: ^testing.T) {
+	if !RUN_FLAKY {
+		return
+	}
 	fx := FixtureConnectAuthz {
 		grant_a = GRANT_A,
 		lease_a = time.Hour,

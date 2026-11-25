@@ -1,21 +1,18 @@
 #!/usr/bin/env bash
-# Owen runs as clay on each Mac; no sudo, SSH, launchd or prefix manipulation.
-# M4: OPENSSL_PREFIX=/opt/homebrew/opt/openssl@3
-#     PATH=/Users/clay/opt/odin-dev-2026-07a:$PATH (819fdc7)
-# iMac: OPENSSL_PREFIX=/opt/local/libexec/openssl3
-#       set ODIN or PATH to Clay's existing compiler (not on default PATH).
-# If copied to /Users/clay/work/, set THIRP_SOURCE to this branch's checkout.
-# Optional REPLAY_WORKTREE must name a NEW directory. Logs/artifacts stay there.
+# Verify static OpenSSL builds on macOS as a regular user.
+# Set OPENSSL_PREFIX to the OpenSSL 3 installation and provide Odin via ODIN or PATH.
+# When running outside the source tree, set THIRP_SOURCE to a Runtime Git checkout.
+# Optional REPLAY_WORKTREE names a new directory for the build, logs and artifacts.
 set -euo pipefail
 [[ $(uname -s) == Darwin ]] || { echo 'replay: Darwin only' >&2; exit 1; }
-[[ $(id -u) != 0 ]] || { echo 'replay: run as clay, not root' >&2; exit 1; }
-: "${OPENSSL_PREFIX:?set OPENSSL_PREFIX to the lab OpenSSL 3 prefix}"
+[[ $(id -u) != 0 ]] || { echo 'replay: run as a regular user' >&2; exit 1; }
+: "${OPENSSL_PREFIX:?set OPENSSL_PREFIX to the OpenSSL 3 installation prefix}"
 ODIN="${ODIN:-odin}"
-ODIN="$(command -v "$ODIN")" || { echo 'replay: set ODIN or PATH to Clay’s existing Odin; nothing will be installed' >&2; exit 1; }
+ODIN="$(command -v "$ODIN")" || { echo 'replay: set ODIN or add an installed Odin compiler to PATH' >&2; exit 1; }
 ODIN="$(cd "$(dirname "$ODIN")" && pwd)/$(basename "$ODIN")"
 export ODIN
 SOURCE="${THIRP_SOURCE:-$(cd "$(dirname "$0")/.." && pwd)}"
-[[ -f "$SOURCE/scripts/macos_openssl.sh" ]] || { echo 'replay: set THIRP_SOURCE to the static-OpenSSL branch checkout' >&2; exit 1; }
+[[ -f "$SOURCE/scripts/macos_openssl.sh" ]] || { echo 'replay: set THIRP_SOURCE to a Runtime Git checkout' >&2; exit 1; }
 if [[ -n ${REPLAY_WORKTREE:-} ]]; then
 	WORK="$REPLAY_WORKTREE"
 	[[ "$WORK" == /* && ! -e "$WORK" ]] || { echo 'replay: REPLAY_WORKTREE must be an absolute path that does not exist' >&2; exit 1; }
@@ -37,7 +34,7 @@ chmod +x "$WORK/replay-tools/odin"
 export PATH="$WORK/replay-tools:$PATH"
 echo "replay: worktree=$WORK commit=$(git rev-parse HEAD) arch=$(uname -m) prefix=$OPENSSL_PREFIX"
 "$ODIN" version
-# This replay uses ad-hoc hardened signing below; Clay's release signing is separate.
+# Use ad-hoc hardened signing for the verification copies below.
 unset THIRP_MACOS_CODESIGN_IDENTITY THIRP_MACOS_NOTARY_PROFILE
 bash scripts/release_macos.sh
 VERSION="$(tr -d '[:space:]' < VERSION.txt)"
@@ -47,8 +44,7 @@ ARCHIVE="$OUT.tar.gz"
 mkdir "$WORK/evidence/unpacked"
 tar -xzf "$ARCHIVE" -C "$WORK/evidence/unpacked"
 bash scripts/verify_dataplane_release.sh "$WORK/evidence/unpacked/$(basename "$OUT")" darwin | tee "$WORK/evidence/archive-guard.log"
-# Run copied binaries from a separate directory; never hide/rename an OpenSSL
-# prefix. M4 pid 1612 uses it. No live agent tree or process is touched.
+# Verify copies in a separate directory to preserve the original build and OpenSSL installation.
 # Security.framework pulls Apple's own /usr/lib/libssl.NN / libcrypto.NN
 # (LibreSSL) from the shared cache. Those are platform images, not ours;
 # anything else named libssl/libcrypto, or any package-manager path, fails.
@@ -91,7 +87,7 @@ trap cleanup EXIT
 "$OPENSSL_PREFIX/bin/openssl" req -x509 -newkey rsa:2048 -sha256 -days 1 -nodes \
 	-keyout "$WORK/evidence/broker.key" -out "$WORK/evidence/broker.crt" \
 	-subj /CN=localhost -addext 'subjectAltName=IP:127.0.0.1,DNS:localhost' > "$WORK/evidence/cert.log" 2>&1
-# The kernel chooses an unused loopback port. No fixed lab/soak listener ports.
+# The kernel chooses an unused loopback port.
 printf '%s\n' 'replay-throwaway-token=replay-agent' > "$WORK/evidence/broker.tokens"
 printf '%s\n' 'replay-throwaway-token' > "$WORK/evidence/agent.token"
 chmod 600 "$WORK/evidence/"*.key "$WORK/evidence/"*.token "$WORK/evidence/"*.tokens

@@ -9,11 +9,7 @@ This is a port bridge, not a VPN. Routing is by `ServiceId`.
 
 ## Build
 
-Requires [Odin](https://odin-lang.org/) and OpenSSL 3. See [DEPENDENCIES.md](../docs/DEPENDENCIES.md).
-
-```bash
-odin build caller_cli -out:thirp-connect
-```
+See the native Linux, macOS and Windows instructions. [Building](../docs/BUILDING.md#build-command-line-components)
 
 ## Usage
 
@@ -29,18 +25,18 @@ thirp-connect --caller-conf PATH [--stream-stall-timeout SECONDS] [--max-stream-
 | `--version` | no | Print project version, build commit and protocol 1.0, then exit 0 |
 | `--broker HOST:PORT` | yes in legacy mode | Broker address. IP or DNS name; DNS is resolved at start |
 | `--token TOKEN` | one of in legacy mode | Bearer token (must match a broker credential). Development convenience |
-| `--token-file PATH` | one of in legacy mode | File whose body is the bearer secret. Prefer mode `0600` |
+| `--token-file PATH` | one of in legacy mode | File containing the bearer secret. Use mode `0600` on Unix and a private ACL on Windows |
 | `--service SERVICE_ID` | yes in legacy mode | Service to dial on each local accept |
-| `--listen HOST:PORT` | yes in legacy mode | Local TCP listen address |
+| `--listen HOST:PORT` | yes in legacy mode | Local TCP listen address. Use a numeric IP address |
 | `--caller-conf PATH` | yes in enrollment mode | Enrolled caller configuration; see Caller enrollment |
 | `--tls-ca PATH` | no | Legacy mode: PEM CA file. Omit to use the system CA bundle |
 | `--tls-server-name NAME` | no | Legacy mode: SNI / hostname verification. Defaults to the host in `--broker` |
 | `--insecure` | no | Legacy mode: plaintext TCP. Rejected if combined with `--tls-ca` or `--tls-server-name` |
-| `--stream-stall-timeout SECONDS` | no | A write to a local client that takes no bytes this long fails and ends that stream (default `30`, `0` = never). See Behavior |
+| `--stream-stall-timeout SECONDS` | no | A write to a local client that takes no bytes this long fails and ends that stream (range `0` to `86400`, default `30`, `0` disables the timeout). See Behavior |
 | `--max-stream-buffer-mib N` | no | Download data held for one local client that it has not read yet; a stream further behind is reset at once (`1`..`1048576`, default `8`). See Behavior |
 | `-h`, `--help` | no | Print usage and exit 0 |
 
-In legacy mode, exactly one of `--token` or `--token-file` is required. `--token-file` is the production path for this mode: the file is the raw secret (one line, no `TOKEN=PRINCIPAL` grammar). Do not put long-lived secrets on the command line. Group- or world-readable files print a warning.
+In legacy mode, exactly one of `--token` or `--token-file` is required. `--token-file` is the production path for this mode: the file is the raw secret (one line, no `TOKEN=PRINCIPAL` grammar). Do not put long-lived secrets on the command line. On Unix, group- or world-readable files print a warning.
 
 For an enrolled caller, use `--caller-conf` as described below. Broker and agent config files are documented in [OPERATIONS.md](../docs/OPERATIONS.md).
 
@@ -70,16 +66,18 @@ Stream ends:
 - Local EOF is sent as `HALF_CLOSE`; the response direction stays open until the peer finishes.
 - Peer `HALF_CLOSE` is passed to the client as EOF (`shutdown(SHUT_WR)`).
 - When both directions are done, or on the peer's `CLOSE`/`RESET`, the local socket is closed. After an early `CLOSE`/`RESET` (for example a server that answers 403 and closes while the client is still uploading), the rest of the client's request is drained for up to 2 s so the response is not lost to a TCP reset, then the socket is shut down both ways.
-- A slow client or server only slows its own stream. Each stream has its own buffer: 8 MiB in thirp-connect (download direction) and 64 MiB in the Agent (upload direction, `AgentConfig.max_stream_buffer`; 256 MiB for all streams together).
-- A write to the local client fails only when the client took no bytes for `--stream-stall-timeout` seconds (default 30; `0` = never).
-- The protocol has no per-stream flow control, so no buffer ever makes the session wait. **A slow download past 8 MiB is reset:** a client that reads slower than the service sends (or pauses, like a pager) loses its stream once it is `--max-stream-buffer-mib` behind. Likewise in the Agent, an upload whose backlog would pass 64 MiB is reset. Either way the other streams, and other callers of the same service, are unaffected. See the CHANGELOG trade-off note.
-- At most 256 local connections are open per Caller; more are closed on accept (with a message on stderr in legacy mode). Enrollment links with the same catalog ID share this limit.
+- A download that overruns the Caller's per-stream buffer resets that stream.
+  A local write that makes no progress for the configured stall timeout also
+  ends the stream. [Broker backpressure](../docs/OPERATIONS.md#resource-limits)
+- A Caller accepts up to 256 live local connections per session. Enrollment
+  listeners for the same catalog service share that limit.
 
-In legacy mode, a failed initial broker dial exits nonzero. Enrollment mode retries broker setup. A dead broker session closes in-flight local sockets. The caller library reconnects the broker session with the same backoff as the agent (250 ms … 15 s). Later accepts `CONNECT` on the new session. Lost streams are not resumed. `RATE_LIMITED` on authenticate or CONNECT is transient, not a bad token.
+A failed initial legacy broker setup exits nonzero. For established sessions,
+see [session recovery](../docs/OPERATIONS.md#session-recovery).
 
-`--listen` (legacy mode) or each `listen` address in `caller.conf` controls who on the caller-side network can use the bridge. Examples use `127.0.0.1`. Binding all interfaces (`0.0.0.0` / `::`) prints a warning.
+`--listen` (legacy mode) or each `listen` address in `caller.conf` controls who on the caller-side network can use the bridge. Examples use `127.0.0.1`. A non-loopback listen address prints a warning in either mode.
 
-There is no signal waiter. Default process kill is enough. Local listen failure also exits nonzero.
+A local listen failure exits nonzero.
 
 Programs that want in-process `dial` / `conn_read` / `conn_write` should link the `caller` package (or `libthirp.so`) instead of this binary.
 
@@ -89,19 +87,20 @@ Programs that want in-process `dial` / `conn_read` / `conn_write` should link th
 thirp-connect --caller-conf /path/to/caller.conf
 ```
 
-Use the file written by `thirp caller enroll`. The conf contains `api`, `org`,
+Use the configuration produced by the control-plane enrollment tool. The conf contains `api`, `org`,
 `environment`, `enrollment`, `token_file`, `broker`, `tls_ca`, and
 `tls_server_name`, plus service/listen links. All eight keys must be present;
 `environment`, `tls_ca`, and `tls_server_name` may have empty values.
 The configuration and its `token_file` must be regular files. On Unix their
 permissions must be no wider than `0600`; broader permissions cause an error
 and exit 1. Keep their directory at `0700` (recommended, not checked).
-On Windows, files written during rotation have an owner-only DACL: exactly
-two allow ACEs, granting the current process-token user and LocalSystem (SYSTEM)
-`FILE_ALL_ACCESS`, with inheritance off. Before reading either file, the process
-checks the open file's DACL and refuses a NULL DACL, an unprotected DACL,
-inherited ACEs, or a grant that lets another principal read the data. Deny ACEs
-are permitted. An unsafe file causes the same error and exit 1 as on Unix.
+On Windows, token rotation writes a protected DACL granting `FILE_ALL_ACCESS`
+to the process-token user and LocalSystem (SYSTEM). When the process runs as
+LocalSystem, the DACL has one allow entry for SYSTEM. Before reading either
+file, the process checks the open file's DACL and rejects a NULL or unprotected
+DACL, inherited entries, or an allow entry for another principal that grants
+more than metadata access. Explicit deny entries are permitted. An unsafe
+file causes exit 1.
 Relative `token_file`, `tls_ca`, and `api_tls_ca` paths resolve beside the conf.
 One process opens a listener for every `service = <catalog id> listen = <IP:port>`
 line. `api` must be an HTTPS origin. The API's TLS identity comes from the URL.
@@ -112,36 +111,33 @@ Stream buffer and stall flags can also be used.
 `--caller-conf` cannot be mixed with `--token`, `--token-file`, `--broker`,
 `--service`, `--listen`, `--tls-ca`, `--tls-server-name`, or `--insecure`;
 mixing them prints an error and exits 1.
-Put endpoint and TLS settings in the conf.
-The enrollment secret authenticates only control-plane requests. The process
-mints and renews a separate broker credential for each grant. Platforms
-org-wide links create and approve replacement grants automatically. At grant
-end, Support links log `waiting for approval` and poll for a new active grant
-under the existing approval policy. Listeners stay bound while waiting and
-during rollover. They close new local sockets on accept whenever their service
-lacks an admitted broker session. The accept loop polls at 50 ms and the
-loopback regression requires EOF within two seconds. Existing streams drain
-until EOF or their grant end. Revocation closes the Caller and its streams and
-polls slowly. Configuration errors and enrollment expiry exit nonzero.
+Put endpoint and TLS settings in the file.
 
-Setup failures go to stderr with a reason such as `tls_verify`, `dns`,
-`unauthorized_or_revoked`, or `unknown_service`. Each source and reason logs
-immediately on first occurrence and at most once per ten seconds per process.
+The enrollment secret authenticates control-plane requests. With an
+organization-wide Platforms enrollment, the Caller can request and approve
+a replacement grant. With an environment-scoped enrollment, it waits for an
+approved grant. The Caller mints
+a separate broker credential and renews it while the grant is valid. It keeps
+the listeners bound during approval and rollover. Accepts close while the
+service has no live, admitted session. On revocation, affected streams close
+and approval polling resumes. Invalid configuration and enrollment expiry
+cause a nonzero exit.
 
-On start and every six hours the process checks enrollment expiry. Within
-30 days of expiry it rotates the token and replaces the configured `token_file` atomically
-after flushing the temporary file. Unix uses mode `0600` and rename. Windows
-sets the protected DACL on the empty temporary file before writing any secret,
-then uses `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH`
-for an atomic replace in the same directory that keeps the temporary file's
-DACL, and checks the final path's DACL again. A temporary hard link retains the
-old token until that check passes; a failed check restores it. If restoring the
-old token also fails, its backup remains beside the token as `*.tmp.old`.
-Windows rotation of an existing token requires hard-link support for that backup;
-if creating it fails, the old token remains in place. No login session, session
-refresh, or disk adoption is involved. Run one process per enrollment token file. The compile-time
-`-define:THIRP_LAB_TIMERS=true` shortens polling and rotation-check intervals
-only; credential and grant lifetimes and the rotation window stay unchanged.
+If admission is lost, the Caller retires the session and tries to mint a
+fresh broker credential. If the API is unavailable, it can reuse its former
+credential once if it is still valid for the same grant. A failed broker
+setup discards that credential. Each setup attempt shares a 10-second deadline
+across DNS, TCP, TLS, Hello and Authenticate. With no usable session, three
+consecutive broker setup failures for a service cause exit 1 with
+`broker_setup_exhausted`. Approval waits and API retries have separate timers.
+
+The Caller checks for enrollment token rotation at startup and every six hours.
+Within 30 days of expiry it requests a replacement and atomically replaces the
+token file. Unix uses a private temporary file and rename. Windows sets a
+protected DACL before writing the temporary file, then replaces the token
+and rechecks the DACL. Rotation of an existing token on Windows requires
+hard-link support to retain the old token for rollback. Run one process per
+enrollment token file.
 
 ## Example
 
@@ -189,4 +185,4 @@ Plaintext:
 - [broker_cli/README.md](../broker_cli/README.md) — broker
 - [OPERATIONS.md](../docs/OPERATIONS.md) — deploy, systemd, backup
 - [PROTOCOL.md](../docs/PROTOCOL.md) — wire format
-- [README.md](../README.md) — five-terminal echo demo
+- [Quickstart](../docs/QUICKSTART.md) — local relay demo

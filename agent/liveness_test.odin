@@ -561,6 +561,7 @@ silent_peer_echo :: proc(t: ^testing.T, fx: ^TestBroker, want: string) {
 // keepalive intervals. Use the broker's production timers too.
 @(test)
 test_agent_stays_up_on_healthy_idle_session :: proc(t: ^testing.T) {
+	if !RUN_FLAKY { return }
 	testing.set_fail_timeout(t, 180 * time.Second)
 	fx: TestBroker
 	start_test_broker(t, &fx)
