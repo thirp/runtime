@@ -213,7 +213,7 @@ when ODIN_TEST {
 
 	@(test)
 	test_caller_watchdog_survives_full_destination :: proc(t: ^testing.T) {
-		hold_duration :: 3 * max(DEAD_PEER_TIMEOUT, DEFAULT_SEND_STALL_TIMEOUT)
+		hold_duration :: 3 * max(LIVENESS_TEST_READ_IDLE_TIMEOUT, DEFAULT_SEND_STALL_TIMEOUT)
 		testing.set_fail_timeout(t, hold_duration + 10 * time.Second)
 		blocked_id: proto.StreamId = 7
 		sibling_id: proto.StreamId = 9
@@ -224,6 +224,8 @@ when ODIN_TEST {
 		}
 		ping_observation := ProbePongs{last = time.tick_now()}
 		c := Caller{conn = socket, streams = make(map[proto.StreamId]^Conn)}
+		c.config.read_idle_timeout = LIVENESS_TEST_READ_IDLE_TIMEOUT
+		c.config.ping_interval = LIVENESS_TEST_PING_INTERVAL
 		c.config.test_ping_received = record_probe_receive
 		c.config.test_ping_user = &ping_observation
 		blocked, sibling: ^Conn
@@ -310,7 +312,7 @@ when ODIN_TEST {
 		}
 		_, pending_err := conn_write(blocked, first_data[:])
 		if !testing.expect_value(t, pending_err, ConnError.None) ||
-		   !testing.expect(t, sync.sema_wait_with_timeout(&partial_drain.waiting, DEAD_PEER_TIMEOUT), "the broker held the pending DATA") {
+		   !testing.expect(t, sync.sema_wait_with_timeout(&partial_drain.waiting, LIVENESS_TEST_READ_IDLE_TIMEOUT), "the broker held the pending DATA") {
 			return
 		}
 		// Exercise a caller Ping and a broker Ping while the pending DATA
@@ -321,7 +323,7 @@ when ODIN_TEST {
 		ping_terr, ping_perr := trans.write_frame(socket, .Ping, ping)
 		if !testing.expect(t, ping_terr == .None && ping_perr == .None && send_liveness_probe(broker_socket),
 			"send keepalives in both directions while waiting for DATA space") ||
-		   !testing.expect(t, sync.sema_wait_with_timeout(&pong_observation.first, DEAD_PEER_TIMEOUT), "the broker read a Pong while DATA was held") {
+		   !testing.expect(t, sync.sema_wait_with_timeout(&pong_observation.first, LIVENESS_TEST_READ_IDLE_TIMEOUT), "the broker read a Pong while DATA was held") {
 			return
 		}
 		writer = thread.create_and_start_with_poly_data(&upload, liveness_upload_proc)
@@ -333,7 +335,7 @@ when ODIN_TEST {
 		_ = proto.decoder_init(&decoder)
 		defer proto.decoder_destroy(&decoder)
 		_ = trans.connection_set_recv_timeout(sibling_peer, 10 * time.Millisecond)
-		next_probe := time.tick_since(start) + CALLER_PING_INTERVAL
+		next_probe := time.tick_since(start) + LIVENESS_TEST_PING_INTERVAL
 		last_upload: time.Tick
 		longest_upload_gap, first_sibling, reset_at: time.Duration
 		received := 0
@@ -344,7 +346,7 @@ when ODIN_TEST {
 				if !testing.expect(t, send_liveness_probe(broker_socket), "A1: Ping write failed") {
 					return
 				}
-				next_probe += CALLER_PING_INTERVAL
+				next_probe += LIVENESS_TEST_PING_INTERVAL
 			}
 			sync.mutex_lock(&c.mutex)
 			admitted, reason := c.connected, c.disconnect_reason
@@ -403,7 +405,7 @@ when ODIN_TEST {
 		pings := ping_observation.count
 		longest_ping_gap := max(ping_observation.longest_gap, time.tick_since(ping_observation.last))
 		sync.mutex_unlock(&ping_observation.mutex)
-		testing.expectf(t, pings >= 3 && longest_ping_gap < DEAD_PEER_TIMEOUT,
+		testing.expectf(t, pings >= 3 && longest_ping_gap < LIVENESS_TEST_READ_IDLE_TIMEOUT,
 			"A1: caller read %d Pings during the hold with longest gap %v", pings, longest_ping_gap)
 		testing.expect_value(t, caller_stream_load(&c), 1)
 		sync.mutex_lock(&blocked.mutex)
@@ -468,7 +470,7 @@ when ODIN_TEST {
 		upload_bytes :: 8 * 1024
 		drain_bytes :: upload_bytes / drain_cycles
 		#assert(drain_cycles * (drain_bytes + proto.HEADER_SIZE) < proto.DECODER_BUFFER_CAP)
-		testing.set_fail_timeout(t, 3 * DEAD_PEER_TIMEOUT)
+		testing.set_fail_timeout(t, 3 * LIVENESS_TEST_READ_IDLE_TIMEOUT)
 		sid: proto.StreamId = 7
 		socket, broker_socket, err := trans.test_stream_pair()
 		if !testing.expect_value(t, err, trans.TransportError.None) {
@@ -476,6 +478,8 @@ when ODIN_TEST {
 		}
 		defer trans.connection_destroy(broker_socket)
 		c := Caller{conn = socket, streams = make(map[proto.StreamId]^Conn)}
+		c.config.read_idle_timeout = LIVENESS_TEST_READ_IDLE_TIMEOUT
+		c.config.ping_interval = LIVENESS_TEST_PING_INTERVAL
 		stream: ^Conn
 		defer {
 			caller_destroy(&c)
@@ -532,14 +536,14 @@ when ODIN_TEST {
 		pending[0] = 'p'
 		_, send_err := conn_write(stream, pending[:])
 		if !testing.expect_value(t, send_err, ConnError.None) ||
-		   !testing.expect(t, sync.sema_wait_with_timeout(&clock.blocked, DEAD_PEER_TIMEOUT), "the upload blocked on the full queue") ||
+		   !testing.expect(t, sync.sema_wait_with_timeout(&clock.blocked, LIVENESS_TEST_READ_IDLE_TIMEOUT), "the upload blocked on the full queue") ||
 		   !testing.expect(t, send_liveness_probe(broker_socket), "send Ping while the upload waits") {
 			return
 		}
 		decoder: proto.FrameDecoder
 		_ = proto.decoder_init(&decoder)
 		defer proto.decoder_destroy(&decoder)
-		_ = trans.connection_set_recv_timeout(peer, DEAD_PEER_TIMEOUT)
+		_ = trans.connection_set_recv_timeout(peer, LIVENESS_TEST_READ_IDLE_TIMEOUT)
 		following: [drain_cycles][drain_bytes]u8
 		for cycle in 0 ..< drain_cycles {
 			// Keep uploading while the first pending frame waits. Pace
@@ -559,11 +563,11 @@ when ODIN_TEST {
 				return
 			}
 			defer delete(queued.payload, dst.outbox.allocator)
-			if !testing.expect(t, sync.sema_wait_with_timeout(&clock.observed, DEAD_PEER_TIMEOUT), "broker observed the partial drain") {
+			if !testing.expect(t, sync.sema_wait_with_timeout(&clock.observed, LIVENESS_TEST_READ_IDLE_TIMEOUT), "broker observed the partial drain") {
 				return
 			}
 			if cycle + 1 == int(brk.BACKPRESSURE_PING_INTERVAL / drain_interval) {
-				if !testing.expect(t, sync.sema_wait_with_timeout(&pongs.first, DEAD_PEER_TIMEOUT),
+				if !testing.expect(t, sync.sema_wait_with_timeout(&pongs.first, LIVENESS_TEST_READ_IDLE_TIMEOUT),
 					"broker read a Pong before any partial drain could admit the pending DATA") {
 					return
 				}
@@ -581,7 +585,7 @@ when ODIN_TEST {
 				return
 			}
 		}
-		if !testing.expect(t, sync.sema_wait_with_timeout(&clock.blocked, DEAD_PEER_TIMEOUT),
+		if !testing.expect(t, sync.sema_wait_with_timeout(&clock.blocked, LIVENESS_TEST_READ_IDLE_TIMEOUT),
 			"the final drain admitted the pending frame and the reader advanced to the following DATA") {
 			return
 		}
@@ -723,7 +727,7 @@ when ODIN_TEST {
 				// Leave DATA unread on the socket and delay Pong replies
 				// even though the caller has finished uploading.
 				if mode == .WithParserSpace {
-					if !testing.expect(t, sync.sema_wait_with_timeout(&clock.blocked, DEAD_PEER_TIMEOUT), "the larger upload entered the outbox wait") {
+					if !testing.expect(t, sync.sema_wait_with_timeout(&clock.blocked, LIVENESS_TEST_READ_IDLE_TIMEOUT), "the larger upload entered the outbox wait") {
 						return
 					}
 					sync.mutex_lock(&dst.outbox.mutex)
@@ -762,7 +766,7 @@ when ODIN_TEST {
 		}
 		paused := time.tick_since(first_ping)
 		if mode == .WithParserSpace {
-			testing.expect(t, sync.sema_wait_with_timeout(&pongs.first, DEAD_PEER_TIMEOUT),
+			testing.expect(t, sync.sema_wait_with_timeout(&pongs.first, LIVENESS_TEST_READ_IDLE_TIMEOUT),
 				"broker read a Pong behind the larger upload while the outbox remained held")
 		}
 		_, open := brk.relay_lookup_stream(&server, stream_id)

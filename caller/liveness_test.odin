@@ -13,6 +13,16 @@ import "core:thread"
 import "core:time"
 
 when ODIN_TEST {
+LIVENESS_TEST_PING_INTERVAL :: 2 * time.Second
+LIVENESS_TEST_READ_IDLE_TIMEOUT :: 7 * time.Second
+
+@(test)
+test_caller_production_liveness_defaults :: proc(t: ^testing.T) {
+	c: Caller
+	testing.expect_value(t, caller_ping_interval(&c), 15 * time.Second)
+	testing.expect_value(t, caller_dead_peer_limit(&c), 45 * time.Second)
+}
+
 // The dead endpoint stays pending for the agent's real local dial budget.
 // A loopback listen backlog does not drop SYNs consistently across kernels.
 // Healthy dials still go through the real TCP transport.
@@ -291,10 +301,10 @@ test_no_dial_timeout_does_not_tombstone :: proc(t: ^testing.T) {
 	}
 }
 
-// Verify the production deadline with a peer that still accepts TCP bytes.
+// Exercise the receive watchdog with a silent peer that still accepts TCP bytes.
 @(test)
-test_silent_peer_uses_production_deadline :: proc(t: ^testing.T) {
-	reconnect_five_services(t, silent = true, cycles = 1, production_timers = true)
+test_silent_peer_recovers_after_receive_deadline :: proc(t: ^testing.T) {
+	reconnect_five_services(t, silent = true, cycles = 1)
 }
 
 // A dial that gets no answer on a blackholed path must not leave the caller
@@ -331,6 +341,8 @@ test_blackhole_failed_dial_drops_session :: proc(t: ^testing.T) {
 				insecure = true,
 				dial_timeout = 2 * time.Second,
 				send_stall_timeout = -1,
+				read_idle_timeout = LIVENESS_TEST_READ_IDLE_TIMEOUT,
+				ping_interval = LIVENESS_TEST_PING_INTERVAL,
 			},
 		),
 		CallerError.None,

@@ -27,6 +27,9 @@ test_caller_receive_deadline_distinguishes_dead_and_idle :: proc(t: ^testing.T) 
 	defer delete(c.streams)
 	caller_watch_sessions(&c, now)
 	testing.expect(t, c.connected && c.disconnect_reason == "", "a quiet open stream was treated as idle")
+	c.last_recv = time.tick_add(now, -DEAD_PEER_TIMEOUT + time.Millisecond)
+	caller_watch_sessions(&c, now)
+	testing.expect(t, c.connected && c.disconnect_reason == "", "the watchdog dropped the session before the receive deadline")
 	c.last_recv = time.tick_add(now, -DEAD_PEER_TIMEOUT)
 	caller_watch_sessions(&c, now)
 	testing.expect_value(t, c.disconnect_reason, LOG_REASON_DEAD_PEER)
@@ -71,7 +74,7 @@ test_five_services_resume_after_silent_drop :: proc(t: ^testing.T) {
 	reconnect_five_services(t, silent = true)
 }
 
-reconnect_five_services :: proc(t: ^testing.T, silent: bool, cycles := RESUME_CYCLES, production_timers := false) {
+reconnect_five_services :: proc(t: ^testing.T, silent: bool, cycles := RESUME_CYCLES) {
 	testing.set_fail_timeout(t, 100 * time.Second)
 	fx: TestBroker
 	start_test_broker(t, &fx)
@@ -99,10 +102,13 @@ reconnect_five_services :: proc(t: ^testing.T, silent: bool, cycles := RESUME_CY
 	byte_proxy_start(t, &proxy, endpoint)
 	defer byte_proxy_stop(&proxy)
 	c: Caller
-	config := CallerConfig{broker = proxy.ep, token = TEST_TOKEN_CALLER, insecure = true, dial_timeout = 3 * time.Second}
-	if !production_timers {
-		config.read_idle_timeout = RESUME_SILENCE
-		config.ping_interval = RESUME_PING
+	config := CallerConfig {
+		broker = proxy.ep,
+		token = TEST_TOKEN_CALLER,
+		insecure = true,
+		dial_timeout = 3 * time.Second,
+		read_idle_timeout = RESUME_SILENCE,
+		ping_interval = RESUME_PING,
 	}
 	if !silent {
 		config.session_idle_timeout = RESUME_IDLE
@@ -116,13 +122,13 @@ reconnect_five_services :: proc(t: ^testing.T, silent: bool, cycles := RESUME_CY
 		return
 	}
 	for cycle in 1 ..= cycles {
-		if !resume_one_cycle(t, &c, &proxy, cycle, silent, production_timers) {
+		if !resume_one_cycle(t, &c, &proxy, cycle, silent) {
 			return
 		}
 	}
 }
 
-resume_one_cycle :: proc(t: ^testing.T, c: ^Caller, proxy: ^ByteProxy, cycle: int, silent, production_timers: bool) -> bool {
+resume_one_cycle :: proc(t: ^testing.T, c: ^Caller, proxy: ^ByteProxy, cycle: int, silent: bool) -> bool {
 	old: ^Conn
 	if silent {
 		gen := caller_conn_gen(c)
@@ -140,11 +146,8 @@ resume_one_cycle :: proc(t: ^testing.T, c: ^Caller, proxy: ^ByteProxy, cycle: in
 	}
 	gen := caller_conn_gen(c)
 	start := time.tick_now()
-	bound := 4 * time.Second if silent && !production_timers else 10 * time.Second
-	detect := 1500 * time.Millisecond
-	if production_timers {
-		detect = 9 * time.Second
-	}
+	bound := 4 * time.Second if silent else 10 * time.Second
+	detect :: 1500 * time.Millisecond
 	if silent {
 		byte_proxy_blackhole(proxy)
 	}

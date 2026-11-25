@@ -3,6 +3,7 @@ package broker
 import auth "../auth"
 import proto "../protocol"
 import trans "../transport"
+import "core:fmt"
 import "core:testing"
 import "core:time"
 
@@ -397,6 +398,64 @@ test_conn_ping_nonce_echoed :: proc(t: ^testing.T) {
 	testing.expect_value(t, perr, proto.ProtocolError.None)
 	proto.frame_destroy(&pong_frame)
 	testing.expect_value(t, pong.nonce, u64(0xAABBCCDDEEFF0011))
+}
+
+@(test)
+test_conn_caller_stays_connected_with_15s_pings :: proc(t: ^testing.T) {
+	reg: Registry
+	store: auth.StaticTokenAuth
+	server: Server
+	start_test_server(t, &server, &reg, &store)
+	defer stop_test_server(&server, &store, &reg)
+	server.heartbeat_interval = DEFAULT_HEARTBEAT_INTERVAL
+	server.session_timeout = DEFAULT_SESSION_TIMEOUT
+
+	conn := dial_server(t, &server)
+	if conn == nil {
+		return
+	}
+	defer trans.connection_destroy(conn)
+	decoder: proto.FrameDecoder
+	handshake_caller(t, conn, &decoder)
+	defer proto.decoder_destroy(&decoder)
+
+	ping_interval :: 15 * time.Second
+	probe_count :: 4
+	start := time.tick_now()
+	for probe in 1 ..= probe_count {
+		next_ping := ping_interval * time.Duration(probe)
+		time.sleep(max(0, next_ping - time.tick_since(start)))
+		nonce := u64(probe)
+		payload, err := proto.encode_ping({nonce = nonce})
+		defer delete(payload)
+		if !testing.expect_value(t, err, proto.ProtocolError.None) {
+			return
+		}
+		must_write_opcode(t, conn, .Ping, payload)
+		for {
+			frame := must_read_frame(t, conn, &decoder)
+			defer proto.frame_destroy(&frame)
+			// The caller sends only its scheduled Pings. Broker Pings may
+			// arrive before the matching Pong on the same connection.
+			if frame.header.opcode == .Ping {
+				continue
+			}
+			if !testing.expect_value(t, frame.header.opcode, proto.Opcode.Pong) {
+				return
+			}
+			pong, perr := proto.decode_pong(frame.payload)
+			if !testing.expect_value(t, perr, proto.ProtocolError.None) ||
+			   !testing.expect_value(t, pong.nonce, nonce) {
+				return
+			}
+			break
+		}
+	}
+	elapsed := time.tick_since(start)
+	if testing.expect(t, elapsed > server.session_timeout, "the caller stayed connected beyond one idle deadline") {
+		fmt.printfln("A4: broker returned %d matching Pongs to a caller pinging every %v on one session over %v (idle deadline %v)",
+			probe_count, ping_interval, elapsed, server.session_timeout)
+	}
 }
 
 @(test)

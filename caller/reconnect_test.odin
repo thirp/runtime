@@ -290,12 +290,17 @@ test_reconnect_after_silent_peer :: proc(t: ^testing.T) {
 	byte_proxy_start(t, &proxy, broker_endpoint(t, &fx))
 	defer byte_proxy_stop(&proxy)
 	c: Caller
-	err := caller_init(&c, CallerConfig {
+	config := CallerConfig {
 		broker = proxy.ep,
 		token = TEST_TOKEN_CALLER,
 		insecure = true,
 		dial_timeout = 5 * time.Second,
-	})
+	}
+	when #defined(LIVENESS_TEST_READ_IDLE_TIMEOUT) {
+		config.read_idle_timeout = LIVENESS_TEST_READ_IDLE_TIMEOUT
+		config.ping_interval = LIVENESS_TEST_PING_INTERVAL
+	}
+	err := caller_init(&c, config)
 	testing.expect_value(t, err, CallerError.None)
 	if err != .None {
 		return

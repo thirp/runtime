@@ -57,7 +57,7 @@ DIAL_TIMEOUT_WARN_BELOW :: 6 * time.Second
 LOG_EVENT_DIAL_TIMEOUT_SHORT :: "dial_timeout_short"
 // Probe after inbound silence and allow time for a reply even if a probe
 // has to wait behind a frame. Any inbound frame proves liveness.
-CALLER_PING_INTERVAL :: 2 * time.Second
+CALLER_PING_INTERVAL :: 15 * time.Second
 DEAD_PEER_TIMEOUT :: trans.CALLER_DEAD_PEER_TIMEOUT
 SESSION_IDLE_TIMEOUT :: 45 * time.Second
 LOG_REASON_IDLE :: "idle"

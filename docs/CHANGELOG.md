@@ -4,6 +4,10 @@ Project version is independent of the wire protocol version. This tree speaks pr
 
 ## Unreleased
 
+## 0.16.16 - 2026-11-25
+
+- Restore caller Pings after 15 seconds of inbound silence and the 45-second receive deadline before `dead_peer`, so short host or network pauses do not tear down otherwise recoverable sessions.
+
 ## 0.16.15 - 2026-11-25
 
 - `thirp-connect --caller-conf` replaces a caller session that has lost broker admission: it retires the session, mints a fresh credential and reconnects, so a host pause longer than the credential lifetime no longer leaves the caller retrying a rejected token. A credential that expires during an in-flight Authenticate now starts a fresh setup instead of waiting in approval backoff. Reconnect setup no longer waits on a retired session's writer (caller-resume-redial-r2).
