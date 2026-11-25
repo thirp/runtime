@@ -9,6 +9,18 @@ REPO_ROOT :: #directory + ".."
 
 @(test)
 test_sdk_public_api_and_package_boundary :: proc(t: ^testing.T) {
+	test_bash_script(t, CHECK_SDK_API)
+}
+
+@(test)
+test_cut_release :: proc(t: ^testing.T) {
+	// Public source exports omit the maintainer release tooling.
+	if os.exists(REPO_ROOT + "/scripts/cut-release.sh") {
+		test_bash_script(t, "scripts/cut_release_test.sh")
+	}
+}
+
+test_bash_script :: proc(t: ^testing.T, script: string) {
 	bash := "/bin/bash"
 	when ODIN_OS == .Windows {
 		// Git for Windows provides Bash and the Unix tools the check invokes.
@@ -17,15 +29,15 @@ test_sdk_public_api_and_package_boundary :: proc(t: ^testing.T) {
 		bash = git_bash if os.exists(git_bash) else "bash.exe"
 	}
 	state, stdout, stderr, err := os.process_exec(
-		{command = []string{bash, CHECK_SDK_API}, working_dir = REPO_ROOT},
+		{command = []string{bash, script}, working_dir = REPO_ROOT},
 		context.allocator,
 	)
 	defer delete(stdout)
 	defer delete(stderr)
 	testing.expect_value(t, err, nil)
 	if state.exit_code != 0 {
-		fmt.eprintf("check_sdk_api stdout: %s\n", string(stdout))
-		fmt.eprintf("check_sdk_api stderr: %s\n", string(stderr))
+		fmt.eprintf("%s stdout: %s\n", script, string(stdout))
+		fmt.eprintf("%s stderr: %s\n", script, string(stderr))
 	}
 	testing.expect_value(t, state.exit_code, 0)
 }

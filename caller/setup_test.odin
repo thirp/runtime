@@ -3,6 +3,7 @@ package caller
 import trans "../transport"
 import proto "../protocol"
 import "core:os"
+import "core:strings"
 import "core:sync"
 import "core:testing"
 import "core:thread"
@@ -15,6 +16,7 @@ SetupHang :: struct {
 	stop: bool,
 	accepted: bool,
 	hello_delay: time.Duration,
+	admit: bool,
 }
 
 setup_hang_peer :: proc(p: ^SetupHang) {
@@ -23,21 +25,24 @@ setup_hang_peer :: proc(p: ^SetupHang) {
 	conn, err := trans.listener_accept(p.listener)
 	if err != .None {return}
 	defer trans.connection_destroy(conn)
-	if p.hello_delay > 0 {
+	if p.hello_delay > 0 || p.admit {
 		_ = trans.connection_set_recv_timeout(conn, time.Second)
 		decoder: proto.FrameDecoder
 		_ = proto.decoder_init(&decoder)
 		defer proto.decoder_destroy(&decoder)
 		hello, _, _ := trans.read_frame(conn, &decoder)
 		proto.frame_destroy(&hello)
-		time.sleep(p.hello_delay)
+		if p.hello_delay > 0 {time.sleep(p.hello_delay)}
 		payload, _ := proto.encode_hello_ack({major = proto.PROTOCOL_MAJOR, minor = proto.PROTOCOL_MINOR, implementation = "setup-fixture"})
 		_, _ = trans.write_frame(conn, .HelloAck, payload)
 		delete(payload)
-		// Consume Authenticate, but never answer it. Its wait gets only the
-		// remainder of the original deadline, not another 500ms.
 		auth, _, _ := trans.read_frame(conn, &decoder)
 		proto.frame_destroy(&auth)
+		if p.admit {
+			ok, _ := proto.encode_authenticate_ok({principal_id = "setup-fixture"})
+			_, _ = trans.write_frame(conn, .AuthenticateOk, ok)
+			delete(ok)
+		}
 	}
 	sync.mutex_lock(&p.mutex)
 	p.accepted = true
@@ -74,6 +79,63 @@ test_broker_setup_accept_then_hang :: proc(t: ^testing.T) {
 		testing.expect_value(t, err, CallerError.Timeout)
 		testing.expect(t, elapsed >= 450*time.Millisecond && elapsed < time.Second, "whole setup must respect 500ms deadline")
 		if mode == 2 {testing.expect(t, elapsed < 700*time.Millisecond, "Hello and Authenticate share one deadline")}
+	}
+}
+
+@(test)
+test_broker_setup_honors_earlier_deadline :: proc(t: ^testing.T) {
+	c: Caller
+	err := caller_init(&c, {
+		broker = trans.loopback_endpoint(1), token = TEST_TOKEN_CALLER, insecure = true,
+		dial_timeout = DEFAULT_DIAL_TIMEOUT, setup_deadline = time.time_add(time.now(), -time.Millisecond),
+	})
+	if err == .None {caller_destroy(&c)}
+	testing.expect_value(t, err, CallerError.Timeout)
+}
+
+SetupReconnect :: struct {caller: ^Caller, done, admitted: bool}
+
+setup_reconnect_run :: proc(r: ^SetupReconnect) {
+	attempt: int
+	r.admitted = caller_reconnect(r.caller, &attempt)
+	sync.atomic_store(&r.done, true)
+}
+
+@(test)
+test_reconnect_setup_does_not_wait_for_session_writer :: proc(t: ^testing.T) {
+	ln, lerr := trans.listener_listen(trans.loopback_endpoint(0))
+	if !testing.expect_value(t, lerr, trans.TransportError.None) {return}
+	defer trans.listener_close(&ln)
+	ep, _ := trans.listener_endpoint(ln)
+	peer := SetupHang{listener = &ln, admit = true}
+	peer_th := thread.create_and_start_with_poly_data(&peer, setup_hang_peer)
+	if !testing.expect(t, peer_th != nil) {return}
+	defer {
+		sync.mutex_lock(&peer.mutex)
+		peer.stop = true
+		sync.cond_signal(&peer.cond)
+		sync.mutex_unlock(&peer.mutex)
+		thread.join(peer_th); thread.destroy(peer_th)
+	}
+	c := Caller{config = {broker = ep, token = strings.clone(TEST_TOKEN_CALLER), insecure = true, dial_timeout = time.Second}}
+	defer caller_destroy(&c)
+	// Model a writer still occupied by a retired session's DATA write.
+	release: sync.Sema
+	c.writer = thread.create_and_start_with_poly_data(&release, proc(s: ^sync.Sema) {sync.sema_wait(s)})
+	if !testing.expect(t, c.writer != nil) {return}
+	defer sync.sema_post(&release)
+	r := SetupReconnect{caller = &c}
+	th := thread.create_and_start_with_poly_data(&r, setup_reconnect_run)
+	if !testing.expect(t, th != nil) {return}
+	defer {
+		sync.atomic_store(&c.stop, true)
+		caller_fail_queued(&c)
+		thread.join(th); thread.destroy(th)
+	}
+	start := time.tick_now()
+	for !sync.atomic_load(&r.done) && time.tick_since(start) < 2*time.Second {time.sleep(5*time.Millisecond)}
+	if testing.expect(t, sync.atomic_load(&r.done), "broker setup waited for the previous session writer") {
+		testing.expect(t, r.admitted, "reconnect authenticated while the session writer was held")
 	}
 }
 

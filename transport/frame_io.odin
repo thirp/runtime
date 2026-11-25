@@ -8,6 +8,8 @@ write_frame :: proc(
 	payload: []u8,
 	stream_id: proto.StreamId = proto.CONNECTION_STREAM_ID,
 	allocator := context.allocator,
+	guard: proc(rawptr) -> bool = nil,
+	guard_data: rawptr = nil,
 ) -> (terr: TransportError, perr: proto.ProtocolError) {
 	when ODIN_TEST {
 		defer if opcode == .Ping && conn != nil {
@@ -25,7 +27,7 @@ write_frame :: proc(
 		return .None, encode_err
 	}
 	defer delete(bytes, allocator)
-	return connection_write(conn, bytes), .None
+	return connection_write(conn, bytes, guard, guard_data), .None
 }
 
 // read_frame returns a complete frame. The caller must proto.frame_destroy the
@@ -45,7 +47,11 @@ read_frame :: proc(
 		if ok {
 			return next, .None, .None
 		}
-		n, rerr := connection_read(conn, buf[:])
+		space := cap(decoder.buf) - len(decoder.buf)
+		if space == 0 {
+			return {}, .None, proto.decoder_fail(decoder, .BufferFull)
+		}
+		n, rerr := connection_read(conn, buf[:min(space, len(buf))])
 		if n > 0 {
 			push_err := proto.decoder_push(decoder, buf[:n])
 			if push_err != .None {

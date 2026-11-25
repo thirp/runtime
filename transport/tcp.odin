@@ -297,7 +297,9 @@ connection_set_recv_lowat :: proc(conn: ^Connection, n: int) -> TransportError {
 	return connection_set_recv_lowat_impl(conn, n)
 }
 
-connection_write :: proc(conn: ^Connection, src: []u8) -> TransportError {
+// A guarded write checks ownership after acquiring the socket writer. A
+// false guard completes without writing any bytes.
+connection_write :: proc(conn: ^Connection, src: []u8, guard: proc(rawptr) -> bool = nil, guard_data: rawptr = nil) -> TransportError {
 	if conn == nil || conn.closed {
 		return .Closed
 	}
@@ -309,6 +311,9 @@ connection_write :: proc(conn: ^Connection, src: []u8) -> TransportError {
 	defer conn_io_exit(conn)
 	sync.mutex_lock(&conn.write_mutex)
 	defer sync.mutex_unlock(&conn.write_mutex)
+	if guard != nil && !guard(guard_data) {
+		return .None
+	}
 	return connection_write_locked(conn, src)
 }
 

@@ -21,6 +21,7 @@ ConnHandler :: struct {
 	conn:            ^trans.Connection,
 	outbox:          ^ConnOutbox,
 	decoder:         proto.FrameDecoder,
+	caller_input:    CallerInput,
 	state:           ConnState,
 	role:            proto.PeerRole,
 	session_id:      SessionId,
@@ -37,11 +38,9 @@ ConnHandler :: struct {
 	last_ping_sent:  time.Time,
 	caller_counted:  bool,
 	close_reason:    trans.CloseCause,
-	// Stream ids this connection ended with the second HALF_CLOSE. The row
-	// is already gone, so a following CLOSE for one of these ids must not
-	// RESET StreamNotFound. Both peers get the id: the agent half-closes
-	// second when the caller goes first, and the caller half-closes second
-	// in the other order, and either side may send the later CLOSE.
+	// Both peers remember the second HALF_CLOSE for a following CLOSE.
+	// Overflow RESETs also use this history to discard in-flight stream
+	// frames after the relay row is gone.
 	//
 	// Fixed ring, not a growable list. This repo's agent never sends that
 	// CLOSE (agent_maybe_finish), so one id per request would sit on the
@@ -111,7 +110,8 @@ conn_cleanup :: proc(h: ^ConnHandler) {
 		dest_peer := stream_peer_opposite(from)
 		dest := dest_peer == .Agent ? stream.agent_conn : stream.caller_conn
 		server_drop_stream_queues(h.server, stream)
-		if trans.connection_acquire(dest) {
+		held_slot := relay_caller_cancellation_pending(stream, h.conn)
+		if held_slot || trans.connection_acquire(dest) {
 			if stream.state == .Opening && dest_peer == .Caller {
 				metrics_inc_connect_failure(&h.server.metrics, .AgentUnavailable)
 				_ = relay_write_failure(
@@ -143,13 +143,19 @@ conn_cleanup :: proc(h: ^ConnHandler) {
 						reason     = reset_reason_label(reason),
 					},
 				)
-				_ = relay_write_failure(dest, .Reset, code, stream.id, h.server.allocator)
+				if held_slot {
+					server_enqueue_agent_cancel(h.server, stream, .Reset, failure = code)
+				} else {
+					_ = relay_write_failure(dest, .Reset, code, stream.id, h.server.allocator)
+				}
 				server_emit_connection(
 					h.server,
 					connection_event_from_stream(.Reset, stream, reset_reason_label(reason)),
 				)
 			}
-			trans.connection_release(dest)
+			if !held_slot {
+				trans.connection_release(dest)
+			}
 		}
 		relay_release_stream(h.server, stream)
 	}
@@ -214,7 +220,7 @@ conn_run :: proc(h: ^ConnHandler) {
 
 	for {
 		_ = trans.connection_set_recv_timeout(h.conn, conn_next_timeout(h))
-		frame, terr, perr := trans.read_frame(h.conn, &h.decoder, h.server.allocator)
+		frame, terr, perr := conn_read_frame(h)
 		if terr == .Timeout {
 			conn_expire_idle_streams(h)
 			conn_expire_grant_streams(h)
@@ -312,11 +318,16 @@ conn_maybe_send_ping :: proc(h: ^ConnHandler) -> bool {
 	return true
 }
 
-conn_handle_frame :: proc(h: ^ConnHandler, frame: proto.Frame) -> (close: bool) {
+@(private)
+conn_note_recv :: proc(h: ^ConnHandler) {
 	h.last_recv = time.now()
 	if h.session_id != INVALID_SESSION_ID {
 		_ = registry_touch_session(h.server.registry, h.session_id)
 	}
+}
+
+conn_handle_frame :: proc(h: ^ConnHandler, frame: proto.Frame) -> (close: bool) {
+	conn_note_recv(h)
 	switch h.state {
 	case .ExpectHello:
 		return conn_handle_hello(h, frame)
@@ -506,6 +517,13 @@ conn_handle_authenticated :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 	case .Ping:
 		return conn_handle_ping(h, frame)
 	case .Pong:
+		when ODIN_TEST {
+			if h.server != nil && h.server.test_pong != nil {
+				if pong, err := proto.decode_pong(frame.payload); err == .None {
+					h.server.test_pong(pong, h.server.test_pong_data)
+				}
+			}
+		}
 		return false
 	case .Connect:
 		return conn_handle_connect(h, frame)
@@ -901,28 +919,31 @@ conn_handle_connect :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 		return false
 	}
 
-	open_payload, perr := proto.encode_open(proto.Open{service_id = msg.service_id}, h.server.allocator)
-	if perr != .None {
-		trans.connection_release(agent_conn)
-		stream, _ := relay_lookup_stream(h.server, stream_id)
-		server_drop_stream_queues(h.server, stream)
-		relay_drop_stream(h.server, stream_id)
-		metrics_inc_connect_failure(&h.server.metrics, .InternalError)
-		_ = conn_send_failure(h, .ConnectFailed, .InternalError)
-		return false
-	}
-	qerr := server_enqueue_frame(h.server, agent_conn, .Open, open_payload, stream_id)
-	delete(open_payload, h.server.allocator)
+	conn_queue_open(h, agent_conn, stream_id, msg.service_id)
 	trans.connection_release(agent_conn)
-	if qerr != .None {
-		stream, _ := relay_lookup_stream(h.server, stream_id)
-		server_drop_stream_queues(h.server, stream)
-		relay_drop_stream(h.server, stream_id)
-		metrics_inc_connect_failure(&h.server.metrics, .AgentUnavailable)
-		_ = conn_send_failure(h, .ConnectFailed, .AgentUnavailable)
-		return false
-	}
 	return false
+}
+
+conn_queue_open :: proc(h: ^ConnHandler, agent_conn: ^trans.Connection, stream_id: proto.StreamId, service_id: proto.ServiceId) {
+	failure: ConnectFailureReason = .InternalError
+	code: proto.WireError = .InternalError
+	payload, perr := proto.encode_open(proto.Open{service_id = service_id}, h.server.allocator)
+	if perr == .None {
+		defer delete(payload, h.server.allocator)
+		if server_enqueue_frame(h.server, agent_conn, .Open, payload, stream_id) == .None {
+			return
+		}
+		failure, code = .AgentUnavailable, .AgentUnavailable
+	}
+	// Whoever removes the pending relay owns the CONNECT failure. A
+	// concurrent grant reset may already have taken it to reply Unauthorized.
+	stream, found := relay_take_stream(h.server, stream_id)
+	if found {
+		defer relay_release_stream(h.server, stream)
+		server_drop_stream_queues(h.server, stream)
+		metrics_inc_connect_failure(&h.server.metrics, failure)
+		_ = conn_send_failure(h, .ConnectFailed, code)
+	}
 }
 
 conn_handle_open_ok :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
@@ -946,18 +967,13 @@ conn_handle_open_ok :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 	metrics_observe(&h.server.metrics, .OpenOk, time.since(stream.opened_at))
 	peer, _, ok := relay_acquire_peer(h.server, stream.id, .Caller)
 	if !ok {
-		server_drop_stream_queues(h.server, stream)
-		relay_drop_stream(h.server, stream.id)
-		metrics_inc_connect_failure(&h.server.metrics, .AgentUnavailable)
+		conn_cancel_undelivered_open(h, stream.id)
 		return false
 	}
 	qerr := server_enqueue_frame(h.server, peer, .ConnectOk, nil, stream.id)
 	trans.connection_release(peer)
 	if qerr != .None {
-		latest, _ := relay_lookup_stream(h.server, stream.id)
-		server_drop_stream_queues(h.server, latest)
-		relay_drop_stream(h.server, stream.id)
-		metrics_inc_connect_failure(&h.server.metrics, .AgentUnavailable)
+		conn_cancel_undelivered_open(h, stream.id)
 		return false
 	}
 	metrics_inc(&h.server.metrics.connection_success_total)
@@ -970,6 +986,15 @@ conn_handle_open_ok :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 	)
 	server_emit_connection(h.server, connection_event_from_stream(.Opened, stream))
 	return false
+}
+
+conn_cancel_undelivered_open :: proc(h: ^ConnHandler, stream_id: proto.StreamId) {
+	metrics_inc_connect_failure(&h.server.metrics, .AgentUnavailable)
+	if stream, found := relay_take_stream(h.server, stream_id, keep_slot = true); found {
+		defer relay_release_stream(h.server, stream)
+		server_drop_stream_queues(h.server, stream)
+		server_enqueue_agent_cancel(h.server, stream, .Reset, failure = .InternalError)
+	}
 }
 
 conn_handle_open_failed :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
@@ -1096,12 +1121,13 @@ conn_handle_stream_frame :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 	}
 
 	peer: ^trans.Connection
-	stream, err := relay_apply(h.server, frame.header.stream_id, event, from, &peer if event == .HalfClose else nil)
+	cancel_agent := from == .Caller && (event == .Close || event == .Reset)
+	stream, err := relay_apply(
+		h.server, frame.header.stream_id, event, from, &peer if event == .HalfClose else nil, take_for_cancel = cancel_agent,
+	)
 	if err == .NotFound {
-		// The second HALF_CLOSE already ended this stream and recorded
-		// closed. A following CLOSE from the same connection is the old
-		// agent's finish, not an unknown stream.
-		if event == .Close && half_close_finished_take(h, frame.header.stream_id) {
+		// A terminal event has already been sent for these streams.
+		if finished_stream_ignores(&h.half_close_finished, frame.header.stream_id, event) {
 			return false
 		}
 		metrics_inc_reset(&h.server.metrics, .StreamNotFound)
@@ -1118,6 +1144,9 @@ conn_handle_stream_frame :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 	if err != .None {
 		conn_abort_stream(h, frame.header.stream_id, from)
 		return false
+	}
+	defer if cancel_agent {
+		relay_release_stream(h.server, stream)
 	}
 
 	if event == .Reset {
@@ -1150,11 +1179,14 @@ conn_handle_stream_frame :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 		when ODIN_TEST {
 			half_close_before_forward(h.server, terminal)
 		}
-	} else {
+	} else if !cancel_agent {
 		peer, _, _ = relay_acquire_peer(h.server, stream.id, stream_peer_opposite(from))
 	}
 	if terminal && event != .HalfClose {
 		server_drop_stream_queues(h.server, stream)
+	}
+	if cancel_agent {
+		server_enqueue_agent_cancel(h.server, stream, frame.header.opcode, frame.payload)
 	}
 	if peer != nil {
 		defer trans.connection_release(peer)
@@ -1176,7 +1208,9 @@ conn_handle_stream_frame :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 				half_close_finished_remember(h, stream)
 			}
 		}
-		relay_drop_stream(h.server, stream.id)
+		if !cancel_agent {
+			relay_drop_stream(h.server, stream.id)
+		}
 	}
 	return false
 }
@@ -1185,45 +1219,58 @@ conn_handle_stream_frame :: proc(h: ^ConnHandler, frame: proto.Frame) -> bool {
 // streams than live ones; only the most recent finished ids are kept.
 HALF_CLOSE_FINISHED_CAP :: 256
 
-HalfCloseFinished :: struct {
-	mutex: sync.Mutex,
-	ids:   [HALF_CLOSE_FINISHED_CAP]proto.StreamId,
-	n:     int,
+FinishedStreamKind :: enum { HalfClose, Overflow }
+
+FinishedStream :: struct {
+	id: proto.StreamId,
+	kind: FinishedStreamKind,
 }
 
-half_close_finished_add :: proc(slot: ^HalfCloseFinished, stream_id: proto.StreamId) {
+HalfCloseFinished :: struct {
+	mutex:   sync.Mutex,
+	entries: [HALF_CLOSE_FINISHED_CAP]FinishedStream,
+	n:       int,
+}
+
+finished_stream_add :: proc(slot: ^HalfCloseFinished, stream_id: proto.StreamId, kind: FinishedStreamKind) {
 	sync.mutex_lock(&slot.mutex)
 	defer sync.mutex_unlock(&slot.mutex)
 	for i in 0 ..< slot.n {
-		if slot.ids[i] == stream_id {
+		if slot.entries[i].id == stream_id {
+			slot.entries[i].kind = kind
 			return
 		}
 	}
 	if slot.n < HALF_CLOSE_FINISHED_CAP {
-		slot.ids[slot.n] = stream_id
+		slot.entries[slot.n] = {stream_id, kind}
 		slot.n += 1
 		return
 	}
 	// Drop the oldest. A later CLOSE for that id is STREAM_NOT_FOUND.
 	for i in 0 ..< HALF_CLOSE_FINISHED_CAP - 1 {
-		slot.ids[i] = slot.ids[i + 1]
+		slot.entries[i] = slot.entries[i + 1]
 	}
-	slot.ids[HALF_CLOSE_FINISHED_CAP - 1] = stream_id
+	slot.entries[HALF_CLOSE_FINISHED_CAP - 1] = {stream_id, kind}
 }
 
-half_close_finished_take :: proc(h: ^ConnHandler, stream_id: proto.StreamId) -> bool {
-	slot := &h.half_close_finished
+finished_stream_ignores :: proc(slot: ^HalfCloseFinished, stream_id: proto.StreamId, event: StreamEvent) -> bool {
 	sync.mutex_lock(&slot.mutex)
 	defer sync.mutex_unlock(&slot.mutex)
 	for i in 0 ..< slot.n {
-		if slot.ids[i] != stream_id {
+		if slot.entries[i].id != stream_id {
 			continue
 		}
+		if slot.entries[i].kind == .Overflow {
+			return true
+		}
+		if event != .Close {
+			return false
+		}
 		for j in i ..< slot.n - 1 {
-			slot.ids[j] = slot.ids[j + 1]
+			slot.entries[j] = slot.entries[j + 1]
 		}
 		slot.n -= 1
-		slot.ids[slot.n] = 0
+		slot.entries[slot.n] = {}
 		return true
 	}
 	return false
@@ -1240,7 +1287,17 @@ half_close_finished_len :: proc(slot: ^HalfCloseFinished) -> int {
 // Ring lock is taken only while handlers_mutex is held or from the
 // connection's own thread, and take never acquires handlers_mutex.
 half_close_finished_remember :: proc(h: ^ConnHandler, stream: RelayStream) {
-	half_close_finished_add(&h.half_close_finished, stream.id)
+	finished_stream_remember_pair(h, stream, .HalfClose)
+}
+
+finished_stream_remember :: proc(h: ^ConnHandler, stream_id: proto.StreamId, kind: FinishedStreamKind) {
+	if stream, found := relay_lookup_stream(h.server, stream_id); found {
+		finished_stream_remember_pair(h, stream, kind)
+	}
+}
+
+finished_stream_remember_pair :: proc(h: ^ConnHandler, stream: RelayStream, kind: FinishedStreamKind) {
+	finished_stream_add(&h.half_close_finished, stream.id, kind)
 	other := stream.caller_conn if h.conn == stream.agent_conn else stream.agent_conn
 	if other == nil || other == h.conn || h.server == nil {
 		return
@@ -1249,7 +1306,7 @@ half_close_finished_remember :: proc(h: ^ConnHandler, stream: RelayStream) {
 	defer sync.mutex_unlock(&h.server.handlers_mutex)
 	for peer in h.server.handlers {
 		if peer != nil && peer.conn == other {
-			half_close_finished_add(&peer.half_close_finished, stream.id)
+			finished_stream_add(&peer.half_close_finished, stream.id, kind)
 			return
 		}
 	}
@@ -1269,11 +1326,12 @@ conn_enqueue_stream :: proc(
 		return false
 	}
 	for {
-		err := server_enqueue_frame(h.server, dest, opcode, payload, stream_id)
+		err := server_enqueue_frame(h.server, dest, opcode, payload, stream_id, from)
 		if err == .None {
-			if needed > 0 {
-				metrics_add_bytes(&h.server.metrics, from, needed)
-				relay_add_stream_bytes(h.server, stream_id, from, needed)
+			when ODIN_TEST {
+				if needed > 0 && h.server.test_after_data_enqueue != nil {
+					h.server.test_after_data_enqueue(h.server.test_data_enqueue_ctx)
+				}
 			}
 			return true
 		}
@@ -1285,15 +1343,17 @@ conn_enqueue_stream :: proc(
 			if box == nil {
 				return true
 			}
-			source := h.outbox if from == .Agent else nil
-			ok := outbox_wait_stream_space(box, stream_id, needed, h.server.stream_stall_timeout, source)
+			wait := outbox_wait_stream_space(box, stream_id, needed, h.server.stream_stall_timeout, h)
 			outbox_release(box)
-			if ok {
+			if wait == .Ready {
 				_, still := relay_lookup_stream(h.server, stream_id)
 				if still {
 					continue
 				}
 				return true
+			}
+			if wait == .CallerOverflow {
+				finished_stream_remember(h, stream_id, .Overflow)
 			}
 			conn_reset_overflow(h, stream_id, .StreamBuffer)
 			return false
@@ -1343,21 +1403,18 @@ conn_reset_overflow :: proc(h: ^ConnHandler, stream_id: proto.StreamId, limit: L
 		},
 	)
 	conn_log(h, .Warn, LOG_EVENT_LIMIT_EXCEEDED, log.LogFields{stream_id = u64(stream_id), reason = limit_kind_label(limit)})
-	stream, found := relay_lookup_stream(h.server, stream_id)
+	stream, found := relay_take_stream(h.server, stream_id, keep_slot = true)
 	if !found {
 		return
 	}
+	defer relay_release_stream(h.server, stream)
 	server_drop_stream_queues(h.server, stream)
 	if caller := server_lookup_outbox(h.server, stream.caller_conn); caller != nil {
 		_ = outbox_enqueue_failure(caller, .Reset, .InternalError, stream_id, diagnostic)
 		outbox_release(caller)
 	}
-	if agent := server_lookup_outbox(h.server, stream.agent_conn); agent != nil {
-		_ = outbox_enqueue_failure(agent, .Reset, .InternalError, stream_id, diagnostic)
-		outbox_release(agent)
-	}
+	server_enqueue_agent_cancel(h.server, stream, .Reset, failure = .InternalError, diagnostic = diagnostic)
 	server_emit_connection(h.server, connection_event_from_stream(.Reset, stream, reset_reason_label(reason)))
-	relay_drop_stream(h.server, stream_id)
 }
 
 conn_expire_idle_streams :: proc(h: ^ConnHandler) {
@@ -1372,10 +1429,11 @@ conn_expire_idle_streams :: proc(h: ^ConnHandler) {
 }
 
 conn_reset_idle_stream :: proc(h: ^ConnHandler, stream_id: proto.StreamId) {
-	stream, found := relay_lookup_stream(h.server, stream_id)
+	stream, found := relay_take_stream(h.server, stream_id, keep_slot = true)
 	if !found {
 		return
 	}
+	defer relay_release_stream(h.server, stream)
 	metrics_inc_reset(&h.server.metrics, .StreamIdle)
 	conn_log(
 		h,
@@ -1388,34 +1446,8 @@ conn_reset_idle_stream :: proc(h: ^ConnHandler, stream_id: proto.StreamId) {
 			reason     = reset_reason_label(.StreamIdle),
 		},
 	)
-	server_drop_stream_queues(h.server, stream)
-	if stream.state == .Opening {
-		if trans.connection_acquire(stream.caller_conn) {
-			_ = server_enqueue_failure(
-				h.server,
-				stream.caller_conn,
-				.ConnectFailed,
-				.Timeout,
-				proto.CONNECTION_STREAM_ID,
-			)
-			trans.connection_release(stream.caller_conn)
-		}
-		if trans.connection_acquire(stream.agent_conn) {
-			_ = server_enqueue_failure(h.server, stream.agent_conn, .Reset, .Timeout, stream_id)
-			trans.connection_release(stream.agent_conn)
-		}
-	} else {
-		if caller := server_lookup_outbox(h.server, stream.caller_conn); caller != nil {
-			_ = outbox_enqueue_failure(caller, .Reset, .Timeout, stream_id)
-			outbox_release(caller)
-		}
-		if agent := server_lookup_outbox(h.server, stream.agent_conn); agent != nil {
-			_ = outbox_enqueue_failure(agent, .Reset, .Timeout, stream_id)
-			outbox_release(agent)
-		}
-	}
+	server_reset_taken_stream(h.server, stream, .Timeout)
 	server_emit_connection(h.server, connection_event_from_stream(.Reset, stream, reset_reason_label(.StreamIdle)))
-	relay_drop_stream(h.server, stream_id)
 }
 
 conn_expire_grant_streams :: proc(h: ^ConnHandler) {
@@ -1427,10 +1459,11 @@ conn_expire_grant_streams :: proc(h: ^ConnHandler) {
 }
 
 conn_reset_grant_stream :: proc(h: ^ConnHandler, stream_id: proto.StreamId, reason: ResetReason) {
-	stream, found := relay_lookup_stream(h.server, stream_id)
+	stream, found := relay_take_stream(h.server, stream_id, keep_slot = true)
 	if !found {
 		return
 	}
+	defer relay_release_stream(h.server, stream)
 	code: proto.WireError = .Timeout
 	if reason == .GrantRevoked {
 		code = .Unauthorized
@@ -1447,34 +1480,8 @@ conn_reset_grant_stream :: proc(h: ^ConnHandler, stream_id: proto.StreamId, reas
 			reason     = reset_reason_label(reason),
 		},
 	)
-	server_drop_stream_queues(h.server, stream)
-	if stream.state == .Opening {
-		if trans.connection_acquire(stream.caller_conn) {
-			_ = server_enqueue_failure(
-				h.server,
-				stream.caller_conn,
-				.ConnectFailed,
-				code,
-				proto.CONNECTION_STREAM_ID,
-			)
-			trans.connection_release(stream.caller_conn)
-		}
-		if trans.connection_acquire(stream.agent_conn) {
-			_ = server_enqueue_failure(h.server, stream.agent_conn, .Reset, code, stream_id)
-			trans.connection_release(stream.agent_conn)
-		}
-	} else {
-		if caller := server_lookup_outbox(h.server, stream.caller_conn); caller != nil {
-			_ = outbox_enqueue_failure(caller, .Reset, code, stream_id)
-			outbox_release(caller)
-		}
-		if agent := server_lookup_outbox(h.server, stream.agent_conn); agent != nil {
-			_ = outbox_enqueue_failure(agent, .Reset, code, stream_id)
-			outbox_release(agent)
-		}
-	}
+	server_reset_taken_stream(h.server, stream, code)
 	server_emit_connection(h.server, connection_event_from_stream(.Reset, stream, reset_reason_label(reason)))
-	relay_drop_stream(h.server, stream_id)
 }
 
 conn_abort_stream :: proc(h: ^ConnHandler, stream_id: proto.StreamId, from: StreamPeer) {
@@ -1485,17 +1492,18 @@ conn_abort_stream :: proc(h: ^ConnHandler, stream_id: proto.StreamId, from: Stre
 		LOG_EVENT_STREAM_RESET,
 		log.LogFields{stream_id = u64(stream_id), error_code = wire_error_name(.ProtocolError), reason = reset_reason_label(.ProtocolError)},
 	)
-	if stream, found := relay_lookup_stream(h.server, stream_id); found {
+	if stream, found := relay_take_stream(h.server, stream_id, keep_slot = true); found {
+		defer relay_release_stream(h.server, stream)
 		server_drop_stream_queues(h.server, stream)
+		server_enqueue_agent_cancel(h.server, stream, .Reset, failure = .ProtocolError)
+		if from == .Caller {
+			_ = conn_send_failure_stream(h, .Reset, .ProtocolError, stream_id)
+		} else {
+			_ = server_enqueue_failure(h.server, stream.caller_conn, .Reset, .ProtocolError, stream_id)
+		}
+	} else {
+		_ = conn_send_failure_stream(h, .Reset, .ProtocolError, stream_id)
 	}
-	dest := stream_peer_opposite(from)
-	peer, _, ok := relay_acquire_peer(h.server, stream_id, dest)
-	if ok {
-		_ = server_enqueue_failure(h.server, peer, .Reset, .ProtocolError, stream_id)
-		trans.connection_release(peer)
-	}
-	_ = conn_send_failure_stream(h, .Reset, .ProtocolError, stream_id)
-	relay_drop_stream(h.server, stream_id)
 }
 
 conn_write_payload :: proc(

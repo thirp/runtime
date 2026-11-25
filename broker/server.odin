@@ -22,6 +22,10 @@ when ODIN_TEST {
 		test_trace_agent_session: bool,
 		test_accept:              proc(server: ^Server, data: rawptr) -> (^trans.Connection, trans.TransportError),
 		test_accept_data:         rawptr,
+		test_pong:                proc(pong: proto.Pong, data: rawptr),
+		test_pong_data:           rawptr,
+		test_after_data_enqueue:  proc(data: rawptr),
+		test_data_enqueue_ctx:    rawptr,
 	}
 } else {
 	ServerTestTrace :: struct {}
@@ -66,9 +70,9 @@ Server :: struct {
 	register_rate:             RateLimitConfig,
 	connect_rate:              RateLimitConfig,
 	stream_idle_timeout:       time.Duration,
-	// No-progress limit while a session reader waits on one stream's full
-	// queue (see outbox_wait_stream_space). <= 0 waits as long as the
-	// destination stays open. Odin-only; no C field.
+	// No-progress limit for a reader waiting on a full stream queue. <= 0
+	// disables this timer. A proven caller input overflow can still reset
+	// that stream to protect the session. Odin-only; no C field.
 	stream_stall_timeout:      time.Duration,
 	rate_limits:               RateLimiters,
 	limits_mutex:              sync.Mutex,
@@ -379,37 +383,13 @@ server_copy_stream_grant_ids :: proc(
 }
 
 server_reset_taken_stream :: proc(server: ^Server, stream: RelayStream, code: proto.WireError) {
-	if server == nil {
-		return
-	}
 	server_drop_stream_queues(server, stream)
 	if stream.state == .Opening {
-		if trans.connection_acquire(stream.caller_conn) {
-			_ = server_enqueue_failure(
-				server,
-				stream.caller_conn,
-				.ConnectFailed,
-				code,
-				proto.CONNECTION_STREAM_ID,
-			)
-			trans.connection_release(stream.caller_conn)
-		}
-		if trans.connection_acquire(stream.agent_conn) {
-			_ = server_enqueue_failure(server, stream.agent_conn, .Reset, code, stream.id)
-			trans.connection_release(stream.agent_conn)
-		}
-		return
+		_ = server_enqueue_failure(server, stream.caller_conn, .ConnectFailed, code, proto.CONNECTION_STREAM_ID)
+	} else {
+		_ = server_enqueue_failure(server, stream.caller_conn, .Reset, code, stream.id)
 	}
-	if caller := server_lookup_outbox(server, stream.caller_conn); caller != nil {
-		outbox_drop_stream(caller, stream.id)
-		_ = outbox_enqueue_failure(caller, .Reset, code, stream.id)
-		outbox_release(caller)
-	}
-	if agent := server_lookup_outbox(server, stream.agent_conn); agent != nil {
-		outbox_drop_stream(agent, stream.id)
-		_ = outbox_enqueue_failure(agent, .Reset, code, stream.id)
-		outbox_release(agent)
-	}
+	server_enqueue_agent_cancel(server, stream, .Reset, failure = code)
 }
 
 server_shutdown_handlers :: proc(server: ^Server) {

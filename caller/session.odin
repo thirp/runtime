@@ -12,19 +12,16 @@ import "core:time"
 
 caller_init :: proc(c: ^Caller, config: CallerConfig) -> CallerError {
 	if c == nil {
-		return .InvalidConfig
+		return broker_setup_config_error(config, .InvalidConfig, SETUP_PHASE_SESSION, "configuration")
 	}
 	if config.broker.port == 0 || len(config.token) == 0 {
-		return .InvalidConfig
+		return broker_setup_config_error(config, .InvalidConfig, SETUP_PHASE_SESSION, "configuration")
 	}
 	if config.insecure && (len(config.tls_ca) > 0 || len(config.tls_server_name) > 0) {
-		return .InvalidConfig
+		return broker_setup_config_error(config, .InvalidConfig, SETUP_PHASE_TLS, "configuration")
 	}
 	if !tls_ca_readable(config.tls_ca) {
-		if config.setup_failure != nil {
-			config.setup_failure(config.setup_failure_user, SETUP_PHASE_TLS, "tls_verify")
-		}
-		return .InvalidConfig
+		return broker_setup_config_error(config, .InvalidConfig, SETUP_PHASE_TLS, "tls_verify")
 	}
 
 	c^ = {}
@@ -34,25 +31,25 @@ caller_init :: proc(c: ^Caller, config: CallerConfig) -> CallerError {
 	}
 	token, terr := strings.clone(config.token)
 	if terr != .None {
-		return .OutOfMemory
+		return broker_setup_config_error(config, .OutOfMemory, SETUP_PHASE_SESSION, "out_of_memory")
 	}
 	ca, caerr := strings.clone(config.tls_ca)
 	if caerr != .None {
 		delete(token)
-		return .OutOfMemory
+		return broker_setup_config_error(config, .OutOfMemory, SETUP_PHASE_SESSION, "out_of_memory")
 	}
 	sni, snerr := strings.clone(config.tls_server_name)
 	if snerr != .None {
 		delete(token)
 		delete(ca)
-		return .OutOfMemory
+		return broker_setup_config_error(config, .OutOfMemory, SETUP_PHASE_SESSION, "out_of_memory")
 	}
 	implementation, ierr := strings.clone(impl)
 	if ierr != .None {
 		delete(token)
 		delete(ca)
 		delete(sni)
-		return .OutOfMemory
+		return broker_setup_config_error(config, .OutOfMemory, SETUP_PHASE_SESSION, "out_of_memory")
 	}
 	c.config = config
 	c.config.token = token
@@ -62,10 +59,10 @@ caller_init :: proc(c: ^Caller, config: CallerConfig) -> CallerError {
 	c.streams = make(map[proto.StreamId]^Conn)
 
 	setup: BrokerSetup
-	broker_setup_begin(&setup, c)
+	broker_setup_begin(&setup, c, config.setup_deadline)
 	conn, derr := caller_dial_broker(c, &setup)
 	if derr != .None {
-		err := broker_setup_finish(&setup, c, derr == .Timeout && setup.deadline != {} ? CallerError.Timeout : .Transport)
+		err := broker_setup_finish(&setup, c, broker_setup_dial_error(derr))
 		trans.connection_destroy(conn)
 		caller_free_config(c)
 		delete(c.streams)
@@ -73,6 +70,7 @@ caller_init :: proc(c: ^Caller, config: CallerConfig) -> CallerError {
 		return err
 	}
 	c.conn = conn
+	setup.phase = SETUP_PHASE_SESSION
 	if proto.decoder_init(&c.decoder) != .None {
 		_ = broker_setup_finish(&setup, c, .Internal)
 		trans.connection_destroy(conn)
@@ -82,12 +80,7 @@ caller_init :: proc(c: ^Caller, config: CallerConfig) -> CallerError {
 		c.streams = nil
 		return .Internal
 	}
-	// Handshake writes Hello and Authenticate through the session queue.
-	caller_bind_session(c, conn)
-	setup.phase = SETUP_PHASE_HANDSHAKE
-	if hs := broker_setup_finish(&setup, c, caller_handshake(c)); hs != .None {
-		caller_unbind_session(conn)
-		caller_delete_queues(c)
+	if hs := broker_setup_finish(&setup, c, caller_handshake(c, &setup)); hs != .None {
 		proto.decoder_destroy(&c.decoder)
 		trans.connection_destroy(conn)
 		c.conn = nil
@@ -96,6 +89,8 @@ caller_init :: proc(c: ^Caller, config: CallerConfig) -> CallerError {
 		c.streams = nil
 		return hs
 	}
+	caller_bind_session(c, conn)
+	setup.phase = SETUP_PHASE_SESSION
 	c.writer = thread.create_and_start_with_poly_data(c, caller_writer_proc)
 	if c.writer == nil || !caller_start_stall(c) {
 		broker_setup_report(&setup, c, .Internal)
@@ -139,7 +134,8 @@ caller_session_admitted :: proc(c: ^Caller) -> bool {
 	return c.connected && c.conn != nil && !sync.atomic_load(&c.stop)
 }
 
-caller_destroy :: proc(c: ^Caller) {
+// Stop session I/O without freeing state used by external stream owners.
+caller_stop :: proc(c: ^Caller) {
 	if c == nil {
 		return
 	}
@@ -168,6 +164,13 @@ caller_destroy :: proc(c: ^Caller) {
 	caller_take_and_finish_all(c)
 	sync.cond_broadcast(&c.cond)
 	sync.mutex_unlock(&c.mutex)
+}
+
+caller_destroy :: proc(c: ^Caller) {
+	if c == nil {
+		return
+	}
+	caller_stop(c)
 	if c.reader != nil {
 		thread.join(c.reader)
 		thread.destroy(c.reader)
@@ -273,7 +276,8 @@ caller_dial_broker :: proc(c: ^Caller, setup: ^BrokerSetup) -> (^trans.Connectio
 	return conn, derr
 }
 
-caller_handshake :: proc(c: ^Caller) -> CallerError {
+caller_handshake :: proc(c: ^Caller, setup: ^BrokerSetup) -> CallerError {
+	setup.phase = SETUP_PHASE_HELLO
 	hello_payload, herr := proto.encode_hello(
 		proto.Hello {
 			major           = proto.PROTOCOL_MAJOR,
@@ -287,39 +291,47 @@ caller_handshake :: proc(c: ^Caller) -> CallerError {
 		return .Internal
 	}
 	defer delete(hello_payload)
-	if !caller_write(c.conn, .Hello, hello_payload) {
+	if !broker_setup_write(setup, .Hello, hello_payload) {
 		return .Transport
 	}
 
-	ack_frame, ack_ok := caller_read(c.conn, &c.decoder)
-	if !ack_ok || ack_frame.header.opcode != .HelloAck {
+	ack_frame, ack_ok := broker_setup_read(setup, &c.decoder)
+	if !ack_ok {return .Transport}
+	if ack_frame.header.opcode != .HelloAck {
 		proto.frame_destroy(&ack_frame)
+		setup.failure = "unexpected_reply"
 		return .Transport
 	}
 	ack, aerr := proto.decode_hello_ack(ack_frame.payload)
 	proto.frame_destroy(&ack_frame)
 	if aerr != .None {
+		setup.failure = "invalid_reply"
 		return .Transport
 	}
 	delete(ack.implementation)
 
+	setup.phase = SETUP_PHASE_AUTHENTICATE
 	tok := ([^]u8)(raw_data(c.config.token))[:len(c.config.token)]
 	auth_payload, auerr := proto.encode_authenticate(proto.Authenticate{token = tok})
 	if auerr != .None {
 		return .Internal
 	}
 	defer delete(auth_payload)
-	if !caller_write(c.conn, .Authenticate, auth_payload) {
+	if !broker_setup_write(setup, .Authenticate, auth_payload) {
 		return .Transport
 	}
 
-	auth_frame, auth_ok := caller_read(c.conn, &c.decoder)
+	auth_frame, auth_ok := broker_setup_read(setup, &c.decoder)
 	if !auth_ok {
 		return .Transport
 	}
 	defer proto.frame_destroy(&auth_frame)
 	if auth_frame.header.opcode == .AuthenticateFailed {
-		fail, _ := proto.decode_wire_failure(auth_frame.payload)
+		fail, ferr := proto.decode_wire_failure(auth_frame.payload)
+		if ferr != .None {
+			setup.failure = "invalid_reply"
+			return .Transport
+		}
 		code, ok := proto.wire_error_from_u16(fail.code)
 		delete(fail.diagnostic)
 		if ok && code == .RateLimited {
@@ -328,28 +340,16 @@ caller_handshake :: proc(c: ^Caller) -> CallerError {
 		return .AuthFailed
 	}
 	if auth_frame.header.opcode != .AuthenticateOk {
+		setup.failure = "unexpected_reply"
 		return .Transport
 	}
 	ok_msg, oerr := proto.decode_authenticate_ok(auth_frame.payload)
 	if oerr != .None {
+		setup.failure = "invalid_reply"
 		return .Transport
 	}
 	delete(ok_msg.principal_id)
 	return .None
-}
-
-caller_read :: proc(
-	conn: ^trans.Connection,
-	decoder: ^proto.FrameDecoder,
-) -> (
-	frame: proto.Frame,
-	ok: bool,
-) {
-	got, terr, perr := trans.read_frame(conn, decoder)
-	if terr != .None || perr != .None {
-		return {}, false
-	}
-	return got, true
 }
 
 caller_post_failure :: proc(
@@ -399,6 +399,9 @@ caller_reader_proc :: proc(c: ^Caller) {
 					reason      = reason,
 				},
 			)
+		}
+		if c.config.managed_reconnect {
+			return
 		}
 		if !caller_reconnect(c, &attempt) {
 			return
@@ -458,7 +461,7 @@ caller_reconnect :: proc(c: ^Caller, attempt: ^int) -> bool {
 		broker_setup_begin(&setup, c)
 		conn, derr := caller_dial_broker(c, &setup)
 		if derr != .None {
-			setup_err := broker_setup_finish(&setup, c, derr == .Timeout ? CallerError.Timeout : .Transport)
+			setup_err := broker_setup_finish(&setup, c, broker_setup_dial_error(derr))
 			if setup_err == .Timeout && setup.deadline != {} {derr = .Timeout}
 			trans.connection_destroy(conn)
 			cap_attempt := attempt^
@@ -480,8 +483,7 @@ caller_reconnect :: proc(c: ^Caller, attempt: ^int) -> bool {
 			continue
 		}
 		caller_set_conn(c, conn)
-		setup.phase = SETUP_PHASE_HANDSHAKE
-		hs := broker_setup_finish(&setup, c, caller_handshake(c))
+		hs := broker_setup_finish(&setup, c, caller_handshake(c, &setup))
 		if hs == .None {
 			sync.mutex_lock(&c.mutex)
 			c.last_recv = time.tick_now()
@@ -494,12 +496,10 @@ caller_reconnect :: proc(c: ^Caller, attempt: ^int) -> bool {
 			return true
 		}
 		caller_drop_conn(c)
-		// A timed-out peer may have left a partial HelloAck/auth frame.
+		// A failed peer may have left a partial HelloAck/auth frame.
 		// Never carry bytes from a failed setup onto the next socket.
-		if hs == .Timeout {
-			proto.decoder_destroy(&c.decoder)
-			if proto.decoder_init(&c.decoder) != .None {return false}
-		}
+		proto.decoder_destroy(&c.decoder)
+		if proto.decoder_init(&c.decoder) != .None {return false}
 		cap_attempt := attempt^
 		reason := "broker_unavailable"
 		if hs == .Timeout {
@@ -691,6 +691,11 @@ caller_handle_frame :: proc(
 			pong, _ := proto.encode_pong(proto.Pong{nonce = msg.nonce})
 			_ = caller_post_control(c, conn, gen, .Pong, pong)
 			delete(pong)
+			when ODIN_TEST {
+				if c.config.test_ping_received != nil {
+					c.config.test_ping_received(c.config.test_ping_user)
+				}
+			}
 		}
 	case .Pong:
 	case .Error, .Hello, .HelloAck, .Authenticate, .AuthenticateOk, .AuthenticateFailed,
@@ -935,7 +940,7 @@ caller_watch_sessions :: proc(c: ^Caller, now: time.Tick) {
 			c.idle_since = {}
 		} else if c.idle_since == {} {
 			c.idle_since = now
-		} else if time.tick_diff(c.idle_since, now) >= caller_session_idle_limit(c) {
+		} else if !c.config.managed_reconnect && time.tick_diff(c.idle_since, now) >= caller_session_idle_limit(c) {
 			reason = LOG_REASON_IDLE
 		}
 		if reason != "" {

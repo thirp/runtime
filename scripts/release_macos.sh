@@ -41,7 +41,9 @@ fi
 release_copy_dataplane_docs "$OUT"
 release_write_dataplane_provenance "$OUT" "darwin ${ARCH}" "scripts/release_macos.sh" "$OPENSSL_VER (static libssl.a + libcrypto.a; prefix=$OPENSSL_PREFIX)" "$DATE"
 
-if [[ -n "${THIRP_MACOS_CODESIGN_IDENTITY:-}" ]]; then
+if [[ "${THIRP_RELEASE_UNSIGNED:-}" == 1 ]]; then
+	echo "release_macos: Developer ID signing and notarization skipped in unsigned mode"
+elif [[ -n "${THIRP_MACOS_CODESIGN_IDENTITY:-}" ]]; then
 	for bin in thirp-agent thirp-connect libthirp.dylib; do
 		codesign --force --options runtime --timestamp \
 			--sign "${THIRP_MACOS_CODESIGN_IDENTITY}" "${OUT}/${bin}"

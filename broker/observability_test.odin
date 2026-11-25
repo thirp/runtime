@@ -46,7 +46,20 @@ obs_attach_logger :: proc(server: ^Server, logger: ^log.Logger) {
 	server.logger = logger
 }
 
-obs_wait_contains :: proc(needle: string, timeout := 2 * time.Second) -> string {
+obs_log_contains :: proc(text, needle: string, same_line := "") -> bool {
+	if same_line == "" {
+		return strings.contains(text, needle)
+	}
+	remaining := text
+	for line in strings.split_lines_iterator(&remaining) {
+		if strings.contains(line, needle) && strings.contains(line, same_line) {
+			return true
+		}
+	}
+	return false
+}
+
+obs_wait_contains :: proc(needle: string, timeout := 2 * time.Second, same_line := "") -> string {
 	deadline := time.now()
 	snapshot: [dynamic]u8
 	defer delete(snapshot)
@@ -54,10 +67,9 @@ obs_wait_contains :: proc(needle: string, timeout := 2 * time.Second) -> string 
 		sync.mutex_lock(&obs_logs.mutex)
 		clear(&snapshot)
 		append(&snapshot, ..obs_logs.text[:])
-		got := string(snapshot[:])
-		found := strings.contains(got, needle)
 		sync.mutex_unlock(&obs_logs.mutex)
-		if found {
+		got := string(snapshot[:])
+		if obs_log_contains(got, needle, same_line) {
 			return strings.clone(got)
 		}
 		time.sleep(10 * time.Millisecond)
@@ -391,9 +403,13 @@ test_obs_session_timeout_increments_counter :: proc(t: ^testing.T) {
 	}
 	snap := metrics_snapshot_counters(&server.metrics)
 	testing.expect(t, snap.session_timeouts_total >= 1)
-	got := obs_wait_contains(json_event(LOG_EVENT_SESSION_CLOSED))
+	// Earlier fixtures can still publish close logs to the shared capture.
+	// Wait for the idle timeout reason on the close event itself.
+	event := json_event(LOG_EVENT_SESSION_CLOSED)
+	reason := json_reason(LABEL_IDLE_TIMEOUT)
+	got := obs_wait_contains(event, same_line = reason)
 	defer delete(got)
-	testing.expect(t, strings.contains(got, json_reason(LABEL_IDLE_TIMEOUT)))
+	testing.expectf(t, obs_log_contains(got, event, reason), "missing idle session close log in %s", got)
 }
 
 @(test)

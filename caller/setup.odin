@@ -1,6 +1,7 @@
 package caller
 
 import log "../logging"
+import proto "../protocol"
 import trans "../transport"
 import "core:sync"
 import "core:thread"
@@ -9,7 +10,9 @@ import "core:time"
 LOG_BROKER_SETUP_TIMEOUT :: "broker_setup_timeout"
 SETUP_PHASE_TCP :: "tcp"
 SETUP_PHASE_TLS :: "tls"
-SETUP_PHASE_HANDSHAKE :: "handshake"
+SETUP_PHASE_HELLO :: "hello"
+SETUP_PHASE_AUTHENTICATE :: "authenticate"
+SETUP_PHASE_SESSION :: "session"
 
 // Stack-owned by the setup thread; the waiter is always cancelled and joined
 // before the socket can be destroyed or handed to the session reader. One
@@ -26,6 +29,7 @@ BrokerSetup :: struct {
 	timed_out: bool,
 	tls_verify_failed: bool,
 	phase: string,
+	failure: string,
 }
 
 broker_setup_wait :: proc(s: ^BrokerSetup) {
@@ -42,10 +46,13 @@ broker_setup_wait :: proc(s: ^BrokerSetup) {
 	}
 }
 
-broker_setup_begin :: proc(s: ^BrokerSetup, c: ^Caller) {
+broker_setup_begin :: proc(s: ^BrokerSetup, c: ^Caller, deadline: time.Time = {}) {
 	s^ = {phase = SETUP_PHASE_TCP}
 	if c.config.dial_timeout > 0 {
 		s.deadline = time.time_add(time.now(), c.config.dial_timeout)
+	}
+	if deadline != {} && (s.deadline == {} || deadline._nsec < s.deadline._nsec) {
+		s.deadline = deadline
 	}
 }
 
@@ -81,6 +88,22 @@ broker_setup_finish :: proc(s: ^BrokerSetup, c: ^Caller, err: CallerError) -> Ca
 	return err
 }
 
+broker_setup_dial_error :: proc(err: trans.TransportError) -> CallerError {
+	#partial switch err {
+	case .Timeout: return .Timeout
+	case .OutOfMemory: return .OutOfMemory
+	case .InvalidEndpoint: return .InvalidConfig
+	}
+	return .Transport
+}
+
+broker_setup_config_error :: proc(config: CallerConfig, err: CallerError, phase, reason: string) -> CallerError {
+	if config.setup_failure != nil {
+		config.setup_failure(config.setup_failure_user, phase, reason)
+	}
+	return err
+}
+
 broker_setup_report :: proc(s: ^BrokerSetup, c: ^Caller, err: CallerError) {
 	if err == .None || c.config.setup_failure == nil {return}
 	reason := "handshake"
@@ -89,13 +112,33 @@ broker_setup_report :: proc(s: ^BrokerSetup, c: ^Caller, err: CallerError) {
 	case .RateLimited: reason = "rate_limited"
 	case .Timeout: reason = "timeout"
 	case .InvalidConfig: reason = "configuration"
-	case .Internal, .OutOfMemory: reason = "internal"
+	case .Internal: reason = "internal"
+	case .OutOfMemory: reason = "out_of_memory"
 	case .Transport:
 		switch s.phase {
 		case SETUP_PHASE_TCP: reason = "connect"
 		case SETUP_PHASE_TLS: reason = s.tls_verify_failed ? "tls_verify" : "tls_handshake"
+		case: if s.failure != "" {reason = s.failure}
 		}
 	case:
 	}
 	c.config.setup_failure(c.config.setup_failure_user, s.phase, reason)
+}
+
+// Setup owns this socket until admission. A session writer can still be
+// busy with a parked drain, so it must never own Hello or Authenticate.
+broker_setup_write :: proc(s: ^BrokerSetup, opcode: proto.Opcode, payload: []u8) -> bool {
+	terr, perr := trans.write_frame(s.conn, opcode, payload)
+	if terr == .None && perr == .None {return true}
+	s.failure = terr == .Closed ? "peer_closed" : "write_failed"
+	return false
+}
+
+broker_setup_read :: proc(s: ^BrokerSetup, decoder: ^proto.FrameDecoder) -> (proto.Frame, bool) {
+	frame, terr, perr := trans.read_frame(s.conn, decoder)
+	if terr == .None && perr == .None {return frame, true}
+	s.failure = "read_failed"
+	if terr == .Closed {s.failure = "peer_closed"}
+	if perr != .None {s.failure = "invalid_frame"}
+	return {}, false
 }

@@ -15,7 +15,7 @@ ENROLLMENT_HTTP_TIMEOUT :: 15*time.Second
 ENROLLMENT_HTTP_MAX :: 1 << 20
 ENROLLMENT_HEADER_MAX :: 16 << 10
 
-EnrollmentError :: enum {None, Retry, Denied, Config, Expired}
+EnrollmentError :: enum {None, Retry, Unavailable, Denied, Config, Expired, Broker_Setup_Exhausted}
 EnrollmentRequest :: struct {method, path, bearer, body: string}
 EnrollmentResponse :: struct {
 	status: int,
@@ -146,6 +146,7 @@ enrollment_network_http :: proc(_: rawptr, cfg: ^EnrollmentConfig, req: Enrollme
 		if err == .Closed {break}
 		if err != .None {return {failure = "http_io"}, .Retry}
 	}
+	if len(raw) == 0 {return {failure = "http_io"}, .Retry}
 	return enrollment_http_response(string(raw[:]))
 }
 

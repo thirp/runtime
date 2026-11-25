@@ -1,5 +1,6 @@
 package caller
 
+import trans "../transport"
 import "core:time"
 
 DEFAULT_IMPLEMENTATION :: "thirp-connect"
@@ -24,7 +25,7 @@ DEFAULT_DIAL_TIMEOUT :: 10 * time.Second
 // outstanding, closes the socket so the reader reconnects. 0 in CallerConfig
 // means this default. Negative disables it. Progress is peer ACKs, not the
 // wall clock since a CONNECT was queued.
-DEFAULT_SEND_STALL_TIMEOUT :: 10 * time.Second
+DEFAULT_SEND_STALL_TIMEOUT :: trans.CALLER_SEND_STALL_TIMEOUT
 
 RECONNECT_BASE :: 250 * time.Millisecond
 RECONNECT_MAX :: 15 * time.Second
@@ -57,7 +58,7 @@ LOG_EVENT_DIAL_TIMEOUT_SHORT :: "dial_timeout_short"
 // Probe after inbound silence and allow time for a reply even if a probe
 // has to wait behind a frame. Any inbound frame proves liveness.
 CALLER_PING_INTERVAL :: 2 * time.Second
-DEAD_PEER_TIMEOUT :: 7 * time.Second
+DEAD_PEER_TIMEOUT :: trans.CALLER_DEAD_PEER_TIMEOUT
 SESSION_IDLE_TIMEOUT :: 45 * time.Second
 LOG_REASON_IDLE :: "idle"
 // The broker stopped sending frames, or outstanding bytes went unacknowledged.

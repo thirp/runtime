@@ -84,6 +84,11 @@ conn_half_close :: proc(conn: ^Conn) {
 }
 
 conn_close :: proc(conn: ^Conn) {
+	conn_close_with_writer(conn, true)
+}
+
+@(private)
+conn_close_with_writer :: proc(conn: ^Conn, wait: bool) {
 	if conn == nil {
 		return
 	}
@@ -114,11 +119,25 @@ conn_close :: proc(conn: ^Conn) {
 	sync.cond_broadcast(&conn.cond)
 	sync.mutex_unlock(&conn.mutex)
 	if sess != nil {
+		gen, live := 0, false
+		if !wait {
+			sync.mutex_lock(&caller.mutex)
+			gen, live = caller_generation_of(caller, sess)
+			sync.mutex_unlock(&caller.mutex)
+		}
 		if !already_half {
-			_ = caller_write(sess, .HalfClose, nil, stream_id)
+			if wait {
+				_ = caller_write(sess, .HalfClose, nil, stream_id)
+			} else if live {
+				_ = caller_post_control(caller, sess, gen, .HalfClose, nil, stream_id)
+			}
 		}
 		if !peer_half {
-			_ = caller_write(sess, .Close, nil, stream_id)
+			if wait {
+				_ = caller_write(sess, .Close, nil, stream_id)
+			} else if live {
+				_ = caller_post_control(caller, sess, gen, .Close, nil, stream_id)
+			}
 		}
 		trans.connection_release(sess)
 	}

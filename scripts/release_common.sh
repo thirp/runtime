@@ -53,6 +53,10 @@ release_sign_sha256sums() {
 		echo "release: SHA256SUMS missing: ${sums:-<empty>}" >&2
 		exit 1
 	fi
+	if [[ "${THIRP_RELEASE_UNSIGNED:-}" == 1 ]]; then
+		echo "release: GPG signing skipped in unsigned mode"
+		return 0
+	fi
 	if [[ -z "${THIRP_GPG_KEY:-}" ]]; then
 		if command -v gpg >/dev/null 2>&1 &&
 			gpg --list-secret-keys --with-colons "$THIRP_PUBLISH_GPG_FINGERPRINT" >/dev/null 2>&1; then

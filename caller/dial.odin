@@ -114,7 +114,7 @@ caller_dial :: proc(c: ^Caller, service_id: proto.ServiceId, wait_for_session: b
 		}
 		// A reply may have bound the stream before the write waiter noticed
 		// the session swap. Remove it from its owning session before freeing it.
-		conn_destroy(stream)
+		dial_discard_stream(stream)
 		// A timed dial that never gets a CONNECT out fails on its own.
 		// The session stays up unless the socket itself has stopped making
 		// send progress (that timer is not this deadline).
@@ -143,7 +143,7 @@ caller_dial :: proc(c: ^Caller, service_id: proto.ServiceId, wait_for_session: b
 	}
 	if sync.atomic_load(&c.stop) {
 		sync.mutex_unlock(&c.mutex)
-		conn_destroy(stream)
+		dial_discard_stream(stream)
 		return nil, .Closed
 	}
 	// The slot may already hold another service's dial.
@@ -163,6 +163,14 @@ caller_dial :: proc(c: ^Caller, service_id: proto.ServiceId, wait_for_session: b
 	}
 	sync.mutex_unlock(&c.mutex)
 	return stream, .None
+}
+
+// A CONNECT_OK may have arrived before a failed dial noticed its deadline
+// or session change. End any stream it bound and leave the writes to the
+// owning session's writer, which may still be blocked.
+dial_discard_stream :: proc(stream: ^Conn) {
+	conn_close_with_writer(stream, false)
+	conn_release(stream)
 }
 
 // CONNECT is a control frame: the session writer pulls it ahead of DATA

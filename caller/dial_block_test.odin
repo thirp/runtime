@@ -68,7 +68,8 @@ test_dial_behind_blocked_data_times_out_and_recovers :: proc(t: ^testing.T) {
 	fx: TestBroker
 	start_test_broker(t, &fx)
 	defer stop_test_broker(&fx)
-	fx.server.max_stream_buffer = 32 * 1024
+	// Allow the queued socket bytes to drain after the read hold is released.
+	fx.server.max_stream_buffer = fx.server.max_connection_buffer
 
 	echo: EchoFixture
 	echo_ep := start_echo(t, &echo)
@@ -114,16 +115,14 @@ test_dial_behind_blocked_data_times_out_and_recovers :: proc(t: ^testing.T) {
 	testing.expect_value(t, rerr, ConnError.None)
 	testing.expect_value(t, string(buf[:rn]), "hi")
 
-	// Stop the broker draining this agent's outbox. The stream cap then fills
-	// and the broker stops reading the caller, so conn_write blocks in the
-	// kernel and holds the session write lock.
-	box := test_agent_outbox(&fx.server)
-	testing.expect(t, box != nil, "agent outbox")
-	if box == nil {
+	// Force a transport write stall on this caller socket. An overflowing
+	// destination now resets only its stream, so it cannot create the stall.
+	broker_conn := hold_broker_caller_reader(&fx.server, up_conn.stream_id)
+	if !testing.expect(t, broker_conn != nil, "broker-side caller socket") {
 		return
 	}
-	defer brk.outbox_release(box)
-	brk.outbox_set_writer_hold(box, true)
+	defer trans.connection_release(broker_conn)
+	defer release_broker_caller_reader(broker_conn)
 	// Keep the default buffer. A small explicit SO_SNDBUF on Winsock
 	// loopback lets sends keep completing even with the broker stalled.
 	_ = trans.connection_set_send_timeout(c.conn, 8 * time.Second)
@@ -136,7 +135,7 @@ test_dial_behind_blocked_data_times_out_and_recovers :: proc(t: ^testing.T) {
 	}
 	defer {
 		sync.atomic_store(&up.stop, true)
-		brk.outbox_set_writer_hold(box, false)
+		release_broker_caller_reader(broker_conn)
 		thread.join(uth)
 		thread.destroy(uth)
 	}
@@ -181,7 +180,7 @@ test_dial_behind_blocked_data_times_out_and_recovers :: proc(t: ^testing.T) {
 		return
 	}
 	defer {
-		brk.outbox_set_writer_hold(box, false)
+		release_broker_caller_reader(broker_conn)
 		thread.join(dth)
 		thread.destroy(dth)
 		if attempt.conn != nil {
@@ -211,7 +210,7 @@ test_dial_behind_blocked_data_times_out_and_recovers :: proc(t: ^testing.T) {
 
 	released := sync.atomic_load(&up.sent)
 	sync.atomic_store(&up.stop, true)
-	brk.outbox_set_writer_hold(box, false)
+	release_broker_caller_reader(broker_conn)
 	progress := time.now()
 	for sync.atomic_load(&up.sent) <= released && !sync.atomic_load(&up.done) && time.since(progress) < 2 * time.Second {
 		time.sleep(5 * time.Millisecond)
@@ -273,7 +272,6 @@ test_stuck_socket_restarts_session_and_dials_timeout :: proc(t: ^testing.T) {
 	fx: TestBroker
 	start_test_broker(t, &fx)
 	defer stop_test_broker(&fx)
-	fx.server.max_stream_buffer = 32 * 1024
 
 	echo: EchoFixture
 	echo_ep := start_echo(t, &echo)
@@ -310,13 +308,12 @@ test_stuck_socket_restarts_session_and_dials_timeout :: proc(t: ^testing.T) {
 	}
 	defer conn_destroy(up_conn)
 
-	box := test_agent_outbox(&fx.server)
-	testing.expect(t, box != nil, "agent outbox")
-	if box == nil {
+	broker_conn := hold_broker_caller_reader(&fx.server, up_conn.stream_id)
+	if !testing.expect(t, broker_conn != nil, "broker-side caller socket") {
 		return
 	}
-	defer brk.outbox_release(box)
-	brk.outbox_set_writer_hold(box, true)
+	defer trans.connection_release(broker_conn)
+	defer release_broker_caller_reader(broker_conn)
 	// Use the default TCP buffer just as in the blocked-dial test above.
 	_ = trans.connection_set_send_timeout(c.conn, 8 * time.Second)
 
@@ -328,7 +325,7 @@ test_stuck_socket_restarts_session_and_dials_timeout :: proc(t: ^testing.T) {
 	}
 	defer {
 		sync.atomic_store(&up.stop, true)
-		brk.outbox_set_writer_hold(box, false)
+		release_broker_caller_reader(broker_conn)
 		thread.join(uth)
 		thread.destroy(uth)
 	}
@@ -425,7 +422,7 @@ test_stuck_socket_restarts_session_and_dials_timeout :: proc(t: ^testing.T) {
 	testing.expect(t, stuck_log_has("\"event\":\"disconnected\",\"reason\":\"stall\""), "missing disconnected stall")
 	testing.expect(t, stuck_log_has("\"streams\":"), "missing stream count")
 
-	brk.outbox_set_writer_hold(box, false)
+	release_broker_caller_reader(broker_conn)
 	back := time.now()
 	for !caller_is_connected(&c) && time.since(back) < 3 * time.Second {
 		time.sleep(5 * time.Millisecond)
@@ -668,6 +665,27 @@ stuck_log_has :: proc(part: string) -> bool {
 	sync.mutex_lock(&stuck_logs.mu)
 	defer sync.mutex_unlock(&stuck_logs.mu)
 	return strings.contains(string(stuck_logs.text[:]), part)
+}
+
+// Pause only this broker reader. Its peer can still read, and a replacement
+// caller session is unaffected.
+hold_broker_caller_reader :: proc(server: ^brk.Server, stream_id: proto.StreamId) -> ^trans.Connection {
+	conn, _, found := brk.relay_acquire_peer(server, stream_id, .Caller)
+	if !found {
+		return nil
+	}
+	sync.atomic_store(&conn.read_hook, rawptr(hold_caller_socket_read))
+	return conn
+}
+
+hold_caller_socket_read :: proc(conn: ^trans.Connection) {
+	for sync.atomic_load(&conn.read_hook) != nil && !sync.atomic_load(&conn.closed) {
+		time.sleep(time.Millisecond)
+	}
+}
+
+release_broker_caller_reader :: proc(conn: ^trans.Connection) {
+	sync.atomic_store(&conn.read_hook, nil)
 }
 
 // Broker-side connection for the registered agent, referenced once.

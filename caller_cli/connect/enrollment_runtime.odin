@@ -7,9 +7,12 @@ import trans "../../transport"
 import ver "../../version"
 import "core:fmt"
 import "core:mem"
+import "core:strings"
 import "core:sync"
 import "core:thread"
 import "core:time"
+
+ENROLLMENT_BROKER_ATTEMPTS :: 3
 
 EnrollmentCaller :: struct {
 	run: Run,
@@ -34,6 +37,7 @@ EnrollmentLink :: struct {
 	request_id: string,
 	next: time.Time,
 	backoff: time.Duration,
+	setup_failures: int,
 	job: ^EnrollmentJob,
 	discard_job: bool,
 	mutex: sync.Mutex,
@@ -56,13 +60,32 @@ enrollment_share_links :: proc(links: []EnrollmentLink) {
 }
 
 enrollment_new_caller :: proc(e: ^Enrollment, l: ^EnrollmentLink) -> (^EnrollmentCaller, bool) {
-	ep, ok := enrollment_resolve(e.cfg.broker, time.time_add(time.now(), cl.DEFAULT_DIAL_TIMEOUT))
-	if !ok {enrollment_failure(e, "broker", "dns", l.cfg.service); return nil, false}
 	sid, serr := proto.make_service_id(l.pending.service_id)
-	if serr != .None {enrollment_failure(e, "api", "invalid_service_id", l.cfg.service); return nil, false}
-	c := new(EnrollmentCaller)
+	if serr != .None {
+		enrollment_setup_failure(e, l.cfg.service, "service", "invalid_service_id")
+		return nil, false
+	}
+	deadline := time.time_add(time.now(), cl.DEFAULT_DIAL_TIMEOUT)
+	ep, ok := enrollment_resolve(e.cfg.broker, deadline)
+	if !ok {
+		reason := time.since(deadline) >= 0 ? "timeout" : "dns"
+		enrollment_setup_failure(e, l.cfg.service, "dns", reason)
+		return nil, false
+	}
+	c, alloc_err := new(EnrollmentCaller)
+	if alloc_err != .None {
+		enrollment_setup_failure(e, l.cfg.service, "session", "out_of_memory")
+		return nil, false
+	}
+	// A retired caller can still have bridges after its plan is freed.
+	service_id, clone_err := strings.clone(string(sid))
+	if clone_err != .None {
+		free(c)
+		enrollment_setup_failure(e, l.cfg.service, "session", "out_of_memory")
+		return nil, false
+	}
 	c.grant_end = l.pending.grant_end
-	c.run.service_id, c.run.stall = sid, l.stall
+	c.run.service_id, c.run.stall = proto.ServiceId(service_id), l.stall
 	c.run.enrollment, c.run.catalog_service = e, l.cfg.service
 	name := e.cfg.tls_server_name
 	if len(name) == 0 {name, _ = trans.endpoint_host(e.cfg.broker)}
@@ -72,10 +95,11 @@ enrollment_new_caller :: proc(e: ^Enrollment, l: ^EnrollmentLink) -> (^Enrollmen
 		broker = ep, token = l.pending.token, tls_ca = e.cfg.tls_ca,
 		tls_server_name = name, implementation = impl, logger = &e.logger,
 		setup_failure = enrollment_broker_failure, setup_failure_user = &c.run,
+		managed_reconnect = true, setup_deadline = deadline,
 		max_stream_buffer = l.buffer, dial_timeout = cl.DEFAULT_DIAL_TIMEOUT,
 	})
 	if cerr != .None {
-		if cerr == .OutOfMemory {enrollment_failure(e, "broker", "internal", l.cfg.service)}
+		delete(service_id)
 		free(c)
 		return nil, false
 	}
@@ -83,9 +107,12 @@ enrollment_new_caller :: proc(e: ^Enrollment, l: ^EnrollmentLink) -> (^Enrollmen
 }
 
 enrollment_destroy_caller :: proc(c: ^EnrollmentCaller) {
+	// Wake bridges blocked on the retired broker socket before joining them.
+	cl.caller_stop(&c.run.c)
 	_ = run_stop_bridges(&c.run, 0)
 	cl.caller_destroy(&c.run.c)
 	delete(c.run.bridges)
+	delete(string(c.run.service_id))
 	free(c)
 }
 
@@ -136,6 +163,11 @@ enrollment_reaper :: proc(r: ^EnrollmentReaper) {
 	}
 }
 
+enrollment_caller_usable :: proc(c: ^EnrollmentCaller, now: time.Time) -> bool {
+	return c != nil && now._nsec < c.grant_end._nsec && now._nsec < sync.atomic_load(&c.expires_ns) &&
+		cl.caller_session_admitted(&c.run.c)
+}
+
 enrollment_accept :: proc(l: ^EnrollmentLink) {
 	session := l
 	if l.owner != nil {session = l.owner}
@@ -146,9 +178,7 @@ enrollment_accept :: proc(l: ^EnrollmentLink) {
 		if err != .None {continue}
 		sync.mutex_lock(&session.mutex)
 		c := session.current
-		now := time.now()._nsec
-		if c == nil || now >= c.grant_end._nsec || now >= sync.atomic_load(&c.expires_ns) ||
-			sync.atomic_load(&c.run.live) >= MAX_BRIDGES || !cl.caller_session_admitted(&c.run.c) {
+		if !enrollment_caller_usable(c, time.now()) || sync.atomic_load(&c.run.live) >= MAX_BRIDGES {
 			sync.mutex_unlock(&session.mutex)
 			trans.connection_destroy(local)
 			continue
@@ -177,6 +207,7 @@ enrollment_drop :: proc(e: ^Enrollment, l: ^EnrollmentLink) {
 	enrollment_plan_destroy(&l.plan)
 	if l.job != nil {l.discard_job = true} else {enrollment_plan_destroy(&l.pending)}
 	delete(l.request_id); l.request_id = ""
+	l.setup_failures = 0
 }
 
 enrollment_retry :: proc(e: ^Enrollment, l: ^EnrollmentLink, denied := false) {
@@ -198,99 +229,157 @@ enrollment_install :: proc(e: ^Enrollment, l: ^EnrollmentLink, c: ^EnrollmentCal
 	l.plan = l.pending
 	l.pending = {}
 	l.next, l.backoff = {}, 0
+	l.setup_failures = 0
 	enrollment_log(e, "caller connected", &l.plan)
 }
 
-enrollment_link_step :: proc(e: ^Enrollment, l: ^EnrollmentLink) {
-	if l.owner != nil {return}
+enrollment_forget_credential :: proc(p: ^EnrollmentPlan) {
+	delete(p.token); p.token = ""
+	delete(p.credential_id); p.credential_id = ""
+	p.expires_at, p.renew_at = {}, {}
+}
+
+enrollment_complete_setup :: proc(e: ^Enrollment, l: ^EnrollmentLink, c: ^EnrollmentCaller, ok: bool) -> EnrollmentError {
 	now := enrollment_now(e)
-	sync.mutex_lock(&l.mutex)
-	active := l.current != nil
-	sync.mutex_unlock(&l.mutex)
-	if len(l.plan.grant_id) > 0 && (!active || now._nsec >= l.plan.grant_end._nsec || now._nsec >= l.plan.expires_at._nsec) {
+	valid := !l.discard_job && !e.denied && now._nsec < l.pending.expires_at._nsec && now._nsec < l.pending.grant_end._nsec
+	if ok && valid && cl.caller_session_admitted(&c.run.c) {
+		enrollment_install(e, l, c)
+		return .None
+	}
+	if c != nil {
 		sync.mutex_lock(&l.mutex)
-		enrollment_retire_locked(l, true)
+		c.force = true
+		append(&l.retired, c)
 		sync.mutex_unlock(&l.mutex)
-		enrollment_failure(e, "approval", "waiting_for_approval", l.cfg.service)
-		enrollment_plan_destroy(&l.plan)
-		l.next = {}
+	}
+	// A failed setup consumes its credential. The mint endpoint checks the
+	// grant's authority before issuing a replacement.
+	enrollment_forget_credential(&l.pending)
+	if l.discard_job {enrollment_plan_destroy(&l.pending)}
+	if !valid {return .None}
+	if ok {enrollment_setup_failure(e, l.cfg.service, "session", "disconnected_before_install")}
+	sync.mutex_lock(&l.mutex)
+	usable := enrollment_caller_usable(l.current, now)
+	sync.mutex_unlock(&l.mutex)
+	if usable {
+		// Rollover can keep retrying while the original session serves traffic.
+		l.setup_failures = 0
+		enrollment_retry(e, l)
+		return .None
+	}
+	l.setup_failures += 1
+	if l.setup_failures >= ENROLLMENT_BROKER_ATTEMPTS {
+		log.log_event(&e.logger, .Error, "caller broker redials exhausted", {
+			mode = "caller-conf", organization_id = e.cfg.org, service_id = l.cfg.service,
+			phase = "broker", reason = "broker_setup_exhausted",
+		})
+		return .Broker_Setup_Exhausted
+	}
+	minimum, maximum, _, _ := enrollment_intervals()
+	delay := min(minimum*time.Duration(l.setup_failures), maximum)
+	l.next = time.time_add(now, delay)
+	return .None
+}
+
+enrollment_link_step :: proc(e: ^Enrollment, l: ^EnrollmentLink) -> EnrollmentError {
+	if l.owner != nil {return .None}
+	now := enrollment_now(e)
+	grant_ended := now._nsec >= l.plan.grant_end._nsec
+	credential_expired := now._nsec >= l.plan.expires_at._nsec
+	sync.mutex_lock(&l.mutex)
+	retire := len(l.plan.grant_id) > 0 && (grant_ended || credential_expired ||
+		l.current == nil || !cl.caller_session_admitted(&l.current.run.c))
+	if retire {enrollment_retire_locked(l, grant_ended || credential_expired)}
+	sync.mutex_unlock(&l.mutex)
+	fallback: EnrollmentPlan
+	defer enrollment_plan_destroy(&fallback)
+	if retire {
+		// Keep the admitted credential for this recovery decision while
+		// attempting a fresh mint. A replacement already in flight owns
+		// this recovery, so there is no need to retain the previous plan.
+		if !grant_ended && !credential_expired && l.job == nil {
+			fallback, l.plan = l.plan, {}
+		} else {
+			enrollment_plan_destroy(&l.plan)
+		}
+		l.next, l.backoff = {}, 0
 	}
 	if l.job != nil {
 		j := l.job
-		if !sync.atomic_load(&j.done) {return}
+		if !sync.atomic_load(&j.done) {return .None}
 		thread.join(j.th); thread.destroy(j.th)
 		l.job = nil
-		valid := !l.discard_job && !e.denied && now._nsec < l.pending.expires_at._nsec && now._nsec < l.pending.grant_end._nsec
-		if j.ok && valid {enrollment_install(e, l, j.caller)} else {
-			if j.caller != nil {
-				sync.mutex_lock(&l.mutex)
-				j.caller.force = true
-				append(&l.retired, j.caller)
-				sync.mutex_unlock(&l.mutex)
-			}
-			// A broker denial needs a fresh control-plane mint, never a
-			// session refresh. The mint rechecks enrollment and grant authority.
-			delete(l.pending.token); l.pending.token = ""
-			delete(l.pending.credential_id); l.pending.credential_id = ""
-			if l.discard_job {enrollment_plan_destroy(&l.pending)}
-			enrollment_retry(e, l)
-		}
+		err := enrollment_complete_setup(e, l, j.caller, j.ok)
 		l.discard_job = false
 		free(j)
+		if err != .None {return err}
 	}
-	if e.denied || now._nsec < l.next._nsec {return}
+	now = enrollment_now(e)
+	if e.denied || now._nsec < l.next._nsec {return .None}
 	if len(l.plan.grant_id) > 0 && now._nsec >= l.plan.renew_at._nsec {
 		err := enrollment_renew(e, &l.plan)
 		if err == .Denied {
 			enrollment_drop(e, l)
 			enrollment_failure(e, "approval", "waiting_for_approval", l.cfg.service)
 			enrollment_retry(e, l, true)
-			return
+			return .None
 		}
-		if err != .None {enrollment_retry(e, l); return}
+		if err != .None {enrollment_retry(e, l); return .None}
 		sync.mutex_lock(&l.mutex)
 		if l.current != nil {sync.atomic_store(&l.current.expires_ns, l.plan.expires_at._nsec)}
 		sync.mutex_unlock(&l.mutex)
 		enrollment_log(e, "caller renewed", &l.plan)
 	}
-	if len(l.plan.grant_id) > 0 && now._nsec < l.plan.rollover_at._nsec {return}
+	if len(l.plan.grant_id) > 0 && now._nsec < l.plan.rollover_at._nsec {return .None}
 	err := EnrollmentError.None
 	if len(l.pending.grant_id) > 0 && now._nsec >= l.pending.grant_end._nsec {enrollment_plan_destroy(&l.pending)}
 	if len(l.pending.token) > 0 && now._nsec >= l.pending.expires_at._nsec {
-		delete(l.pending.token); l.pending.token = ""
-		delete(l.pending.credential_id); l.pending.credential_id = ""
+		enrollment_forget_credential(&l.pending)
 	}
 	if len(l.pending.grant_id) == 0 {
 		found: bool
 		found, err = enrollment_pick_grant(e, l)
-		if err == .None && !found && len(e.cfg.environment) == 0 {err = enrollment_create_grant(e, l)}
+		if err == .None && !found {
+			enrollment_plan_destroy(&fallback)
+			if len(e.cfg.environment) == 0 {err = enrollment_create_grant(e, l)}
+		}
 		if err == .None && len(l.pending.grant_id) == 0 {
 			if len(l.plan.grant_id) == 0 {enrollment_failure(e, "approval", "waiting_for_approval", l.cfg.service)}
 			enrollment_retry(e, l)
-			return
+			return .None
 		}
 	}
 	if err == .None && len(l.pending.token) == 0 {err = enrollment_mint(e, &l.pending)}
+	if err == .Unavailable && len(fallback.token) > 0 &&
+		(len(l.pending.grant_id) == 0 || l.pending.grant_id == fallback.grant_id) {
+		now = enrollment_now(e)
+		if now._nsec < fallback.expires_at._nsec && now._nsec < fallback.grant_end._nsec {
+			// The normal attempt deadline and completion checks also apply
+			// here. A failed attempt consumes this credential.
+			enrollment_plan_destroy(&l.pending)
+			l.pending, fallback = fallback, {}
+			err = .None
+		}
+	}
 	if err != .None {
 		if err == .Denied {enrollment_drop(e, l); enrollment_failure(e, "approval", "waiting_for_approval", l.cfg.service)}
 		enrollment_retry(e, l, err == .Denied)
-		return
+		return .None
 	}
 	if e.new_caller != nil {
 		c, ok := e.new_caller(e, l)
-		if ok {enrollment_install(e, l, c)} else {enrollment_retry(e, l)}
-		return
+		return enrollment_complete_setup(e, l, c, ok)
 	}
 	j := new(EnrollmentJob)
 	j.e, j.link, j.allocator = e, l, context.allocator
 	j.th = thread.create_and_start_with_poly_data(j, enrollment_job_run)
 	if j.th == nil {
 		free(j)
-		enrollment_failure(e, "broker", "internal", l.cfg.service)
-		enrollment_retry(e, l)
-		return
+		enrollment_setup_failure(e, l.cfg.service, "session", "thread_start")
+		return enrollment_complete_setup(e, l, nil, false)
 	}
 	l.job = j
+	return .None
 }
 
 enrollment_step :: proc(e: ^Enrollment) -> EnrollmentError {
@@ -310,7 +399,9 @@ enrollment_step :: proc(e: ^Enrollment) -> EnrollmentError {
 	if e.expires_at != {} && enrollment_now(e)._nsec >= e.expires_at._nsec && len(e.pending_token) == 0 {return .Expired}
 	// Do not mint before GET self has authenticated this enrollment/config.
 	if e.expires_at == {} {return .None}
-	for &l in e.links {enrollment_link_step(e, &l)}
+	for &l in e.links {
+		if err := enrollment_link_step(e, &l); err != .None {return err}
+	}
 	return .None
 }
 
@@ -370,7 +461,10 @@ enrollment_main :: proc(path: string, stall: time.Duration, buffer: int, ctl: ^R
 	when #config(THIRP_LAB_TIMERS, false) {fmt.eprintln("THIRP_LAB_TIMERS_ENABLED")}
 	for {
 		if ctl != nil && sync.atomic_load(&ctl.stop) {return 0}
-		if enrollment_step(&e) != .None {fmt.eprintln("caller enrollment expired or configuration invalid"); return 1}
+		if err := enrollment_step(&e); err != .None {
+			if err != .Broker_Setup_Exhausted {fmt.eprintln("caller enrollment expired or configuration invalid")}
+			return 1
+		}
 		time.sleep(25*time.Millisecond)
 	}
 }

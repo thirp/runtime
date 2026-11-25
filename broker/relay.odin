@@ -10,6 +10,7 @@ RelayStream :: struct {
 	id:                        proto.StreamId,
 	service_id:                ServiceId,
 	state:                     StreamState,
+	open_pending:              bool, // OPEN has yet to be published to the agent outbox
 	agent_session:             SessionId,
 	caller_session:            SessionId,
 	agent_conn:                ^trans.Connection,
@@ -279,6 +280,7 @@ relay_open_stream :: proc(
 		id                        = stream_id,
 		service_id                = ServiceId(cloned),
 		state                     = .Opening,
+		open_pending              = true,
 		agent_session             = agent_session,
 		caller_session            = caller_session,
 		agent_conn                = found_conn,
@@ -301,16 +303,36 @@ relay_open_stream :: proc(
 }
 
 relay_drop_stream :: proc(server: ^Server, stream_id: proto.StreamId) {
-	sync.mutex_lock(&server.routing_mutex)
-	stream, found := server.streams[stream_id]
-	if found {
-		delete_key(&server.streams, stream_id)
-		relay_adjust_session_stream_count_locked(server, stream.agent_session, -1)
-	}
-	sync.mutex_unlock(&server.routing_mutex)
+	stream, found := relay_take_stream(server, stream_id)
 	if found {
 		relay_release_stream(server, stream)
 	}
+}
+
+// A terminal frame to the agent can take over the existing admission slot.
+relay_take_stream :: proc(server: ^Server, stream_id: proto.StreamId, keep_slot := false) -> (RelayStream, bool) {
+	sync.mutex_lock(&server.routing_mutex)
+	defer sync.mutex_unlock(&server.routing_mutex)
+	stream, found := server.streams[stream_id]
+	if found {
+		delete_key(&server.streams, stream_id)
+		if !keep_slot || stream.open_pending {
+			relay_adjust_session_stream_count_locked(server, stream.agent_session, -1)
+		}
+	}
+	return stream, found
+}
+
+relay_publish_open :: proc(server: ^Server, stream_id: proto.StreamId, agent: ^trans.Connection) -> bool {
+	sync.mutex_lock(&server.routing_mutex)
+	defer sync.mutex_unlock(&server.routing_mutex)
+	stream, found := server.streams[stream_id]
+	if !found || !stream.open_pending || stream.agent_conn != agent {
+		return false
+	}
+	stream.open_pending = false
+	server.streams[stream_id] = stream
+	return true
 }
 
 relay_lookup_stream :: proc(server: ^Server, stream_id: proto.StreamId) -> (RelayStream, bool) {
@@ -320,15 +342,12 @@ relay_lookup_stream :: proc(server: ^Server, stream_id: proto.StreamId) -> (Rela
 	return stream, found
 }
 
-relay_add_stream_bytes :: proc(server: ^Server, stream_id: proto.StreamId, from: StreamPeer, n: int) {
-	if server == nil || n <= 0 {
-		return
-	}
+relay_add_stream_bytes :: proc(server: ^Server, stream_id: proto.StreamId, from: StreamPeer, n: int) -> bool {
 	sync.mutex_lock(&server.routing_mutex)
 	defer sync.mutex_unlock(&server.routing_mutex)
 	stream, found := server.streams[stream_id]
-	if !found {
-		return
+	if !found || stream_state_is_terminal(stream.state) {
+		return false
 	}
 	switch from {
 	case .Caller:
@@ -337,6 +356,7 @@ relay_add_stream_bytes :: proc(server: ^Server, stream_id: proto.StreamId, from:
 		stream.bytes_agent_to_caller += u64(n)
 	}
 	server.streams[stream_id] = stream
+	return true
 }
 
 // If requested, the destination is returned with a reference the caller releases.
@@ -346,6 +366,7 @@ relay_apply :: proc(
 	event: StreamEvent,
 	from: StreamPeer,
 	peer_out: ^^trans.Connection = nil,
+	take_for_cancel := false,
 ) -> (
 	RelayStream,
 	StreamError,
@@ -367,11 +388,21 @@ relay_apply :: proc(
 		return stream, aerr
 	}
 	stream.state = next
+	if event == .OpenOk || event == .OpenFailed {
+		stream.open_pending = false
+	}
 	#partial switch event {
 	case .OpenOk, .Data, .HalfClose:
 		stream.last_activity = time.now()
 	}
-	server.streams[stream_id] = stream
+	if take_for_cancel {
+		delete_key(&server.streams, stream_id)
+		if stream.open_pending {
+			relay_adjust_session_stream_count_locked(server, stream.agent_session, -1)
+		}
+	} else {
+		server.streams[stream_id] = stream
+	}
 	if peer_out != nil {
 		// The opposite HALF_CLOSE can remove this row as soon as we
 		// unlock. Keep the destination alive so this EOF still reaches it.
@@ -428,11 +459,27 @@ relay_take_streams_for_conn :: proc(
 		stream, found := server.streams[id]
 		if found {
 			delete_key(&server.streams, id)
-			relay_adjust_session_stream_count_locked(server, stream.agent_session, -1)
+			// Caller cleanup transfers the slot to the agent's RESET.
+			if stream.open_pending || !relay_caller_cancellation_pending(stream, conn) {
+				relay_adjust_session_stream_count_locked(server, stream.agent_session, -1)
+			}
 			append(&taken, stream)
 		}
 	}
 	return taken
+}
+
+relay_caller_cancellation_pending :: proc(stream: RelayStream, conn: ^trans.Connection) -> bool {
+	return stream.caller_conn == conn && stream.agent_conn != conn
+}
+
+relay_release_cancelled_slot :: proc(server: ^Server, session: SessionId) {
+	if session == INVALID_SESSION_ID {
+		return
+	}
+	sync.mutex_lock(&server.routing_mutex)
+	relay_adjust_session_stream_count_locked(server, session, -1)
+	sync.mutex_unlock(&server.routing_mutex)
 }
 
 relay_take_all_streams :: proc(server: ^Server, allocator := context.allocator) -> [dynamic]RelayStream {
@@ -647,7 +694,10 @@ relay_take_streams_for_grant :: proc(
 		stream, found := server.streams[id]
 		if found {
 			delete_key(&server.streams, id)
-			relay_adjust_session_stream_count_locked(server, stream.agent_session, -1)
+			// Published OPENs hold their slot through RESET delivery.
+			if stream.open_pending {
+				relay_adjust_session_stream_count_locked(server, stream.agent_session, -1)
+			}
 			append(&taken, stream)
 		}
 	}

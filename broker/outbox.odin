@@ -12,6 +12,19 @@ QueuedFrame :: struct {
 	opcode:    proto.Opcode,
 	stream_id: proto.StreamId,
 	payload:   []u8,
+	release_slot: SessionId,
+}
+
+when ODIN_TEST {
+	OutboxTestClock :: struct {
+		// Called with the destination mutex held. A new wait takes its
+		// starting sample before the loop checks the queue.
+		test_wait_clock: proc(box: ^ConnOutbox, starting: bool, data: rawptr) -> time.Tick,
+		test_wait_data:  rawptr,
+		test_probe:      proc(source: ^ConnHandler, data: rawptr) -> (bool, int),
+	}
+} else {
+	OutboxTestClock :: struct {}
 }
 
 ConnOutbox :: struct {
@@ -33,6 +46,7 @@ ConnOutbox :: struct {
 	// test can observe what a terminal HALF_CLOSE does to them. Production
 	// leaves it false. Shutdown (closed) still drains.
 	writer_hold:  bool,
+	using _:      OutboxTestClock,
 }
 
 outbox_counts_as_data :: proc(opcode: proto.Opcode) -> bool {
@@ -100,6 +114,7 @@ outbox_clear_queues_locked :: proc(box: ^ConnOutbox) {
 	}
 	for sid, q in box.queues {
 		for frame in q {
+			relay_release_cancelled_slot(box.server, frame.release_slot)
 			if len(frame.payload) > 0 {
 				delete(frame.payload, box.allocator)
 			}
@@ -178,6 +193,8 @@ outbox_enqueue :: proc(
 	opcode: proto.Opcode,
 	stream_id: proto.StreamId,
 	payload: []u8,
+	release_slot: SessionId = INVALID_SESSION_ID,
+	origin: Maybe(StreamPeer) = nil,
 ) -> OutboxEnqueueError {
 	if box == nil {
 		return .Closed
@@ -188,7 +205,8 @@ outbox_enqueue :: proc(
 		return .Closed
 	}
 	n := len(payload)
-	if outbox_counts_as_data(opcode) {
+	is_data := outbox_counts_as_data(opcode)
+	if is_data {
 		used := box.stream_bytes[stream_id]
 		max_stream := 0
 		max_conn := 0
@@ -214,19 +232,43 @@ outbox_enqueue :: proc(
 	if !found {
 		q = make([dynamic]QueuedFrame, box.allocator)
 	}
-	_, aerr := append(&q, QueuedFrame{opcode = opcode, stream_id = stream_id, payload = copied})
+	_, aerr := append(&q, QueuedFrame{opcode = opcode, stream_id = stream_id, payload = copied, release_slot = release_slot})
+	result: OutboxEnqueueError
 	if aerr != .None {
+		result = .OutOfMemory
+	} else if opcode == .Open && !relay_publish_open(box.server, stream_id, box.conn) {
+		// Revocation removed the relay before publication. The agent
+		// writer cannot see this frame while we hold the outbox mutex.
+		resize(&q, len(q) - 1)
+		result = .Closed
+	} else if from, relayed := origin.?; relayed && is_data && n > 0 {
+		// The writer can deliver this DATA as soon as we release the
+		// outbox mutex. Record it before a peer can reply with CLOSE.
+		if relay_add_stream_bytes(box.server, stream_id, from, n) {
+			metrics_add_bytes(&box.server.metrics, from, n)
+		} else {
+			// A terminal relay can no longer account for this DATA.
+			// Keep it out of the writer's queue.
+			resize(&q, len(q) - 1)
+			result = .Closed
+		}
+	}
+	if result != .None {
 		if n > 0 {
 			delete(copied, box.allocator)
 		}
-		if outbox_counts_as_data(opcode) {
+		if is_data {
 			server_sub_buffered_bytes(box.server, n)
 		}
-		box.queues[stream_id] = q
-		return .OutOfMemory
+		if found {
+			box.queues[stream_id] = q
+		} else {
+			delete(q)
+		}
+		return result
 	}
 	box.queues[stream_id] = q
-	if outbox_counts_as_data(opcode) {
+	if is_data {
 		box.stream_bytes[stream_id] = box.stream_bytes[stream_id] + n
 		box.total_bytes += n
 	}
@@ -243,6 +285,7 @@ outbox_enqueue_failure :: proc(
 	code: proto.WireError,
 	stream_id: proto.StreamId,
 	diagnostic := "",
+	release_slot: SessionId = INVALID_SESSION_ID,
 ) -> OutboxEnqueueError {
 	if box == nil {
 		return .Closed
@@ -262,7 +305,7 @@ outbox_enqueue_failure :: proc(
 		return .OutOfMemory
 	}
 	defer delete(payload, box.allocator)
-	return outbox_enqueue(box, opcode, stream_id, payload)
+	return outbox_enqueue(box, opcode, stream_id, payload, release_slot)
 }
 
 outbox_take_next :: proc(box: ^ConnOutbox) -> (QueuedFrame, bool) {
@@ -319,14 +362,25 @@ outbox_drop_stream :: proc(box: ^ConnOutbox, stream_id: proto.StreamId) {
 	sync.mutex_lock(&box.mutex)
 	defer sync.mutex_unlock(&box.mutex)
 	q, found := box.queues[stream_id]
+	retained := 0
 	if found {
 		for frame in q {
-			if len(frame.payload) > 0 {
+			// Once a cancellation takes the slot, keep its terminal frame
+			// even if another handler is still unwinding the same stream.
+			if frame.release_slot != INVALID_SESSION_ID {
+				q[retained] = frame
+				retained += 1
+			} else if len(frame.payload) > 0 {
 				delete(frame.payload, box.allocator)
 			}
 		}
-		delete(q)
-		delete_key(&box.queues, stream_id)
+		if retained > 0 {
+			resize(&q, retained)
+			box.queues[stream_id] = q
+		} else {
+			delete(q)
+			delete_key(&box.queues, stream_id)
+		}
 	}
 	n := box.stream_bytes[stream_id]
 	if n > 0 {
@@ -337,13 +391,37 @@ outbox_drop_stream :: proc(box: ^ConnOutbox, stream_id: proto.StreamId) {
 		server_sub_buffered_bytes(box.server, n)
 	}
 	delete_key(&box.stream_bytes, stream_id)
-	for i := 0; i < len(box.rr_order); i += 1 {
-		if box.rr_order[i] == stream_id {
-			outbox_rr_remove_locked(box, i)
-			break
+	if retained == 0 {
+		for i := 0; i < len(box.rr_order); i += 1 {
+			if box.rr_order[i] == stream_id {
+				outbox_rr_remove_locked(box, i)
+				break
+			}
 		}
 	}
 	sync.cond_broadcast(&box.cond)
+}
+
+OutboxWaitResult :: enum { Ready, Stalled, CallerOverflow }
+
+@(private)
+outbox_wait_now :: proc(box: ^ConnOutbox, starting := false) -> time.Tick {
+	when ODIN_TEST {
+		if box.test_wait_clock != nil {
+			return box.test_wait_clock(box, starting, box.test_wait_data)
+		}
+	}
+	return time.tick_now()
+}
+
+@(private)
+outbox_probe_caller :: proc(box: ^ConnOutbox, source: ^ConnHandler) -> (bool, int) {
+	when ODIN_TEST {
+		if box.test_probe != nil {
+			return box.test_probe(source, box.test_wait_data)
+		}
+	}
+	return caller_input_probe(source)
 }
 
 outbox_wait_stream_space :: proc(
@@ -351,48 +429,103 @@ outbox_wait_stream_space :: proc(
 	stream_id: proto.StreamId,
 	needed: int,
 	timeout: time.Duration,
-	source: ^ConnOutbox = nil,
-) -> bool {
+	source: ^ConnHandler = nil,
+) -> OutboxWaitResult {
 	if box == nil {
-		return false
+		return .Stalled
 	}
-	if source != nil {
-		outbox_set_stream_wait(source, true)
+	if source != nil && source.outbox != nil {
+		outbox_set_stream_wait(source.outbox, true)
 	}
-	defer if source != nil {
-		outbox_set_stream_wait(source, false)
+	defer if source != nil && source.outbox != nil {
+		outbox_set_stream_wait(source.outbox, false)
 	}
-	// No-progress semantics: the clock restarts whenever this stream's
-	// queue shrinks, so a slow but steady destination never trips it; only
-	// a stream that drained nothing for timeout is reset (timeout <= 0:
-	// wait while the destination is open).
-	progress_at := time.now()
+	inspect_caller := source != nil && source.role == .Caller && source.conn != nil && cap(source.decoder.buf) > 0
+	probing := false
+	can_probe := inspect_caller
+	previous_timeout: time.Duration
+	defer if probing {
+		_ = trans.connection_set_recv_timeout(source.conn, previous_timeout)
+	}
+	wait_started := time.tick_now()
 	sync.mutex_lock(&box.mutex)
 	defer sync.mutex_unlock(&box.mutex)
+	when ODIN_TEST {
+		if box.test_wait_clock != nil {
+			wait_started = outbox_wait_now(box, starting = true)
+		}
+	}
+	// Destination dequeues and successful caller reads renew separate
+	// clocks. A dequeue that still leaves DATA blocked cannot renew the
+	// caller's budget.
+	progress_at := wait_started
+	caller_read_at := wait_started
+	probe_at := time.tick_add(wait_started, BACKPRESSURE_PING_INTERVAL)
+	retry_ping_at := probe_at
 	last_used := box.stream_bytes[stream_id]
 	for {
 		if box.closed {
-			return false
+			return .Stalled
 		}
 		max_stream := 0
 		if box.server != nil {
 			max_stream = box.server.max_stream_buffer
 		}
+		now := outbox_wait_now(box)
 		used := box.stream_bytes[stream_id]
 		if max_stream <= 0 || used + needed <= max_stream {
-			return true
+			return .Ready
 		}
 		if used < last_used {
-			progress_at = time.now()
+			progress_at = now
 		}
 		last_used = used
+		quiet := time.tick_diff(progress_at, now)
 		slice := OUTBOX_WAIT_SLICE
 		if timeout > 0 {
-			remaining := timeout - time.since(progress_at)
+			remaining := timeout - quiet
 			if remaining <= 0 {
-				return false
+				return .Stalled
 			}
 			slice = min(slice, remaining)
+		}
+		if inspect_caller && source.caller_input.deferred_ping && time.tick_diff(retry_ping_at, now) >= 0 {
+			// A Ping can be left in a full parser while its previous
+			// reply waits for the writer. Check for reclaimed space.
+			sync.mutex_unlock(&box.mutex)
+			if outbox_queued(source.outbox, proto.CONNECTION_STREAM_ID) == 0 {
+				caller_input_take_heartbeats(source)
+				can_probe = true
+			}
+			sync.mutex_lock(&box.mutex)
+			retry_ping_at = time.tick_add(now, OUTBOX_WAIT_SLICE)
+			continue
+		}
+		if inspect_caller && time.tick_diff(caller_read_at, now) >= CALLER_OVERFLOW_WAIT && caller_input_overflow(source, stream_id) {
+			return .CallerOverflow
+		}
+		if can_probe && time.tick_diff(probe_at, now) >= 0 {
+			// The destination writer must be able to drain during this read.
+			sync.mutex_unlock(&box.mutex)
+			if !probing {
+				previous_timeout = source.conn.recv_timeout
+				probing = true
+			}
+			if source.conn.recv_timeout != slice {
+				_ = trans.connection_set_recv_timeout(source.conn, slice)
+			}
+			probed, read_bytes := outbox_probe_caller(box, source)
+			can_probe = probed
+			if read_bytes > 0 {
+				caller_read_at = time.tick_now()
+				when ODIN_TEST {
+					if box.test_wait_clock != nil {
+						caller_read_at = now
+					}
+				}
+			}
+			sync.mutex_lock(&box.mutex)
+			continue
 		}
 		_ = sync.cond_wait_with_timeout(&box.cond, &box.mutex, slice)
 	}
@@ -423,7 +556,7 @@ outbox_writer_proc :: proc(box: ^ConnOutbox) {
 				sync.cond_wait(&box.cond, &box.mutex)
 				continue
 			}
-			// The reader cannot consume the agent's Ping with a DATA frame
+			// The reader cannot consume the peer's Ping with a DATA frame
 			// waiting for space. A broker Ping still proves the path is alive.
 			now := time.tick_now()
 			left := time.tick_diff(now, next_ping)
@@ -463,11 +596,12 @@ outbox_writer_proc :: proc(box: ^ConnOutbox) {
 			delete(frame.payload, allocator)
 		}
 		sync.mutex_lock(&box.mutex)
-		sync.cond_broadcast(&box.cond)
 		failed := terr != .None || perr != .None
 		if failed {
 			box.closed = true
 		}
+		relay_release_cancelled_slot(box.server, frame.release_slot)
+		sync.cond_broadcast(&box.cond)
 		sync.mutex_unlock(&box.mutex)
 		if failed {
 			return
@@ -506,13 +640,14 @@ server_enqueue_frame :: proc(
 	opcode: proto.Opcode,
 	payload: []u8,
 	stream_id: proto.StreamId,
+	origin: Maybe(StreamPeer) = nil,
 ) -> OutboxEnqueueError {
 	box := server_lookup_outbox(server, conn)
 	if box == nil {
 		return .Closed
 	}
 	defer outbox_release(box)
-	return outbox_enqueue(box, opcode, stream_id, payload)
+	return outbox_enqueue(box, opcode, stream_id, payload, origin = origin)
 }
 
 server_enqueue_failure :: proc(
@@ -528,6 +663,39 @@ server_enqueue_failure :: proc(
 	}
 	defer outbox_release(box)
 	return outbox_enqueue_failure(box, opcode, code, stream_id)
+}
+
+// The relay row is already gone. Transfer its admission slot to the
+// terminal frame so a replacement OPEN cannot be sent before it.
+server_enqueue_agent_cancel :: proc(
+	server: ^Server,
+	stream: RelayStream,
+	opcode: proto.Opcode,
+	payload: []u8 = nil,
+	failure: proto.WireError = .None,
+	diagnostic := "",
+) {
+	if stream.open_pending {
+		return
+	}
+	box := server_lookup_outbox(server, stream.agent_conn)
+	if box != nil {
+		defer outbox_release(box)
+		err: OutboxEnqueueError
+		if failure != .None {
+			err = outbox_enqueue_failure(box, opcode, failure, stream.id, diagnostic, stream.agent_session)
+		} else {
+			err = outbox_enqueue(box, opcode, stream.id, payload, stream.agent_session)
+		}
+		if err == .None {
+			return
+		}
+		if err != .Closed {
+			trans.connection_note_close(stream.agent_conn, .InternalError)
+			trans.connection_shutdown_both(stream.agent_conn)
+		}
+	}
+	relay_release_cancelled_slot(server, stream.agent_session)
 }
 
 // Holds the outbox writer so queued frames stay observable. Same package

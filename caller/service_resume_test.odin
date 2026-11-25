@@ -38,6 +38,15 @@ test_caller_receive_deadline_distinguishes_dead_and_idle :: proc(t: ^testing.T) 
 	c.idle_since = time.tick_add(now, -SESSION_IDLE_TIMEOUT)
 	caller_watch_sessions(&c, now)
 	testing.expect_value(t, c.disconnect_reason, LOG_REASON_IDLE)
+
+	c.connected = true
+	c.disconnect_reason = ""
+	c.config.managed_reconnect = true
+	caller_watch_sessions(&c, now)
+	testing.expect(t, c.connected && c.disconnect_reason == "", "a healthy managed session should stay admitted while idle")
+	c.last_recv = time.tick_add(now, -DEAD_PEER_TIMEOUT)
+	caller_watch_sessions(&c, now)
+	testing.expect_value(t, c.disconnect_reason, LOG_REASON_DEAD_PEER)
 }
 
 @(test)

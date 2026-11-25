@@ -2,6 +2,13 @@
 
 Thirp Runtime is the open-source named-Service data plane. Protocol 1.0 is frozen: do not add opcodes, wire fields, or peer-visible error codes.
 
+## Release versions
+
+Clay stamps versions with the Runtime release command. For each fix, add one
+line under `## Unreleased` in CHANGELOG.md. Create the section above the
+first release heading if needed. Leave the version declarations and released
+headings to the release command.
+
 ## Tests
 
 A sleep, a longer grace, a destroy timeout that gives up, or a poll loop that waits out a handshake is not a fix. Unblock the thread or close the right fd.

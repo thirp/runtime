@@ -166,8 +166,11 @@ built_at: $Date
 "@
 Write-Utf8Lf (Join-Path $Out "PROVENANCE.txt") $Provenance
 
+$Unsigned = $env:THIRP_RELEASE_UNSIGNED -eq '1'
 $Pfx = $env:THIRP_WINDOWS_PFX
-if ($Pfx) {
+if ($Unsigned) {
+	Write-Host "release_windows: Authenticode signing skipped in unsigned mode"
+} elseif ($Pfx) {
 	$SignTool = Get-Command signtool -ErrorAction SilentlyContinue
 	if (-not $SignTool) {
 		throw "release_windows: THIRP_WINDOWS_PFX is set but signtool.exe is not on PATH"
@@ -207,31 +210,37 @@ $SumLines = foreach ($name in $SumFiles) {
 }
 Write-Utf8Lf (Join-Path $Out "SHA256SUMS") (($SumLines -join "`n") + "`n")
 
-$GpgKey = $env:THIRP_GPG_KEY
-$PublishFp = "3B8559D8754FB3C5B21110C786897A405CF3D8C4"
-$Gpg = Get-Command gpg -ErrorAction SilentlyContinue
-if (-not $GpgKey -and $Gpg) {
-	# gpg writes "directory ... created" on stderr the first time. $ErrorActionPreference
-	# Stop treats that as fatal even with 2>$null (Windows PowerShell 5.1).
-	cmd /c "gpg --list-secret-keys --with-colons $PublishFp >nul 2>nul"
-	if ($LASTEXITCODE -eq 0) {
-		$GpgKey = $PublishFp
-	}
-}
-if ($GpgKey) {
-	$sec = Join-Path $Root "docs\SECURITY.md"
-	if ((Test-Path $sec) -and -not (Select-String -Path $sec -Pattern $PublishFp -Quiet)) {
-		throw "release_windows: signing fingerprint does not match docs/SECURITY.md"
-	}
-	$sums = Join-Path $Out "SHA256SUMS"
-	& gpg --detach-sign --armor --local-user $GpgKey --output "$sums.asc" $sums
-	if ($LASTEXITCODE -ne 0) {
-		throw "release_windows: gpg sign failed"
-	}
-	& gpg --verify "$sums.asc" $sums
-	Write-Host "release_windows: signed SHA256SUMS with $GpgKey"
+if ($Unsigned) {
+	$signature = Join-Path $Out "SHA256SUMS.asc"
+	if (Test-Path -LiteralPath $signature) { Remove-Item -LiteralPath $signature -Force }
+	Write-Host "release_windows: GPG signing skipped in unsigned mode"
 } else {
-	Write-Host "release_windows: GPG signatures not produced (publish key not in the agent; set THIRP_GPG_KEY)"
+	$GpgKey = $env:THIRP_GPG_KEY
+	$PublishFp = "3B8559D8754FB3C5B21110C786897A405CF3D8C4"
+	$Gpg = Get-Command gpg -ErrorAction SilentlyContinue
+	if (-not $GpgKey -and $Gpg) {
+		# gpg writes "directory ... created" on stderr the first time. $ErrorActionPreference
+		# Stop treats that as fatal even with 2>$null (Windows PowerShell 5.1).
+		cmd /c "gpg --list-secret-keys --with-colons $PublishFp >nul 2>nul"
+		if ($LASTEXITCODE -eq 0) {
+			$GpgKey = $PublishFp
+		}
+	}
+	if ($GpgKey) {
+		$sec = Join-Path $Root "docs\SECURITY.md"
+		if ((Test-Path $sec) -and -not (Select-String -Path $sec -Pattern $PublishFp -Quiet)) {
+			throw "release_windows: signing fingerprint does not match docs/SECURITY.md"
+		}
+		$sums = Join-Path $Out "SHA256SUMS"
+		& gpg --detach-sign --armor --local-user $GpgKey --output "$sums.asc" $sums
+		if ($LASTEXITCODE -ne 0) {
+			throw "release_windows: gpg sign failed"
+		}
+		& gpg --verify "$sums.asc" $sums
+		Write-Host "release_windows: signed SHA256SUMS with $GpgKey"
+	} else {
+		Write-Host "release_windows: GPG signatures not produced (publish key not in the agent; set THIRP_GPG_KEY)"
+	}
 }
 
 function Assert-CliVersion([string]$Bin) {

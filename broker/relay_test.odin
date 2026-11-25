@@ -34,6 +34,130 @@ quiet_test_server :: proc(
 	server.session_timeout = 30 * time.Second
 }
 
+when ODIN_TEST {
+	@(test)
+	test_relay_caller_cancellation_holds_slot_until_reset :: proc(t: ^testing.T) {
+		testing.set_fail_timeout(t, 10 * time.Second)
+		agent_socket, peer, err := trans.test_stream_pair()
+		if !testing.expect_value(t, err, trans.TransportError.None) {
+			return
+		}
+		defer trans.connection_destroy(agent_socket)
+		defer trans.connection_destroy(peer)
+		server: Server
+		server_init(&server, nil, {})
+		defer server_destroy(&server)
+		server.max_streams_per_session = 1
+		session: SessionId = 1
+		relay_bind_agent(&server, session, agent_socket)
+		agent := ConnHandler{server = &server, conn = agent_socket}
+		if !testing.expect(t, conn_start_outbox(&agent), "start agent outbox") {
+			return
+		}
+		defer conn_stop_outbox(&agent)
+		// The cleanup handler owns one reference; keep the other on the stack.
+		socket := trans.Connection{refs = 2, closed = true}
+		caller := ConnHandler{server = &server, conn = &socket, role = .Caller}
+		sid, held, open_err := relay_open_stream(&server, TEST_SERVICE, session, &socket)
+		if !testing.expect_value(t, open_err, RelayOpenError.None) {
+			return
+		}
+		trans.connection_release(held)
+
+		sync.mutex_lock(&agent_socket.write_mutex)
+		socket_held := true
+		defer if socket_held {
+			sync.mutex_unlock(&agent_socket.write_mutex)
+		}
+		payload, payload_err := proto.encode_open({service_id = TEST_SERVICE})
+		defer delete(payload)
+		testing.expect_value(t, payload_err, proto.ProtocolError.None)
+		testing.expect_value(t, outbox_enqueue(agent.outbox, .Open, sid, payload), OutboxEnqueueError.None)
+		start := time.tick_now()
+		open_in_flight := false
+		for !open_in_flight && time.tick_since(start) < 2 * time.Second {
+			open_in_flight = outbox_queued(agent.outbox, sid) == 0
+			if !open_in_flight {
+				time.sleep(time.Millisecond)
+			}
+		}
+		if !testing.expect(t, open_in_flight, "agent writer took OPEN before caller loss") {
+			return
+		}
+		cleanup := thread.create_and_start_with_poly_data(&caller, conn_cleanup)
+		if !testing.expect(t, cleanup != nil, "start caller cleanup") {
+			return
+		}
+		defer {
+			if socket_held {
+				sync.mutex_unlock(&agent_socket.write_mutex)
+				socket_held = false
+			}
+			thread.destroy(cleanup)
+		}
+		start = time.tick_now()
+		for outbox_queued(agent.outbox, sid) == 0 && time.tick_since(start) < 2 * time.Second {
+			time.sleep(time.Millisecond)
+		}
+		if !testing.expect_value(t, outbox_queued(agent.outbox, sid), 1) {
+			return
+		}
+		thread.join(cleanup)
+		_, found := relay_lookup_stream(&server, sid)
+		testing.expect(t, !found, "caller cleanup removed stream ownership")
+		testing.expect_value(t, outbox_queued(agent.outbox, sid), 1)
+		outbox_drop_stream(agent.outbox, sid)
+		testing.expect_value(t, outbox_queued(agent.outbox, sid), 1)
+		next_caller := trans.Connection{refs = 1}
+		new_sid, new_held, admission := relay_open_stream(&server, TEST_SERVICE, session, &next_caller)
+		testing.expect_value(t, admission, RelayOpenError.QuotaExceeded)
+		if admission == .None {
+			trans.connection_release(new_held)
+			relay_drop_stream(&server, new_sid)
+		}
+
+		sync.mutex_unlock(&agent_socket.write_mutex)
+		socket_held = false
+		decoder: proto.FrameDecoder
+		_ = proto.decoder_init(&decoder)
+		defer proto.decoder_destroy(&decoder)
+		open_frame := must_read_opcode(t, peer, &decoder, .Open)
+		defer proto.frame_destroy(&open_frame)
+		reset_frame := must_read_opcode(t, peer, &decoder, .Reset)
+		defer proto.frame_destroy(&reset_frame)
+		testing.expect_value(t, open_frame.header.stream_id, sid)
+		testing.expect_value(t, reset_frame.header.stream_id, sid)
+		start = time.tick_now()
+		for {
+			new_sid, new_held, admission = relay_open_stream(&server, TEST_SERVICE, session, &next_caller)
+			if admission != .QuotaExceeded || time.tick_since(start) >= 2 * time.Second {
+				break
+			}
+			time.sleep(time.Millisecond)
+		}
+		if !testing.expect_value(t, admission, RelayOpenError.None) {
+			return
+		}
+		trans.connection_release(new_held)
+		defer relay_drop_stream(&server, new_sid)
+
+		// An explicit cancellation also retains admission while queued.
+		outbox_set_writer_hold(agent.outbox, true)
+		testing.expect_value(t, outbox_enqueue(agent.outbox, .Open, new_sid, payload), OutboxEnqueueError.None)
+		next_handler := ConnHandler{server = &server, conn = &next_caller, role = .Caller}
+		_ = conn_handle_stream_frame(&next_handler, {header = {opcode = .Close, stream_id = new_sid}})
+		_, found = relay_lookup_stream(&server, new_sid)
+		testing.expect(t, !found)
+		testing.expect_value(t, outbox_queued(agent.outbox, new_sid), 1)
+		third, third_held, third_err := relay_open_stream(&server, TEST_SERVICE, session, &next_caller)
+		testing.expect_value(t, third_err, RelayOpenError.QuotaExceeded)
+		if third_err == .None {
+			trans.connection_release(third_held)
+			relay_drop_stream(&server, third)
+		}
+	}
+}
+
 register_test_agent :: proc(
 	t: ^testing.T,
 	server: ^Server,
@@ -318,17 +442,16 @@ test_relay_agent_disconnect_resets_stream_and_drops_registration :: proc(t: ^tes
 	testing.expect_value(t, service_count(&reg), 0)
 }
 
-// Caller DATA is stuck because the agent outbox is not draining, so the
-// broker caller thread sits in outbox_wait and stops reading. Killing the
-// agent session must unblock that write and deliver RESET. A write that
-// is still stuck after the session is gone is the caller wedge: this
-// broker never came back to read, so a later CONNECT stays in the kernel.
+// Agent DATA is stuck because the caller outbox is not draining, so the
+// broker agent thread sits in outbox_wait and stops reading. Killing the
+// caller session must unblock that write and deliver RESET. A write that
+// is still stuck after the session is gone is a wedge on the agent session.
 BLOCKED_CHUNK :: 4 * 1024
 
-blocked_caller_reads: int // atomic, incremented by the broker-side caller socket's read hook
+blocked_agent_reads: int // atomic, incremented by the broker-side agent socket's read hook
 
-count_blocked_caller_read :: proc(_: ^trans.Connection) {
-	sync.atomic_add(&blocked_caller_reads, 1)
+count_blocked_agent_read :: proc(_: ^trans.Connection) {
+	sync.atomic_add(&blocked_agent_reads, 1)
 }
 
 BlockedWrite :: struct {
@@ -354,58 +477,58 @@ blocked_write_proc :: proc(w: ^BlockedWrite) {
 }
 
 @(test)
-test_blocked_caller_write_unblocks_when_agent_session_dies :: proc(t: ^testing.T) {
+test_blocked_agent_write_unblocks_when_caller_session_dies :: proc(t: ^testing.T) {
 	reg: Registry
 	store: auth.StaticTokenAuth
 	server: Server
 	quiet_test_server(t, &server, &reg, &store)
 	defer stop_test_server(&server, &store, &reg)
 	// One chunk fills the stream. The next DATA frame is read and then the
-	// caller thread waits; further frames sit in the kernel until it reads.
+	// agent thread waits; further frames sit in the kernel until it reads.
 	server.max_stream_buffer = BLOCKED_CHUNK
 
 	agent, agent_dec := register_test_agent(t, &server)
-	agent_open := true
-	defer if agent_open {
-		trans.connection_destroy(agent)
-	}
+	defer trans.connection_destroy(agent)
 	defer proto.decoder_destroy(&agent_dec)
 
 	caller := dial_server(t, &server)
-	defer trans.connection_destroy(caller)
+	caller_open := true
+	defer if caller_open {
+		trans.connection_destroy(caller)
+	}
 	caller_dec: proto.FrameDecoder
 	handshake_caller(t, caller, &caller_dec)
 	defer proto.decoder_destroy(&caller_dec)
 
 	sid := open_test_stream(t, agent, &agent_dec, caller, &caller_dec)
-	broker_caller, stream, found := relay_acquire_peer(&server, sid, .Caller)
+	broker_agent, stream, found := relay_acquire_peer(&server, sid, .Agent)
 	testing.expect(t, found, "stream")
 	if !found {
 		return
 	}
-	defer trans.connection_release(broker_caller)
-	box := server_lookup_outbox(&server, stream.agent_conn)
-	testing.expect(t, box != nil, "agent outbox")
+	defer trans.connection_release(broker_agent)
+	box := server_lookup_outbox(&server, stream.caller_conn)
+	testing.expect(t, box != nil, "caller outbox")
 	if box == nil {
 		return
 	}
 	defer outbox_release(box)
 	outbox_set_writer_hold(box, true)
 	defer outbox_set_writer_hold(box, false)
-	sync.atomic_store(&blocked_caller_reads, 0)
-	sync.atomic_store(&broker_caller.read_hook, rawptr(count_blocked_caller_read))
-	defer sync.atomic_store(&broker_caller.read_hook, nil)
+	sync.atomic_store(&blocked_agent_reads, 0)
+	sync.atomic_store(&broker_agent.read_hook, rawptr(count_blocked_agent_read))
+	defer sync.atomic_store(&broker_agent.read_hook, nil)
 
 	w := BlockedWrite {
-		conn = caller,
+		conn = agent,
 		stream_id = sid,
 	}
 	// Use the default TCP buffer. An explicit small SO_SNDBUF on Winsock
 	// loopback let writes keep completing with the broker reader stalled.
 	// Backstop so a real wedge fails the assertion instead of hanging the
 	// process. The pass condition is the write finishing within 1s of the
-	// agent session dying, not this timeout.
-	_ = trans.connection_set_send_timeout(caller, 8 * time.Second)
+	// caller session dying, not this timeout.
+	_ = trans.connection_set_send_timeout(agent, 8 * time.Second)
 	th := thread.create_and_start_with_poly_data(&w, blocked_write_proc)
 	testing.expect(t, th != nil, "writer thread")
 	if th == nil {
@@ -414,7 +537,7 @@ test_blocked_caller_write_unblocks_when_agent_session_dies :: proc(t: ^testing.T
 	defer {
 		sync.atomic_store(&w.stop, true)
 		if !sync.atomic_load(&w.done) {
-			trans.connection_close(caller)
+			trans.connection_close(agent)
 		}
 		thread.join(th)
 		thread.destroy(th)
@@ -429,7 +552,7 @@ test_blocked_caller_write_unblocks_when_agent_session_dies :: proc(t: ^testing.T
 			break
 		}
 		sent := sync.atomic_load(&w.sent)
-		reads := sync.atomic_load(&blocked_caller_reads)
+		reads := sync.atomic_load(&blocked_agent_reads)
 		if sent != last_sent || reads != last_reads || outbox_queued(box, sid) == 0 {
 			last_sent = sent
 			last_reads = reads
@@ -448,17 +571,17 @@ test_blocked_caller_write_unblocks_when_agent_session_dies :: proc(t: ^testing.T
 			sync.atomic_load(&w.done),
 			sync.atomic_load(&w.sent),
 			outbox_queued(box, sid),
-			sync.atomic_load(&blocked_caller_reads),
+			sync.atomic_load(&blocked_agent_reads),
 		)
 		return
 	}
 	fmt.printfln("backpressure: sent=%d queued=%d broker_reads=%d (unchanged during stall)", last_sent, outbox_queued(box, sid), last_reads)
 
 	// Send until actual backpressure, regardless of how much this host's
-	// loopback buffers. Agent loss only has to finish the write in flight.
+	// loopback buffers. Caller loss only has to finish the write in flight.
 	sync.atomic_store(&w.stop, true)
-	trans.connection_destroy(agent)
-	agent_open = false
+	trans.connection_destroy(caller)
+	caller_open = false
 
 	deadline := time.now()
 	for !sync.atomic_load(&w.done) {
@@ -467,27 +590,28 @@ test_blocked_caller_write_unblocks_when_agent_session_dies :: proc(t: ^testing.T
 		}
 		time.sleep(5 * time.Millisecond)
 	}
-	if !testing.expect(t, sync.atomic_load(&w.done), "caller DATA write still blocked after agent session died") {
+	if !testing.expect(t, sync.atomic_load(&w.done), "agent DATA write still blocked after caller session died") {
 		return
 	}
 	testing.expect_value(t, w.terr, trans.TransportError.None)
 	testing.expect_value(t, w.perr, proto.ProtocolError.None)
-	testing.expect(t, sync.atomic_load(&w.sent) > last_sent, "the blocked write made no progress after agent loss")
-	testing.expect(t, sync.atomic_load(&blocked_caller_reads) > last_reads, "the broker did not resume reading after agent loss")
+	testing.expect(t, sync.atomic_load(&w.sent) > last_sent, "the blocked write made no progress after caller loss")
+	testing.expect(t, sync.atomic_load(&blocked_agent_reads) > last_reads, "the broker did not resume reading after caller loss")
 
-	// Closing the agent outbox fails the caller thread's outbox_wait, which
-	// resets InternalError, unless cleanup already sent AgentUnavailable.
-	// Either code means the DATA write finished and the broker read again.
-	_ = trans.connection_set_recv_timeout(caller, 1 * time.Second)
-	reset := must_read_opcode(t, caller, &caller_dec, .Reset)
-	code := read_wire_failure(t, reset)
-	proto.frame_destroy(&reset)
-	testing.expectf(
-		t,
-		code == .InternalError || code == .AgentUnavailable,
-		"blocked write reset %v",
-		code,
-	)
+	// Pings and resets for buffered DATA can race with the cleanup RESET.
+	_ = trans.connection_set_recv_timeout(agent, 1 * time.Second)
+	got_reset := false
+	reset_start := time.tick_now()
+	for !got_reset && time.tick_since(reset_start) < time.Second {
+		frame, err, perr := trans.read_frame(agent, &agent_dec)
+		if err != .None || perr != .None {
+			break
+		}
+		got_reset = frame.header.opcode == .Reset && frame.header.stream_id == sid &&
+			read_wire_failure(t, frame) == .InternalError
+		proto.frame_destroy(&frame)
+	}
+	testing.expect(t, got_reset, "agent did not receive the caller-loss RESET")
 }
 
 @(test)
@@ -730,6 +854,20 @@ test_relay_caller_close_is_delivered_to_agent :: proc(t: ^testing.T) {
 		break
 	}
 	testing.expect(t, got_close)
+
+	// The agent's outbox can deliver CLOSE before the caller handler
+	// removes the relay. A matching PONG on the caller connection confirms
+	// that the same handler has finished processing CLOSE.
+	nonce :: u64(7)
+	ping, ping_err := proto.encode_ping({nonce = nonce})
+	testing.expect_value(t, ping_err, proto.ProtocolError.None)
+	defer delete(ping)
+	must_write_opcode(t, caller, .Ping, ping)
+	pong_frame := must_read_opcode(t, caller, &caller_dec, .Pong)
+	defer proto.frame_destroy(&pong_frame)
+	pong, pong_err := proto.decode_pong(pong_frame.payload)
+	testing.expect_value(t, pong_err, proto.ProtocolError.None)
+	testing.expect_value(t, pong.nonce, nonce)
 	testing.expect_value(t, metrics_snapshot(&server).active_relay_streams, 0)
 }
 

@@ -175,18 +175,6 @@ enrollment_test_network_case :: proc(t: ^testing.T, dropped_requests := false) {
 	f.e.http, f.e.new_caller, f.e.destroy_caller = nil, nil, nil
 	delete(f.e.links)
 	f.e.links = make([]EnrollmentLink, 2)
-	defer {
-		for &l in f.e.links {sync.atomic_store(&l.stop, true)}
-		for &l in f.e.links {
-			if l.accept_th != nil {thread.join(l.accept_th); thread.destroy(l.accept_th)}
-			if l.job != nil {
-				thread.join(l.job.th); thread.destroy(l.job.th)
-				if l.job.caller != nil {l.job.caller.force = true; append(&l.retired, l.job.caller)}
-				free(l.job); l.job = nil
-			}
-			if l.opened {trans.listener_close(&l.ln)}
-		}
-	}
 	for &l, i in f.e.links {
 		l.cfg, l.stall = f.cfg.links[i], time.Second
 		var_err: trans.TransportError
@@ -316,7 +304,7 @@ test_enrollment_caller_conf_unauthorized_api_closes_local :: proc(t: ^testing.T)
 
 @(test)
 test_enrollment_caller_conf_unauthorized_broker_closes_local :: proc(t: ^testing.T) {
-	enrollment_failure_network_case(t, .Unauthorized_Broker, `"reason":"unauthorized_or_revoked","phase":"handshake"`)
+	enrollment_failure_network_case(t, .Unauthorized_Broker, `"reason":"unauthorized_or_revoked","phase":"authenticate"`)
 }
 
 @(test)

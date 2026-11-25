@@ -2,6 +2,16 @@
 
 Project version is independent of the wire protocol version. This tree speaks protocol 1.0. See [COMPATIBILITY.md](COMPATIBILITY.md).
 
+## Unreleased
+
+## 0.16.15 - 2026-11-25
+
+- `thirp-connect --caller-conf` replaces a caller session that has lost broker admission: it retires the session, mints a fresh credential and reconnects, so a host pause longer than the credential lifetime no longer leaves the caller retrying a rejected token. A credential that expires during an in-flight Authenticate now starts a fresh setup instead of waiting in approval backoff. Reconnect setup no longer waits on a retired session's writer (caller-resume-redial-r2).
+
+## 0.16.14 - 2026-11-24
+
+- When a destination stays full and the caller cannot read ahead, the broker resets only the stalled stream and keeps the caller session. A dial whose grant is revoked before OPEN frees its agent slot and gets one reply. Caller and agent watchdogs no longer drop live sessions during partial drains or blocked writes (#51).
+
 ## 0.16.13
 
 - `thirp-connect --caller-conf` logs setup failures to stderr and closes local connections while no broker session is ready (#45).

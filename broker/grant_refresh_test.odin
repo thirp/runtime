@@ -176,3 +176,95 @@ test_grant_refresh_expiry_and_revoke_reset_queues :: proc(t: ^testing.T) {
 	testing.expect_value(t, caller.refs, 1)
 	testing.expect_value(t, agent.refs, 1)
 }
+
+when ODIN_TEST {
+	@(test)
+	test_grant_revoked_before_open_enqueue_replies_once :: proc(t: ^testing.T) {
+		socket, peer, err := trans.test_stream_pair()
+		if !testing.expect_value(t, err, trans.TransportError.None) {
+			return
+		}
+		defer trans.connection_destroy(socket)
+		defer trans.connection_destroy(peer)
+		server: Server
+		server_init(&server, nil, {})
+		defer server_destroy(&server)
+		server.max_streams_per_session = 1
+		caller := ConnHandler{server = &server, conn = socket, role = .Caller}
+		if !testing.expect(t, conn_start_outbox(&caller), "start caller outbox") {
+			return
+		}
+		defer conn_stop_outbox(&caller)
+		outbox_set_writer_hold(caller.outbox, true)
+
+		agent := trans.Connection{refs = 1}
+		agent_box := new(ConnOutbox)
+		outbox_init(agent_box, &agent, &server)
+		defer outbox_release(agent_box)
+		server_register_outbox(&server, &agent, agent_box)
+		session: SessionId = 1
+		relay_bind_agent(&server, session, &agent)
+
+		// Interleave revocation between the two stages of CONNECT. Hold
+		// its queued reply so a second synchronous failure would come first.
+		sid, held, open_err := relay_open_stream(&server, TEST_SERVICE, session, socket, {access_grant_id = GRANT_A}, &caller)
+		if !testing.expect_value(t, open_err, RelayOpenError.None) {
+			return
+		}
+		defer trans.connection_release(held)
+		server_reset_grant(&server, GRANT_A)
+		conn_queue_open(&caller, held, sid, TEST_SERVICE)
+		testing.expect_value(t, outbox_queued(agent_box, sid), 0)
+		outbox_set_writer_hold(caller.outbox, false)
+
+		decoder: proto.FrameDecoder
+		_ = proto.decoder_init(&decoder)
+		defer proto.decoder_destroy(&decoder)
+		reply := must_read_opcode(t, peer, &decoder, .ConnectFailed)
+		defer proto.frame_destroy(&reply)
+		testing.expect_value(t, read_wire_failure(t, reply), proto.WireError.Unauthorized)
+
+		// The agent writer is still held. The next dial must claim the
+		// only slot without waiting for the writer to send anything.
+		next_sid, next_held, next_err := relay_open_stream(&server, TEST_SERVICE, session, socket, {access_grant_id = GRANT_B}, &caller)
+		if !testing.expect_value(t, next_err, RelayOpenError.None) {
+			return
+		}
+		defer trans.connection_release(next_held)
+		conn_queue_open(&caller, next_held, next_sid, TEST_SERVICE)
+		open, queued := outbox_take_next(agent_box)
+		if !testing.expect(t, queued, "the next dial queued OPEN") {
+			return
+		}
+		defer delete(open.payload, agent_box.allocator)
+		testing.expect_value(t, open.opcode, proto.Opcode.Open)
+		testing.expect_value(t, open.stream_id, next_sid)
+		agent_handler := ConnHandler{server = &server, conn = &agent, role = .Agent}
+		_ = conn_handle_open_ok(&agent_handler, {header = {opcode = .OpenOk, stream_id = next_sid}})
+		next := must_read_opcode(t, peer, &decoder, .ConnectOk)
+		defer proto.frame_destroy(&next)
+		testing.expect_value(t, next.header.stream_id, next_sid)
+		relay_drop_stream(&server, next_sid)
+
+		// An unavailable agent still gets one failure if the CONNECT
+		// handler itself owns the pending relay.
+		outbox_close(agent_box)
+		failed_sid, failed_held, failed_err := relay_open_stream(&server, TEST_SERVICE, session, socket)
+		if !testing.expect_value(t, failed_err, RelayOpenError.None) {
+			return
+		}
+		defer trans.connection_release(failed_held)
+		conn_queue_open(&caller, failed_held, failed_sid, TEST_SERVICE)
+		failed := must_read_opcode(t, peer, &decoder, .ConnectFailed)
+		defer proto.frame_destroy(&failed)
+		testing.expect_value(t, read_wire_failure(t, failed), proto.WireError.AgentUnavailable)
+		testing.expect_value(t, relay_stream_count(&server), 0)
+
+		pong, pong_err := proto.encode_pong({nonce = 1})
+		defer delete(pong)
+		testing.expect_value(t, pong_err, proto.ProtocolError.None)
+		testing.expect(t, conn_write_payload(&caller, .Pong, pong), "send marker after the two replies")
+		marker := must_read_opcode(t, peer, &decoder, .Pong)
+		defer proto.frame_destroy(&marker)
+	}
+}

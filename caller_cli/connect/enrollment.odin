@@ -73,6 +73,12 @@ enrollment_call :: proc(e: ^Enrollment, method, suffix: string, body := "") -> (
 		reason := r.failure
 		if reason == "" {reason = err == .Config ? "configuration" : "invalid_response"}
 		enrollment_failure(e, "api", reason)
+		if err == .Retry {
+			switch reason {
+			case "dns", "connect", "timeout", "tls_handshake", "http_io":
+				return {}, .Unavailable
+			}
+		}
 		return {}, err
 	}
 	if r.status == ENROLLMENT_STATUS_UNAUTHORIZED || r.status == ENROLLMENT_STATUS_FORBIDDEN {
@@ -83,6 +89,7 @@ enrollment_call :: proc(e: ^Enrollment, method, suffix: string, body := "") -> (
 	if method == ENROLLMENT_POST && (suffix == ENROLLMENT_REQUESTS || strings.has_suffix(suffix, ENROLLMENT_CREDENTIALS)) {expected = ENROLLMENT_STATUS_CREATED}
 	if r.status != expected {
 		enrollment_failure(e, "api", "http_status", status = fmt.tprintf("%d", r.status))
+		if r.status == 408 || r.status == 429 || r.status >= 500 {return {}, .Unavailable}
 		return {}, .Retry
 	}
 	v, jerr := json.parse(r.body, .JSON)

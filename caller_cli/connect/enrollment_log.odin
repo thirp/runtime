@@ -33,7 +33,11 @@ enrollment_failure :: proc(e: ^Enrollment, source, reason: string, service := ""
 
 enrollment_broker_failure :: proc(user: rawptr, phase, reason: string) {
 	run := (^Run)(user)
-	enrollment_failure(run.enrollment, "broker", reason, run.catalog_service, phase = phase)
+	enrollment_setup_failure(run.enrollment, run.catalog_service, phase, reason)
+}
+
+enrollment_setup_failure :: proc(e: ^Enrollment, service, phase, reason: string, at: time.Tick = {}) {
+	enrollment_failure(e, "broker", reason, service, phase = phase, at = at)
 }
 
 enrollment_stream_failure :: proc(run: ^Run, err: cl.CallerError) {

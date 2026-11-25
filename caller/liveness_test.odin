@@ -340,14 +340,14 @@ test_blackhole_failed_dial_drops_session :: proc(t: ^testing.T) {
 	sid := must_service(t, TEST_SERVICE)
 	gen := caller_conn_gen(&c)
 	byte_proxy_blackhole(&proxy)
-	start := time.now()
+	start := time.tick_now()
 	miss, merr := dial(&c, sid)
 	testing.expect_value(t, merr, CallerError.Timeout)
 	if miss != nil {
 		conn_destroy(miss)
 	}
 	dropped := false
-	for time.since(start) < 50 * time.Second {
+	for time.tick_since(start) < 50 * time.Second {
 		if caller_conn_gen(&c) != gen {
 			dropped = true
 			break
@@ -355,17 +355,15 @@ test_blackhole_failed_dial_drops_session :: proc(t: ^testing.T) {
 		time.sleep(20 * time.Millisecond)
 	}
 	testing.expect(t, dropped, "failed dial left the blackholed session up")
-	testing.expect(t, time.since(start) <= 50 * time.Second, "failed dial was not detected within 50s")
-	reason := caller_last_disconnect_reason(&c)
-	testing.expect(
-		t,
-		reason == LOG_REASON_DEAD_PEER,
-		"disconnect reason was not dead_peer",
-	)
-
-	for !caller_is_connected(&c) && time.since(start) < 60 * time.Second {
-		time.sleep(20 * time.Millisecond)
+	testing.expect(t, time.tick_since(start) <= 50 * time.Second, "failed dial was not detected within 50s")
+	// The reader changes the generation before recording the old session's
+	// reason. It records the reason before admitting the replacement.
+	if !testing.expect(t, resume_wait_connected(&c, gen, time.tick_add(start, 60 * time.Second)),
+		"caller did not reconnect after the blackhole") {
+		return
 	}
+	testing.expect_value(t, caller_last_disconnect_reason(&c), LOG_REASON_DEAD_PEER)
+
 	c.config.dial_timeout = 5 * time.Second
 	again, aerr := dial(&c, sid)
 	testing.expect_value(t, aerr, CallerError.None)

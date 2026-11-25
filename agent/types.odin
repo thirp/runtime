@@ -14,6 +14,12 @@ when ODIN_TEST {
 		recent_frame:   bool,
 		fault_observed: bool,
 	}
+	WatchdogTestClock :: struct {
+		elapsed:   i64, // atomic nanoseconds
+		wake:      sync.Sema,
+		checked:   sync.Sema,
+		ping_read: sync.Sema,
+	}
 
 	Agent_Test_Config :: struct {
 		test_local_dial:           proc(net.Endpoint, time.Duration) -> (^trans.Connection, trans.TransportError),
@@ -24,6 +30,7 @@ when ODIN_TEST {
 		test_dead_peer_timeout:   time.Duration,
 		test_data_write_started:  ^sync.Sema,
 		test_read_idle_timeout:   time.Duration,
+		test_watchdog_clock:     ^WatchdogTestClock,
 	}
 } else {
 	Agent_Test_Config :: struct {}

@@ -5,8 +5,8 @@ import "core:time"
 MAX_IDENTITY_LEN :: 128
 DEFAULT_MAX_REGISTRATIONS_PER_SESSION :: 32
 DEFAULT_MAX_STREAM_BUFFER :: 256 * 1024
-// A stream whose destination queue is full is reset only after it drained
-// nothing for this long. A slow but steady destination is never reset.
+// Time without destination drain before the broker resets a full stream.
+// Actual caller input overflow has a separate session-protection path.
 DEFAULT_STREAM_STALL_TIMEOUT :: 30 * time.Second
 // Keep the source session alive while its reader waits for a slow caller.
 BACKPRESSURE_PING_INTERVAL :: 2 * time.Second

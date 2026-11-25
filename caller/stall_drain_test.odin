@@ -2,12 +2,13 @@ package caller
 
 import ag "../agent"
 import brk "../broker"
+import trans "../transport"
 import "core:sync"
 import "core:testing"
 import "core:thread"
 import "core:time"
 
-// Upload on a retired stream into an agent that has stopped reading.
+// Upload on a retired stream whose broker socket has stopped reading.
 // The shared writer blocks on that drain socket. The stall timer must
 // shut the drain down and leave the live session up, so a healthy
 // service dials within its own timeout.
@@ -91,8 +92,13 @@ test_retired_drain_stall_does_not_drop_live_session :: proc(t: ^testing.T) {
 	}
 	up: StallUp
 	uth: ^thread.Thread
+	retired_socket: ^trans.Connection
 	defer {
 		brk.outbox_set_writer_hold(box, false)
+		if retired_socket != nil {
+			release_broker_caller_reader(retired_socket)
+			trans.connection_release(retired_socket)
+		}
 		if uth != nil {
 			sync.atomic_store(&up.stop, true)
 			conn_close(s1)
@@ -145,6 +151,11 @@ test_retired_drain_stall_does_not_drop_live_session :: proc(t: ^testing.T) {
 		return
 	}
 
+	retired_socket = hold_broker_caller_reader(&fx.server, s1.stream_id)
+	if !testing.expect(t, retired_socket != nil, "broker-side retired caller socket") {
+		return
+	}
+	brk.outbox_set_writer_hold(box, false)
 	up.conn = s1
 	uth = thread.create_and_start_with_poly_data(&up, stall_up_proc)
 	testing.expect(t, uth != nil, "upload thread")
@@ -152,15 +163,22 @@ test_retired_drain_stall_does_not_drop_live_session :: proc(t: ^testing.T) {
 		return
 	}
 	last := -1
+	blocked := false
 	for i := 0; i < 100; i += 1 {
 		time.sleep(100 * time.Millisecond)
+		if sync.atomic_load(&up.done) {
+			break
+		}
 		n := sync.atomic_load(&up.sent)
 		if n == last && n > 0 {
+			blocked = true
 			break
 		}
 		last = n
 	}
-	testing.expect(t, sync.atomic_load(&up.sent) > 0, "retired upload never sent")
+	if !testing.expect(t, blocked, "retired upload did not block in a socket write") {
+		return
+	}
 
 	// Above the 3s stall, under TCP_USER_TIMEOUT (20s). A stall that shuts
 	// the live session leaves this dial blocked on the retired socket until

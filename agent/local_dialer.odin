@@ -3,6 +3,7 @@ package agent
 import proto "../protocol"
 import trans "../transport"
 import log "../logging"
+import "core:container/queue"
 import "core:fmt"
 import "core:net"
 import "core:sync"
@@ -14,7 +15,9 @@ agent_write_failure :: proc(
 	opcode: proto.Opcode,
 	code: proto.WireError,
 	stream_id: proto.StreamId,
-) -> bool {
+	guard: proc(rawptr) -> bool = nil,
+	guard_data: rawptr = nil,
+) -> trans.CloseCause {
 	payload, err := proto.encode_wire_failure(
 		proto.WireFailure {
 			code       = proto.wire_error_to_u16(code),
@@ -22,10 +25,17 @@ agent_write_failure :: proc(
 		},
 	)
 	if err != .None {
-		return false
+		return .InternalError
 	}
 	defer delete(payload)
-	return agent_write(conn, opcode, payload, stream_id)
+	terr, perr := trans.write_frame(conn, opcode, payload, stream_id, guard = guard, guard_data = guard_data)
+	if perr != .None {
+		return .InternalError
+	}
+	if terr != .None {
+		return trans.connection_close_cause(conn, .NetworkError)
+	}
+	return .None
 }
 
 agent_take_stream :: proc(relay: ^AgentRelay, stream_id: proto.StreamId) -> (AgentLocalStream, bool) {
@@ -46,6 +56,11 @@ agent_finish_stream :: proc(relay: ^AgentRelay, stream_id: proto.StreamId) {
 		return
 	}
 	agent_drop_stream(stream)
+}
+
+agent_handle_terminal :: proc(relay: ^AgentRelay, stream_id: proto.StreamId, control: ^AgentControlWriter) {
+	agent_control_cancel(control, stream_id)
+	agent_finish_stream(relay, stream_id)
 }
 
 // Frees what a taken stream owned: stops its writer (queued bytes are
@@ -83,12 +98,13 @@ agent_reset_owned_stream :: proc(
 	relay: ^AgentRelay,
 	stream_id: proto.StreamId,
 	code: proto.WireError,
+	control: ^AgentControlWriter = nil,
 ) {
 	stream, found := agent_take_stream(relay, stream_id)
 	if !found {
 		return
 	}
-	_ = agent_write_failure(relay.broker, .Reset, code, stream_id)
+	agent_relay_write_failure(relay.broker, control, .Reset, code, stream_id)
 	agent_drop_stream(stream)
 }
 
@@ -213,10 +229,11 @@ agent_pump_local :: proc(arg: ^AgentPumpArg) {
 	}
 }
 
-agent_handle_open :: proc(relay: ^AgentRelay, frame: proto.Frame) {
+agent_handle_open :: proc(relay: ^AgentRelay, frame: proto.Frame, control: ^AgentControlWriter = nil) {
 	if sync.atomic_load(&relay.agent.stop) {
-		_ = agent_write_failure(
+		agent_relay_write_failure(
 			relay.broker,
+			control,
 			.OpenFailed,
 			.AgentUnavailable,
 			frame.header.stream_id,
@@ -225,8 +242,9 @@ agent_handle_open :: proc(relay: ^AgentRelay, frame: proto.Frame) {
 	}
 	msg, err := proto.decode_open(frame.payload)
 	if err != .None {
-		_ = agent_write_failure(
+		agent_relay_write_failure(
 			relay.broker,
+			control,
 			.OpenFailed,
 			.ProtocolError,
 			frame.header.stream_id,
@@ -236,8 +254,9 @@ agent_handle_open :: proc(relay: ^AgentRelay, frame: proto.Frame) {
 	target, found_target := agent_lookup_target(relay.agent, msg.service_id)
 	delete(string(msg.service_id))
 	if !found_target {
-		_ = agent_write_failure(
+		agent_relay_write_failure(
 			relay.broker,
+			control,
 			.OpenFailed,
 			.LocalServiceUnavailable,
 			frame.header.stream_id,
@@ -259,12 +278,13 @@ agent_handle_open :: proc(relay: ^AgentRelay, frame: proto.Frame) {
 		if relay.agent != nil {
 			agent_log(relay.agent, .Warn, "open_refused", log.LogFields{stream_id = u64(stream_id), reason = "stream_limit"})
 		}
-		_ = agent_write_failure(relay.broker, .OpenFailed, .QuotaExceeded, stream_id)
+		agent_relay_write_failure(relay.broker, control, .OpenFailed, .QuotaExceeded, stream_id)
 		return
 	}
 	if exists {
-		_ = agent_write_failure(
+		agent_relay_write_failure(
 			relay.broker,
+			control,
 			.OpenFailed,
 			.StreamAlreadyExists,
 			stream_id,
@@ -275,8 +295,9 @@ agent_handle_open :: proc(relay: ^AgentRelay, frame: proto.Frame) {
 	arg, aerr := new(AgentOpenArg)
 	if aerr != .None {
 		sync.atomic_sub(&relay.opening, 1)
-		_ = agent_write_failure(
+		agent_relay_write_failure(
 			relay.broker,
+			control,
 			.OpenFailed,
 			.InternalError,
 			stream_id,
@@ -545,14 +566,14 @@ agent_largest_stream :: proc(relay: ^AgentRelay) -> (proto.StreamId, bool) {
 	return best, best_bytes > 0
 }
 
-agent_reset_for_limit :: proc(relay: ^AgentRelay, stream_id: proto.StreamId, reason: string) {
+agent_reset_for_limit :: proc(relay: ^AgentRelay, stream_id: proto.StreamId, reason: string, control: ^AgentControlWriter) {
 	if relay.agent != nil {
 		agent_log(relay.agent, .Warn, "stream_reset", log.LogFields{stream_id = u64(stream_id), reason = reason})
 	}
-	agent_reset_owned_stream(relay, stream_id, .InternalError)
+	agent_reset_owned_stream(relay, stream_id, .InternalError, control)
 }
 
-agent_handle_data :: proc(relay: ^AgentRelay, frame: proto.Frame) {
+agent_handle_data :: proc(relay: ^AgentRelay, frame: proto.Frame, control: ^AgentControlWriter = nil) {
 	sid := frame.header.stream_id
 	if tx, _ := agent_lookup_tx(relay, sid); tx != nil {
 		defer agent_tx_release(tx)
@@ -563,7 +584,7 @@ agent_handle_data :: proc(relay: ^AgentRelay, frame: proto.Frame) {
 			// Make room by resetting the biggest backlog; if that was not
 			// this stream and there is still no room, reset this one.
 			if big, ok := agent_largest_stream(relay); ok {
-				agent_reset_for_limit(relay, big, "agent_buffer_full")
+				agent_reset_for_limit(relay, big, "agent_buffer_full", control)
 				if big != sid {
 					res = agent_tx_enqueue(tx, frame.payload, stream_cap, agent_cap)
 				} else {
@@ -574,11 +595,11 @@ agent_handle_data :: proc(relay: ^AgentRelay, frame: proto.Frame) {
 		switch res {
 		case .Queued, .Dropped:
 		case .StreamFull:
-			agent_reset_for_limit(relay, sid, "stream_buffer_full")
+			agent_reset_for_limit(relay, sid, "stream_buffer_full", control)
 		case .AgentFull:
-			agent_reset_for_limit(relay, sid, "agent_buffer_full")
+			agent_reset_for_limit(relay, sid, "agent_buffer_full", control)
 		case .NoMemory:
-			agent_reset_for_limit(relay, sid, "out_of_memory")
+			agent_reset_for_limit(relay, sid, "out_of_memory", control)
 		}
 		agent_note_buffered(relay)
 		return
@@ -594,7 +615,7 @@ agent_handle_data :: proc(relay: ^AgentRelay, frame: proto.Frame) {
 		werr := trans.connection_write(local, frame.payload)
 		trans.connection_release(local)
 		if werr != .None {
-			agent_reset_owned_stream(relay, frame.header.stream_id, .InternalError)
+			agent_reset_owned_stream(relay, frame.header.stream_id, .InternalError, control)
 		}
 	}
 }
@@ -700,9 +721,27 @@ AgentKeepalive :: struct {
 	dead_at:      time.Time,
 }
 
+agent_keepalive_now :: proc(agent: ^Agent) -> time.Tick {
+	when ODIN_TEST {
+		if clock := agent.config.test_watchdog_clock; clock != nil {
+			return time.tick_add({}, time.Duration(sync.atomic_load(&clock.elapsed)))
+		}
+	}
+	return time.tick_now()
+}
+
+agent_keepalive_wake :: proc(ka: ^AgentKeepalive) -> ^sync.Sema {
+	when ODIN_TEST {
+		if clock := ka.relay.agent.config.test_watchdog_clock; clock != nil {
+			return &clock.wake
+		}
+	}
+	return &ka.wake
+}
+
 agent_keepalive_stop :: proc(ka: ^AgentKeepalive) {
 	sync.atomic_store(&ka.stopping, true)
-	sync.sema_post(&ka.wake)
+	sync.sema_post(agent_keepalive_wake(ka))
 }
 
 agent_keepalive_reply :: proc(ka: ^AgentKeepalive, nonce: u64) {
@@ -713,7 +752,7 @@ agent_keepalive_reply :: proc(ka: ^AgentKeepalive, nonce: u64) {
 	ka.pong_nonce = nonce
 	sync.mutex_unlock(&ka.mutex)
 	if wake {
-		sync.sema_post(&ka.wake)
+		sync.sema_post(agent_keepalive_wake(ka))
 	}
 }
 
@@ -723,23 +762,40 @@ agent_keepalive :: proc(ka: ^AgentKeepalive) {
 	limit := agent_dead_peer_limit(relay.agent)
 	next := min(interval, limit)
 	nonce: u64
+	wake := agent_keepalive_wake(ka)
+	when ODIN_TEST {
+		clock := relay.agent.config.test_watchdog_clock
+		last_check: time.Tick
+	}
 	for {
-		_ = sync.sema_wait_with_timeout(&ka.wake, next)
+		_ = sync.sema_wait_with_timeout(wake, next)
 		if sync.atomic_load(&ka.stopping) || sync.atomic_load(&relay.agent.stop) {
 			return
 		}
 		sync.mutex_lock(&ka.mutex)
-		quiet := time.tick_since(ka.last_recv)
+		now := agent_keepalive_now(relay.agent)
+		quiet := time.tick_diff(ka.last_recv, now)
 		if quiet >= limit {
 			ka.dead = true
 			ka.dead_at = time.now()
 			trans.connection_note_close(relay.broker, .ReadDeadline)
 			trans.connection_shutdown_both(relay.broker)
 			sync.mutex_unlock(&ka.mutex)
+			when ODIN_TEST {
+				if clock != nil {
+					sync.sema_post(&clock.checked)
+				}
+			}
 			return
 		}
 		reply, pong_nonce := ka.pong_pending, ka.pong_nonce
 		sync.mutex_unlock(&ka.mutex)
+		when ODIN_TEST {
+			if clock != nil && now != last_check {
+				last_check = now
+				sync.sema_post(&clock.checked)
+			}
+		}
 		delay: time.Duration
 		keep_running: bool
 		if reply {
@@ -856,7 +912,7 @@ when ODIN_TEST {
 }
 
 agent_relay_loop :: proc(relay: ^AgentRelay, decoder: ^proto.FrameDecoder) -> (trans.CloseCause, time.Time, bool) {
-	keepalive := AgentKeepalive{relay = relay, last_recv = time.tick_now()}
+	keepalive := AgentKeepalive{relay = relay, last_recv = agent_keepalive_now(relay.agent)}
 	legacy := false
 	when ODIN_TEST {
 		legacy = relay.agent.config.test_legacy_heartbeat
@@ -868,9 +924,27 @@ agent_relay_loop :: proc(relay: ^AgentRelay, decoder: ^proto.FrameDecoder) -> (t
 	closed_at: time.Time
 	graceful_stop := false
 	worker: ^thread.Thread
+	control := AgentControlWriter{relay = relay}
+	control_writer: ^AgentControlWriter
+	control_thread: ^thread.Thread
+	defer if control_writer != nil {
+		if control_thread != nil {
+			agent_control_stop(&control)
+			thread.destroy(control_thread)
+		}
+		queue.destroy(&control.pending)
+	}
 	if !legacy {
 		// Regular DATA writes retain their blocking TCP/TLS send behavior.
 		_ = trans.connection_set_send_timeout(relay.broker, 0)
+		if queue.init(&control.pending) != .None {
+			return .InternalError, time.now(), false
+		}
+		control_writer = &control
+		control_thread = thread.create_and_start_with_poly_data(&control, agent_control_write)
+		if control_thread == nil {
+			return .InternalError, time.now(), false
+		}
 		worker = thread.create_and_start_with_poly_data(&keepalive, agent_keepalive)
 		if worker == nil {
 			return .InternalError, time.now(), false
@@ -941,7 +1015,7 @@ agent_relay_loop :: proc(relay: ^AgentRelay, decoder: ^proto.FrameDecoder) -> (t
 			last_recv = time.now()
 		}
 		sync.mutex_lock(&keepalive.mutex)
-		keepalive.last_recv = time.tick_now()
+		keepalive.last_recv = agent_keepalive_now(relay.agent)
 		sync.mutex_unlock(&keepalive.mutex)
 		switch frame.header.opcode {
 		case .Ping:
@@ -954,18 +1028,23 @@ agent_relay_loop :: proc(relay: ^AgentRelay, decoder: ^proto.FrameDecoder) -> (t
 				} else {
 					agent_keepalive_reply(&keepalive, msg.nonce)
 				}
+				when ODIN_TEST {
+					if clock := relay.agent.config.test_watchdog_clock; clock != nil {
+						sync.sema_post(&clock.ping_read)
+					}
+				}
 			}
 		case .Pong:
 		case .Open:
-			agent_handle_open(relay, frame)
+			agent_handle_open(relay, frame, control_writer)
 		case .Data:
-			agent_handle_data(relay, frame)
+			agent_handle_data(relay, frame, control_writer)
 		case .HalfClose:
 			agent_handle_half_close(relay, frame)
 		case .Close, .Reset:
 			// Terminal. Do not echo StreamNotFound — that ping-pongs
 			// with the broker until the session dies.
-			agent_finish_stream(relay, frame.header.stream_id)
+			agent_handle_terminal(relay, frame.header.stream_id, control_writer)
 		case .RegisterOk, .RegisterFailed:
 			agent_handle_register_reply(relay, frame)
 		case .UnregisterOk, .UnregisterFailed:

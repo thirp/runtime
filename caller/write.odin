@@ -421,6 +421,11 @@ caller_drain :: proc(c: ^Caller) {
 			ok = terr == .None && perr == .None
 			if ok {
 				sync.atomic_add(&c.user_send_bytes, len(payload) + proto.HEADER_SIZE)
+				when ODIN_TEST {
+					if opcode == .Connect && c.config.test_connect_written != nil {
+						c.config.test_connect_written(c.config.test_connect_user)
+					}
+				}
 			}
 		}
 

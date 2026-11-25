@@ -5,7 +5,7 @@ import proto "../protocol"
 import trans "../transport"
 import "core:fmt"
 import "core:os"
-import "core:sync"
+import "core:strings"
 import "core:testing"
 import "core:thread"
 import "core:time"
@@ -14,29 +14,14 @@ import "core:time"
 BROKER_TEST_CERT :: string(#load("../transport/testdata/test_server.crt"))
 BROKER_TEST_KEY :: string(#load("../transport/testdata/test_server.key"))
 
-broker_tls_temp_seq: int
-
 broker_write_temp_pem :: proc(label, contents: string) -> (path: string, ok: bool) {
-	n := sync.atomic_add(&broker_tls_temp_seq, 1)
-	temp_dir := os.get_env("TEMP", context.temp_allocator)
-	if len(temp_dir) == 0 {
-		temp_dir = os.get_env("TMP", context.temp_allocator)
-	}
-	if len(temp_dir) == 0 {
-		temp_dir = os.get_env("TMPDIR", context.temp_allocator)
-	}
-	when ODIN_OS == .Windows {
-		if len(temp_dir) == 0 {
-			temp_dir = "C:\\Windows\\Temp"
-		}
-	} else {
-		if len(temp_dir) == 0 {
-			temp_dir = "/tmp"
-		}
-	}
-	path = fmt.aprintf("%s%cthirp-broker-tls-%s-%d.pem", temp_dir, os.Path_Separator, label, n)
-	err := os.write_entire_file(path, transmute([]u8)contents)
-	if err != nil {
+	file, err := os.create_temp_file("", fmt.tprintf("thirp-broker-tls-%s-*.pem", label))
+	if err != nil {return "", false}
+	path = strings.clone(os.name(file))
+	_, write_err := os.write(file, transmute([]u8)contents)
+	close_err := os.close(file)
+	if write_err != nil || close_err != nil {
+		_ = os.remove(path)
 		delete(path)
 		return "", false
 	}

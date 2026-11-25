@@ -129,12 +129,15 @@ REPLAY_LEGACY_AGENT_HEARTBEAT :: #config(THIRP_REPLAY_LEGACY_AGENT_HEARTBEAT, fa
 
 RESPONSE_403 :: "HTTP/1.1 403 Forbidden\r\nContent-Length: 9\r\nConnection: close\r\n\r\nforbidden"
 
-fixture_start :: proc(t: ^testing.T, fx: ^Fixture, agent_cfg: ag.AgentConfig = {}, use_tls := false, broker_logger: ^log.Logger = nil) -> bool {
+fixture_start :: proc(t: ^testing.T, fx: ^Fixture, agent_cfg: ag.AgentConfig = {}, use_tls := false, broker_logger: ^log.Logger = nil,
+	authenticator: auth.Authenticator = {}) -> bool {
 	testing.expect_value(t, brk.registry_init(&fx.reg), brk.RegistryError.None)
 	testing.expect_value(t, auth.auth_init(&fx.store), auth.AuthError.None)
 	testing.expect_value(t, auth.auth_add_token(&fx.store, T_TOKEN_HOST, "host-a"), auth.AuthError.None)
 	testing.expect_value(t, auth.auth_add_token(&fx.store, T_TOKEN_CALLER, "client-a"), auth.AuthError.None)
-	brk.server_init(&fx.server, &fx.reg, auth.static_token_authenticator(&fx.store))
+	authn := authenticator
+	if authn.authenticate == nil {authn = auth.static_token_authenticator(&fx.store)}
+	brk.server_init(&fx.server, &fx.reg, authn)
 	fx.server.logger = broker_logger
 	when ODIN_TEST {
 		fx.server.test_trace_agent_session = agent_cfg.test_trace_broker_session

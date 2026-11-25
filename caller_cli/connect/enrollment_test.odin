@@ -4,9 +4,12 @@ import "core:encoding/json"
 import "core:fmt"
 import "core:os"
 import "core:strings"
+import "core:sync"
 import "core:testing"
+import "core:thread"
 import "core:time"
 import log "../../logging"
+import trans "../../transport"
 import private_file "private_file"
 
 @(test)
@@ -21,13 +24,24 @@ test_enrollment_failure_log_limits_each_source_and_reason :: proc(t: ^testing.T)
 	}
 	before_limit := time.tick_add(start, 10*time.Second-time.Nanosecond)
 	enrollment_failure(&f.e, "api", "tls_verify", at = before_limit)
-	enrollment_failure(&f.e, "broker", "tls_verify", at = before_limit)
+	enrollment_failure(&f.e, "stream", "unauthorized_or_revoked", at = before_limit)
 	enrollment_failure(&f.e, "api", "unauthorized_or_revoked", at = before_limit)
 	testing.expect_value(t, strings.count(string(f.logs[:]), `"reason":"tls_verify","phase":"api"`), 1)
-	testing.expect_value(t, strings.count(string(f.logs[:]), `"reason":"tls_verify","phase":"broker"`), 1)
+	testing.expect_value(t, strings.count(string(f.logs[:]), `"reason":"unauthorized_or_revoked","phase":"stream"`), 1)
 	testing.expect_value(t, strings.count(string(f.logs[:]), `"reason":"unauthorized_or_revoked","phase":"api"`), 1)
 	enrollment_failure(&f.e, "api", "tls_verify", at = time.tick_add(start, 10*time.Second))
 	testing.expect_value(t, strings.count(string(f.logs[:]), `"reason":"tls_verify","phase":"api"`), 2)
+
+	enrollment_setup_failure(&f.e, "svc-a", "dns", "timeout", at = start)
+	enrollment_setup_failure(&f.e, "svc-b", "authenticate", "timeout", at = before_limit)
+	enrollment_setup_failure(&f.e, "svc-b", "authenticate", "unauthorized_or_revoked", at = before_limit)
+	enrollment_failure(&f.e, "api", "timeout", at = before_limit)
+	testing.expect_value(t, strings.count(string(f.logs[:]), `"reason":"timeout","phase":"dns"`), 1)
+	testing.expect_value(t, strings.count(string(f.logs[:]), `"reason":"timeout","phase":"authenticate"`), 0)
+	testing.expect_value(t, strings.count(string(f.logs[:]), `"reason":"unauthorized_or_revoked","phase":"authenticate"`), 1)
+	testing.expect_value(t, strings.count(string(f.logs[:]), `"reason":"timeout","phase":"api"`), 1)
+	enrollment_setup_failure(&f.e, "svc-b", "authenticate", "timeout", at = time.tick_add(start, 10*time.Second))
+	testing.expect_value(t, strings.count(string(f.logs[:]), `"reason":"timeout","phase":"authenticate"`), 1)
 }
 
 ENROLLMENT_TEST_CONF :: `api = https://api.example.test
@@ -57,8 +71,10 @@ EnrollmentFixture :: struct {
 	active_token: string,
 	wire_service: string,
 	deny_self, deny_grant, unavailable, paginate: bool,
+	unique_mints: bool,
 	created, approved, minted, renewed, rotated, destroyed: int,
 	dir: string,
+	connection: trans.Connection,
 }
 
 enrollment_test_stamp :: proc(t: time.Time) -> string {
@@ -71,7 +87,7 @@ enrollment_test_now :: proc(user: rawptr) -> time.Time {return (^EnrollmentFixtu
 enrollment_test_http :: proc(user: rawptr, _: ^EnrollmentConfig, req: EnrollmentRequest) -> (EnrollmentResponse, EnrollmentError) {
 	f := (^EnrollmentFixture)(user)
 	append(&f.requests, EnrollmentTestRequest{strings.clone(req.method), strings.clone(req.path), strings.clone(req.bearer), strings.clone(req.body)})
-	if f.unavailable {return {}, .Retry}
+	if f.unavailable {return {failure = "connect"}, .Retry}
 	ROOT :: ENROLLMENT_ORGS+"org-a"
 	if req.bearer != f.active_token && !(req.bearer == ENROLLMENT_TEST_TOKEN && f.at._nsec < f.overlap_end._nsec) {return {status = 401, body = strings.clone(`{}`)}, .None}
 	if req.path == ROOT+ENROLLMENT_SELF {
@@ -114,7 +130,12 @@ enrollment_test_http :: proc(user: rawptr, _: ^EnrollmentConfig, req: Enrollment
 			f.minted += 1
 			exp := time.time_add(f.at, 15*time.Minute)
 			if exp._nsec > g.until._nsec {exp = g.until}
-			return {status = 201, body = fmt.aprintf(`{{"token":%q,"credential_id":"credential-a","expires_at":%q}}`, ENROLLMENT_TEST_GRANT_TOKEN, enrollment_test_stamp(exp))}, .None
+			token, id := ENROLLMENT_TEST_GRANT_TOKEN, "credential-a"
+			if f.unique_mints {
+				token = fmt.tprintf("%s%d", ENROLLMENT_TEST_GRANT_TOKEN, f.minted)
+				id = fmt.tprintf("credential-%d", f.minted)
+			}
+			return {status = 201, body = fmt.aprintf(`{{"token":%q,"credential_id":%q,"expires_at":%q}}`, token, id, enrollment_test_stamp(exp))}, .None
 		}
 		if req.path == fmt.tprintf("%s/credential-a%s", base, ENROLLMENT_RENEW) {
 			f.renewed += 1
@@ -142,6 +163,8 @@ enrollment_fixture_init :: proc(t: ^testing.T, f: ^EnrollmentFixture, support :=
 	f.e.new_caller = proc(e: ^Enrollment, l: ^EnrollmentLink) -> (^EnrollmentCaller, bool) {
 		c := new(EnrollmentCaller)
 		c.grant_end, c.run.live = l.pending.grant_end, 1
+		c.run.c.conn = &(^EnrollmentFixture)(e.user).connection
+		c.run.c.connected = true
 		return c, true
 	}
 	f.e.destroy_caller = proc(c: ^EnrollmentCaller) {
@@ -152,10 +175,18 @@ enrollment_fixture_init :: proc(t: ^testing.T, f: ^EnrollmentFixture, support :=
 }
 
 enrollment_fixture_destroy :: proc(f: ^EnrollmentFixture) {
+	for &l in f.e.links {sync.atomic_store(&l.stop, true)}
 	for &l in f.e.links {
+		if l.accept_th != nil {thread.join(l.accept_th); thread.destroy(l.accept_th)}
+		if l.job != nil {
+			thread.join(l.job.th); thread.destroy(l.job.th)
+			if l.job.caller != nil {l.job.caller.force = true; append(&l.retired, l.job.caller)}
+			free(l.job); l.job = nil
+		}
 		enrollment_drop(&f.e, &l)
 		enrollment_reap(&f.e, &l)
 		delete(l.retired)
+		if l.opened {trans.listener_close(&l.ln)}
 	}
 	delete(f.e.links); delete(f.e.token); delete(f.e.pending_token); delete(f.e.failure_next)
 	for r in f.requests {delete(r.method); delete(r.path); delete(r.bearer); delete(r.body)}
@@ -170,6 +201,72 @@ enrollment_fixture_destroy :: proc(f: ^EnrollmentFixture) {
 
 enrollment_test_grant :: proc(f: ^EnrollmentFixture, until: time.Time) {
 	append(&f.grants, EnrollmentTestGrant{"grant-old", "svc-a", f.cfg.environment, f.at, until})
+}
+
+@(test)
+test_enrollment_resume_recovers_lost_admission :: proc(t: ^testing.T) {
+	f: EnrollmentFixture
+	context.user_ptr = &f
+	enrollment_fixture_init(t, &f, true)
+	defer enrollment_fixture_destroy(&f)
+	enrollment_test_grant(&f, time.time_add(f.at, time.Hour))
+	if !testing.expect_value(t, enrollment_step(&f.e), EnrollmentError.None) {return}
+	l := &f.e.links[0]
+	if !testing.expect(t, l.current != nil, "initial admission") {return}
+	f.at = time.time_add(l.plan.expires_at, time.Second)
+	if !testing.expect_value(t, enrollment_step(&f.e), EnrollmentError.None) {return}
+	if !testing.expect(t, l.current != nil && f.minted == 2, "fresh admission after expiry") {return}
+	// The resumed transport admitted us once, then dropped. The grant is
+	// still valid and a fresh mint can be used immediately.
+	l.current.run.c.connected = false
+	if !testing.expect_value(t, enrollment_step(&f.e), EnrollmentError.None) {return}
+	testing.expectf(t, f.minted == 3, "lost admission must trigger a fresh mint immediately, got %d total mints", f.minted)
+}
+
+@(test)
+test_enrollment_fallback_requires_a_valid_credential_and_grant :: proc(t: ^testing.T) {
+	FallbackCase :: enum {Mint_Unavailable, Credential_Expired, Grant_Expired, Denied, Grant_Removed, API_Untrusted}
+	for mode in FallbackCase {
+		f: EnrollmentFixture
+		context.user_ptr = &f
+		enrollment_fixture_init(t, &f, true)
+		defer enrollment_fixture_destroy(&f)
+		enrollment_test_grant(&f, time.time_add(f.at, time.Hour))
+		if !testing.expect_value(t, enrollment_step(&f.e), EnrollmentError.None) {return}
+		l := &f.e.links[0]
+		original := l.current
+		if !testing.expect(t, original != nil, "initial admission") {return}
+		original.run.c.connected = false
+		switch mode {
+		case .Mint_Unavailable:
+			f.e.http = proc(user: rawptr, cfg: ^EnrollmentConfig, req: EnrollmentRequest) -> (EnrollmentResponse, EnrollmentError) {
+				if req.method == ENROLLMENT_POST && strings.has_suffix(req.path, ENROLLMENT_CREDENTIALS) {
+					return {status = 503}, .None
+				}
+				return enrollment_test_http(user, cfg, req)
+			}
+		case .Credential_Expired:
+			f.at, f.unavailable = l.plan.expires_at, true
+		case .Grant_Expired:
+			f.at, f.unavailable = l.plan.grant_end, true
+		case .Denied:
+			f.deny_grant = true
+		case .Grant_Removed:
+			clear(&f.grants)
+		case .API_Untrusted:
+			f.e.http = proc(_: rawptr, _: ^EnrollmentConfig, _: EnrollmentRequest) -> (EnrollmentResponse, EnrollmentError) {
+				return {failure = "tls_verify"}, .Retry
+			}
+		}
+		if !testing.expect_value(t, enrollment_step(&f.e), EnrollmentError.None) {return}
+		testing.expect_value(t, f.minted, 1)
+		if mode == .Mint_Unavailable {
+			testing.expect(t, l.current != nil && l.current != original, "a transient mint failure permits fallback")
+			testing.expect_value(t, l.plan.credential_id, "credential-a")
+		} else {
+			testing.expectf(t, l.current == nil && len(l.pending.token) == 0, "%v must not reuse a credential", mode)
+		}
+	}
 }
 
 // Write a fixture file the way enrollment expects it on disk: mode 0600 on
@@ -241,6 +338,7 @@ test_enrollment_renew_half_lifetime_and_fractional_expiry :: proc(t: ^testing.T)
 	enrollment_test_grant(&f, time.time_add(f.at, 8*time.Hour))
 	testing.expect_value(t, enrollment_step(&f.e), EnrollmentError.None)
 	l := &f.e.links[0]
+	healthy := l.current
 	testing.expect_value(t, l.plan.renew_at, time.time_add(f.at, 450*time.Second))
 	f.at = time.time_add(f.at, 449*time.Second)
 	_ = enrollment_step(&f.e)
@@ -248,6 +346,7 @@ test_enrollment_renew_half_lifetime_and_fractional_expiry :: proc(t: ^testing.T)
 	f.at = time.time_add(f.at, time.Second)
 	_ = enrollment_step(&f.e)
 	testing.expect_value(t, f.renewed, 1)
+	testing.expect(t, healthy != nil && l.current == healthy && f.minted == 1, "normal renewal keeps the admitted caller")
 	testing.expect_value(t, time.diff(f.at, l.plan.expires_at), 15*time.Minute)
 	v, err := json.parse(`{"expires_at":"2026-11-16T00:00:00.123456789Z"}`, .JSON)
 	testing.expect_value(t, err, json.Error.None)
@@ -283,6 +382,53 @@ test_enrollment_platforms_regrant_keeps_listener_and_old_streams :: proc(t: ^tes
 	testing.expect(t, l.current != nil)
 	// The create body uses a catalog id, never the broker wire id.
 	for r in f.requests {if r.path == ENROLLMENT_ORGS+"org-a"+ENROLLMENT_REQUESTS {testing.expect(t, strings.contains(r.body, "svc-a"))}}
+}
+
+@(test)
+test_enrollment_failed_rollover_keeps_healthy_caller :: proc(t: ^testing.T) {
+	f: EnrollmentFixture
+	context.user_ptr = &f
+	enrollment_fixture_init(t, &f, true)
+	defer enrollment_fixture_destroy(&f)
+	enrollment_test_grant(&f, time.time_add(f.at, 10*time.Minute))
+	if !testing.expect_value(t, enrollment_step(&f.e), EnrollmentError.None) {return}
+	l := &f.e.links[0]
+	original := l.current
+	if !testing.expect(t, original != nil, "initial caller admitted") {return}
+	sync.atomic_store(&original.run.live, 0)
+	bridge := BridgeArg{run = &original.run}
+	run_track(&original.run, &bridge)
+	defer {
+		run_untrack(&original.run, &bridge)
+		run_bridge_done(&original.run)
+		delete(original.run.bridges)
+	}
+	l.opened = true // Model the listener owned by enrollment_main.
+	defer l.opened = false
+	f.at = l.plan.rollover_at
+	append(&f.grants, EnrollmentTestGrant{"grant-replacement", "svc-a", "env-a", f.at, time.time_add(f.at, time.Hour)})
+	f.e.new_caller = proc(_: ^Enrollment, _: ^EnrollmentLink) -> (^EnrollmentCaller, bool) {return nil, false}
+
+	for attempt in 1..=3 {
+		if !testing.expect_value(t, enrollment_step(&f.e), EnrollmentError.None) {return}
+		testing.expect(t, l.current == original && original.run.c.connected && len(l.retired) == 0,
+			"failed replacement keeps the original session admitted")
+		testing.expect(t, l.opened && !l.stop && len(original.run.bridges) == 1 &&
+			original.run.bridges[0] == &bridge && original.run.live == 1 && !bridge.kick,
+			"failed replacement keeps the listener and bridge active")
+		testing.expect_value(t, f.minted, 1+attempt)
+		f.at = l.next
+	}
+	testing.expect(t, !strings.contains(string(f.logs[:]), "broker_setup_exhausted"))
+
+	// Losing admission starts a fresh recovery budget for this Service.
+	original.run.c.connected = false
+	for _ in 0..<2 {
+		if !testing.expect_value(t, enrollment_step(&f.e), EnrollmentError.None) {return}
+		f.at = l.next
+	}
+	testing.expect_value(t, enrollment_step(&f.e), EnrollmentError.Broker_Setup_Exhausted)
+	testing.expect_value(t, strings.count(string(f.logs[:]), "broker_setup_exhausted"), 1)
 }
 
 @(test)

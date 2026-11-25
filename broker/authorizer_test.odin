@@ -712,6 +712,68 @@ test_connection_observer_bytes_on_close :: proc(t: ^testing.T) {
 	}
 }
 
+when ODIN_TEST {
+	ObserverCloseDuringEnqueue :: struct {
+		t:      ^testing.T,
+		caller: ^ConnHandler,
+		box:    ^ConnOutbox,
+	}
+
+	@(test)
+	test_connection_observer_close_after_data_dequeue :: proc(t: ^testing.T) {
+		clog: ConnectionLog
+		connection_log_init(&clog)
+		defer connection_log_destroy(&clog)
+		server: Server
+		server_init(&server, nil, {})
+		defer server_destroy(&server)
+		server.connection_observer_ctx = &clog
+		server.connection_observer = observe_connection
+
+		caller_socket := trans.Connection{refs = 1}
+		agent_socket := trans.Connection{refs = 1}
+		caller := ConnHandler{server = &server, role = .Caller, conn = &caller_socket}
+		agent := ConnHandler{server = &server, role = .Agent, conn = &agent_socket}
+		box := new(ConnOutbox)
+		outbox_init(box, &caller_socket, &server)
+		defer outbox_release(box)
+		server_register_outbox(&server, &caller_socket, box)
+		relay_bind_agent(&server, 1, &agent_socket)
+		sid, held, err := relay_open_stream(&server, TEST_SERVICE, 1, &caller_socket)
+		if !testing.expect_value(t, err, RelayOpenError.None) {
+			return
+		}
+		defer trans.connection_release(held)
+		_, opened := relay_apply(&server, sid, .OpenOk, .Agent)
+		testing.expect_value(t, opened, StreamError.None)
+
+		fixture := ObserverCloseDuringEnqueue{t, &caller, box}
+		server.test_data_enqueue_ctx = &fixture
+		server.test_after_data_enqueue = proc(data: rawptr) {
+			fx := (^ObserverCloseDuringEnqueue)(data)
+			// Run the consumer before the producer resumes from enqueue.
+			// A writer can deliver this dequeued DATA and the caller can
+			// reply with CLOSE while the agent reader is still suspended.
+			frame, dequeued := outbox_take_next(fx.box)
+			if !testing.expect(fx.t, dequeued, "DATA was visible to the outbox writer") {
+				return
+			}
+			defer delete(frame.payload, fx.box.allocator)
+			testing.expect_value(fx.t, frame.opcode, proto.Opcode.Data)
+			testing.expect_value(fx.t, string(frame.payload), "xy")
+			_ = conn_handle_stream_frame(fx.caller, {header = {opcode = .Close, stream_id = frame.stream_id}})
+		}
+		_ = conn_handle_stream_frame(&agent, {header = {opcode = .Data, stream_id = sid}, payload = []u8{'x', 'y'}})
+		if testing.expect_value(t, len(clog.kinds), 1) {
+			testing.expect_value(t, clog.kinds[0], ConnectionEventKind.Closed)
+			testing.expect_value(t, clog.bytes_a2c[0], u64(2))
+		}
+		testing.expect_value(t, outbox_enqueue(box, .Data, sid, []u8{'z'}, origin = .Agent), OutboxEnqueueError.Closed)
+		testing.expect_value(t, outbox_queued(box, sid), 0)
+		testing.expect_value(t, metrics_snapshot(&server).bytes_agent_to_caller_total, u64(2))
+	}
+}
+
 @(test)
 test_authorize_connect_quota_returns_quota_exceeded :: proc(t: ^testing.T) {
 	reg: Registry

@@ -17,6 +17,10 @@ when ODIN_TEST {
 		read_idle_timeout:    time.Duration,
 		session_idle_timeout: time.Duration,
 		ping_interval:        time.Duration,
+		test_connect_written: proc(user: rawptr),
+		test_connect_user:    rawptr,
+		test_ping_received:   proc(user: rawptr),
+		test_ping_user:       rawptr,
 	}
 	Caller_Test_State :: struct {
 		// Last reason the reader logged for a drop. Not cleared on
@@ -88,6 +92,12 @@ CallerConfig :: struct {
 	logger:          ^log.Logger,
 	setup_failure:   proc(user: rawptr, phase, reason: string),
 	setup_failure_user: rawptr,
+	// The owner replaces a lost session with fresh credentials. Keep heartbeat
+	// and send-stall detection. A healthy idle session needs no replacement.
+	managed_reconnect: bool,
+	// Optional earlier deadline for the initial setup, including time the
+	// owner already spent resolving the broker address.
+	setup_deadline: time.Time,
 	// Bounds broker setup (TCP, TLS, Hello and Authenticate together), and
 	// each stream CONNECT. 0 keeps legacy broker setup behavior and waits until
 	// CONNECT_OK or the session ends. thirp-connect passes

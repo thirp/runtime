@@ -94,12 +94,12 @@ build_command: scripts/release.sh
 EOF
 
 export ROOT VERSION OUT ARCH DATE
-"${ROOT}/scripts/check_sdk_api.sh"
+bash "${ROOT}/scripts/check_sdk_api.sh"
 # Host library only. The published multi-OS SDK is scripts/assemble_sdk.sh,
 # which runs after the other libthirp binaries exist. That tarball is not
 # part of this operator SHA256SUMS.
-"${ROOT}/scripts/release_sdk.sh"
-"${ROOT}/scripts/release_broker.sh"
+bash "${ROOT}/scripts/release_sdk.sh"
+bash "${ROOT}/scripts/release_broker.sh"
 
 (
 	cd "$OUT"
@@ -172,8 +172,8 @@ for field in source_commit odin openssl target build_command; do
 done
 
 export ROOT VERSION OUT ARCH
-"${ROOT}/scripts/verify_sdk.sh"
-"${ROOT}/scripts/verify_broker.sh"
+bash "${ROOT}/scripts/verify_sdk.sh"
+bash "${ROOT}/scripts/verify_broker.sh"
 
 # One published Linux asset. Checksums stay inside the archive. The host SDK
 # tarball is not in SHA256SUMS and is not copied in.
